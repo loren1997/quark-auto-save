@@ -3,6 +3,7 @@ import copy
 import io
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ class AppIntegrationTests(unittest.TestCase):
         self.config = {
             "webui": {"username": "test", "password": "test-only"},
             "cookie": ["fake-cookie"], "tasklist": [], "crontab": "0 8 * * *",
-            "discovery": {"savepath": "/追更"}, "auto_repair": True,
+            "discovery": {"savepath": "/cartoon"}, "auto_repair": True,
         }
         self.entry = {"id": "bangumi:42", "title": "测试动漫 第二季",
                       "search_title": "测试动漫 第二季", "year": 2024}
@@ -80,6 +81,7 @@ class AppIntegrationTests(unittest.TestCase):
             current = self.saved_config()
             self.assertEqual(current["source"]["pansou"]["server"], "http://pansou:8888")
             self.assertEqual(current["tasklist"], [])
+            self.assertEqual(current["discovery"]["savepath"], "/cartoon")
             self.assertTrue(current["source"]["websearch"]["enable"])
             current["source"]["pansou"]["server"] = "https://custom.example"
             current["source"]["websearch"]["enable"] = False
@@ -95,6 +97,33 @@ class AppIntegrationTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertEqual(self.client.post("/update", json=payload).status_code, 400)
                 self.assertEqual(self.saved_config(), self.config)
+
+    def test_startup_saves_factory_path_migration_and_preserves_custom_paths(self):
+        legacy = {"taskname": "测试动漫 第二季 (2024)", "resource_id": "bangumi:42",
+                  "shareurl": "https://pan.quark.cn/s/old", "savepath": "/追更/测试动漫 第二季 (2024)",
+                  "pattern": r"(?i).*\.(mp4|mkv|mov|m4v|avi|ts)$", "replace": "",
+                  "addition": {"aria2": {"save_path": ""}}}
+        manual = {"taskname": "手动任务", "shareurl": "https://pan.quark.cn/s/manual", "savepath": "/追更/手动"}
+        custom = {"taskname": "自定义", "resource_id": "bangumi:43", "shareurl": "https://pan.quark.cn/s/custom",
+                  "savepath": "/私人目录", "pattern": ".+", "replace": "自定义名称.mp4",
+                  "addition": {"aria2": {"save_path": "自定义下载"}}}
+        for cloud_path, local_path in (("/追更", "/Downloads"), ("/自定义网盘", "/自定义NAS")):
+            with self.subTest(cloud_path=cloud_path):
+                self.config["discovery"]["savepath"] = cloud_path
+                self.config["plugins"] = {"aria2": {"host_port": "", "secret": "", "dir": local_path}}
+                self.config["tasklist"] = copy.deepcopy([legacy, manual, custom])
+                self.write_config()
+                with patch.object(web.Config, "load_plugins", return_value=({}, {
+                    "aria2": {"host_port": "", "secret": "", "dir": "/downloads"},
+                }, {})):
+                    web.init()
+                saved = self.saved_config()
+                self.assertEqual(saved["discovery"]["savepath"], "/cartoon" if cloud_path == "/追更" else cloud_path)
+                self.assertEqual(saved["plugins"]["aria2"]["dir"], "/downloads" if local_path == "/Downloads" else local_path)
+                self.assertEqual(saved["tasklist"][0]["savepath"], "/cartoon")
+                self.assertEqual(saved["tasklist"][0]["addition"]["aria2"]["save_path"], "cartoon")
+                self.assertEqual(saved["tasklist"][0]["replace"], "{TASKNAME} S02E{EXX}.{EXT}")
+                self.assertEqual(saved["tasklist"][1:], [manual, custom])
 
     def test_new_routes_and_search_require_login(self):
         with self.client.session_transaction() as session:
@@ -159,9 +188,9 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(task, response.json["data"])
         self.assertEqual(task["shareurl"], self.candidate["candidate"]["shareurl"])
         self.assertEqual(task["taskname"], "测试动漫 第二季 (2024)")
-        self.assertEqual(task["savepath"], "/追更/测试动漫 第二季 (2024)")
+        self.assertEqual(task["savepath"], "/cartoon")
         self.assertEqual(task["runweek"], list(range(1, 8)))
-        self.assertEqual(task["addition"], {"testplugin": {"enabled": False}})
+        self.assertEqual(task["addition"], {"testplugin": {"enabled": False}, "aria2": {"save_path": "cartoon"}})
         self.assertNotIn("auto_repair", task)
         for key in ("stoken", "passcode", "pwd_id", "pdir_fid", "cookie"):
             self.assertNotIn(key, task)
@@ -182,7 +211,8 @@ class AppIntegrationTests(unittest.TestCase):
         for resource_id in ("tvmaze:99", None):
             with self.subTest(resource_id=resource_id):
                 existing = {"taskname": "测试动漫 S02 [2024] [1080p]", "resource_id": resource_id,
-                            "shareurl": "https://pan.quark.cn/s/already", "savepath": "/已有"}
+                            "shareurl": "https://pan.quark.cn/s/already", "savepath": "/已有",
+                            "pattern": r"第(\d+)集\.mkv", "replace": r"自定义\1.mkv"}
                 self.config["tasklist"] = [existing]
                 self.write_config()
                 response = self.subscribe()
@@ -241,6 +271,101 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(task["search_aliases"], ["国漫测试官方别名"])
         self.assertEqual(self.find.call_args.args[0]["search_aliases"], task["search_aliases"])
 
+    def test_popular_subscription_matches_video_and_subtitles_only(self):
+        response = self.subscribe()
+        self.assertTrue(response.json["success"])
+        pattern = response.json["data"]["pattern"]
+        for filename in ("第01集.MP4", "第02集.mkv", "第01集.zh-CN.srt", "第02集.ass"):
+            with self.subTest(filename=filename):
+                self.assertIsNotNone(re.search(pattern, filename))
+        for filename in ("广告.txt", "安装.exe", "原声.mp3", "下载说明.pdf", "视频.mp4.exe"):
+            with self.subTest(filename=filename):
+                self.assertIsNone(re.search(pattern, filename))
+        self.assertEqual(self.find.call_args.args[0]["resource_type"], "anime")
+
+    def test_popular_subscription_returns_and_saves_season_episode_rename_rule(self):
+        for title, season in (("测试动漫", "01"), ("测试动漫 第三季", "03"), ("测试动漫 Season 12", "12")):
+            with self.subTest(title=title):
+                self.entry["search_title"] = title
+                self.write_config()
+                response = self.subscribe()
+                self.assertTrue(response.json["success"])
+                task = response.json["data"]
+                self.assertEqual(task["replace"], f"{{TASKNAME}} S{season}E{{EXX}}.{{EXT}}")
+                self.assertEqual(self.saved_config()["tasklist"][0]["replace"], task["replace"])
+
+    def test_share_preview_excludes_other_files_even_with_unrestricted_pattern(self):
+        files = [{"fid": str(index), "file_name": name, "dir": False,
+                  "obj_category": "video" if name.endswith(".mp4") else "other"}
+                 for index, name in enumerate(("第01集.mp4", "第01集.srt", "广告.txt", "工具.exe"))]
+        with patch.object(web.Quark, "get_detail", return_value={"code": 0, "data": {"list": files}}), \
+                patch.object(web.Quark, "get_fids", return_value=[]):
+            response = self.client.post("/get_share_detail", json={
+                "shareurl": "https://pan.quark.cn/s/example", "stoken": "test-token",
+                "task": {"taskname": "测试", "savepath": "/追更", "pattern": ".*", "replace": ""},
+            })
+        self.assertTrue(response.json["success"])
+        preview = {item["file_name"]: item for item in response.json["data"]["list"]}
+        for filename in ("第01集.mp4", "第01集.srt"):
+            self.assertIn("file_name_re", preview[filename])
+        for filename in ("广告.txt", "工具.exe"):
+            self.assertNotIn("file_name_re", preview[filename])
+            self.assertNotIn("file_name_saved", preview[filename])
+
+    def test_subtitle_preview_survives_old_video_rule_and_ignore_extension(self):
+        files = [{"fid": "sub", "file_name": "第01集.srt", "dir": False}]
+        with patch.object(web.Quark, "get_detail", return_value={"code": 0, "data": {"list": files}}), \
+                patch.object(web.Quark, "get_fids", return_value=[{"fid": "saved"}]), \
+                patch.object(web.Quark, "ls_dir", return_value={"data": {"list": [
+                    {"file_name": "第01集.mp4", "dir": False},
+                ]}}):
+            response = self.client.post("/get_share_detail", json={
+                "shareurl": "https://pan.quark.cn/s/example", "stoken": "test-token",
+                "task": {"taskname": "测试", "savepath": "/追更", "pattern": r".*\.mp4$",
+                         "replace": "", "ignore_extension": True},
+            })
+        self.assertTrue(response.json["success"])
+        subtitle = response.json["data"]["list"][0]
+        self.assertEqual(subtitle["file_name_re"], "第01集.srt")
+        self.assertNotIn("file_name_saved", subtitle)
+
+    def test_video_preview_ignores_extension_only_among_existing_videos(self):
+        for existing_name, already_saved in (("第01集.srt", False), ("第01集.txt", False), ("第01集.mkv", True)):
+            with self.subTest(existing_name=existing_name), \
+                    patch.object(web.Quark, "get_detail", return_value={"code": 0, "data": {"list": [
+                        {"file_name": "第01集.mp4", "dir": False, "obj_category": "video"},
+                    ]}}), patch.object(web.Quark, "get_fids", return_value=[{"fid": "saved"}]), \
+                    patch.object(web.Quark, "ls_dir", return_value={"data": {"list": [
+                        {"file_name": existing_name, "dir": False},
+                    ]}}):
+                response = self.client.post("/get_share_detail", json={
+                    "shareurl": "https://pan.quark.cn/s/example", "stoken": "test-token",
+                    "task": {"taskname": "测试", "savepath": "/cartoon", "pattern": r".*\.mp4$",
+                             "replace": "", "ignore_extension": True},
+                })
+                self.assertTrue(response.json["success"])
+                video = response.json["data"]["list"][0]
+                if already_saved:
+                    self.assertTrue(video.get("file_name_saved"))
+                    self.assertNotIn("file_name_re", video)
+                else:
+                    self.assertEqual(video["file_name_re"], "第01集.mp4")
+                    self.assertNotIn("file_name_saved", video)
+
+    def test_preview_preserves_original_name_for_invalid_media_rename(self):
+        for filename, replacement in (("第01集.srt", "changed.mp4"), ("第01集.mp4", "changed.txt"),
+                                      ("第01集.mp4", "../changed.mp4")):
+            with self.subTest(filename=filename), \
+                    patch.object(web.Quark, "get_detail", return_value={"code": 0, "data": {"list": [
+                        {"file_name": filename, "dir": False, "obj_category": "video"},
+                    ]}}), patch.object(web.Quark, "get_fids", return_value=[]):
+                response = self.client.post("/get_share_detail", json={
+                    "shareurl": "https://pan.quark.cn/s/example", "stoken": "test-token",
+                    "task": {"taskname": "测试", "savepath": "/追更", "pattern": ".+", "replace": replacement},
+                })
+                self.assertTrue(response.json["success"])
+                self.assertEqual(response.json["data"]["list"][0]["file_name_re"], filename)
+
     def test_subscription_failure_returns_reason_without_saving(self):
         self.find.return_value = {"success": False, "candidate": None,
                                   "error": "搜索源暂不可用", "code": "unavailable",
@@ -289,7 +414,9 @@ class AppIntegrationTests(unittest.TestCase):
         with patch.object(web, "PLUGIN_FLAGS", ""):
             response = self.subscribe()
         self.assertTrue(response.json["success"])
-        self.assertEqual(response.json["data"]["addition"]["aria2"], {"auto_download": True, "download_subdir": True})
+        self.assertEqual(response.json["data"]["addition"]["aria2"], {
+            "auto_download": True, "download_subdir": True, "save_path": "cartoon",
+        })
         self.assertEqual(web.task_plugins_config_default["aria2"], {"auto_download": False, "download_subdir": False})
         self.assertNotIn("fake-rpc-secret", response.get_data(as_text=True))
         self.assertEqual(self.saved_config()["tasklist"][0], response.json["data"])
@@ -408,11 +535,12 @@ class AppIntegrationTests(unittest.TestCase):
 
     def test_title_characters_cannot_create_extra_directories(self):
         self.entry["search_title"] = '测试/动漫:第"二"季'
-        self.config["discovery"]["savepath"] = "/追更/"
+        self.config["discovery"]["savepath"] = "/自定义目录/"
         self.write_config()
         response = self.subscribe()
         self.assertTrue(response.json["success"])
-        self.assertEqual(response.json["data"]["savepath"], "/追更/测试_动漫_第_二_季 (2024)")
+        self.assertEqual(response.json["data"]["savepath"], "/自定义目录")
+        self.assertEqual(response.json["data"]["addition"]["aria2"]["save_path"], "自定义目录")
 
     def test_stale_revision_cannot_overwrite_a_repaired_share(self):
         original = {"taskname": "测试", "shareurl": "https://pan.quark.cn/s/old", "savepath": "/测试"}

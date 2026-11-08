@@ -500,19 +500,94 @@ class AutoRepairTests(unittest.TestCase):
     def test_audiobook_or_text_only_share_is_not_a_video_replacement(self):
         self.task["resource_type"] = "anime"
         for file_name, category in (("01.mp3", "audio"), ("全集.epub", "document"),
-                                    ("全集.txt", "document"), ("伪视频.mp4", "audio")):
+                                    ("全集.txt", "document"), ("伪视频.exe", "video")):
             detail = {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [
                 {"fid": "file", "file_name": file_name, "dir": False, "obj_category": category},
             ]}}
             with self.subTest(file_name=file_name), self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=detail):
                 self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
 
-    def test_generic_non_video_subscriptions_can_still_repair(self):
-        detail = {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [
-            {"fid": "document", "file_name": "资料.pdf", "dir": False, "obj_category": "document"},
-        ]}}
-        with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=detail):
-            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+    def test_generic_subscriptions_also_require_real_video_extensions(self):
+        for filename in ("资料.pdf", "01.srt", "01.ass", "广告.exe", "封面.png"):
+            detail = {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [
+                {"fid": "nonvideo", "file_name": filename, "dir": False, "obj_category": "video"},
+            ]}}
+            with self.subTest(filename=filename), self.search([self.candidate()]), \
+                    patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                    patch.object(self.account, "get_detail", return_value=detail):
+                self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+
+    def test_candidate_with_video_on_second_page_is_verified(self):
+        images = [{"fid": f"image-{index}", "file_name": f"封面{index}.png", "dir": False,
+                   "obj_category": "image"} for index in range(50)]
+        second = [{"fid": "episode", "file_name": "02.MKV", "dir": False, "obj_category": "document"}]
+        pages = [{"code": 0, "metadata": {"_total": 51}, "data": {
+            "share": {"title": self.task["taskname"]}, "list": files}} for files in (images, second)]
+        with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "_send_request", side_effect=[Mock(json=Mock(return_value=page)) for page in pages]) as request:
+            result = self.account.find_valid_resource(self.task, {})
+        self.assertTrue(result["success"])
+        self.assertEqual([call.kwargs["params"]["_page"] for call in request.call_args_list], [1, 2])
+
+    def test_nonvideo_candidates_are_skipped_until_a_real_video_source_is_found(self):
+        candidates = [self.candidate("subtitles"), self.candidate("documents"), self.candidate("videos")]
+        def detail(share, *_args, **_kwargs):
+            filename = {"subtitles": "01.ass", "documents": "作品.pdf", "videos": "01.mp4"}[share]
+            return {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [
+                {"fid": "file", "file_name": filename, "dir": False, "obj_category": "video"}]}}
+        with self.search(candidates) as search, patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", side_effect=detail) as listing:
+            result = self.account.find_valid_resource(self.task, {})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["candidate"]["pwd_id"], "videos")
+        self.assertEqual(listing.call_count, 3)
+        search.assert_called_once()
+
+    def test_incomplete_candidate_listing_is_unconfirmed_even_when_first_page_has_video(self):
+        for incomplete in ({"metadata": {"_total": 200}}, {"truncated": True}):
+            detail = copy.deepcopy(FILES)
+            if "metadata" in incomplete:
+                detail.update(incomplete)
+            else:
+                detail["data"].update(incomplete)
+            with self.subTest(incomplete=incomplete), self.search([self.candidate()]), \
+                    patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                    patch.object(self.account, "get_detail", return_value=detail) as listing:
+                result = self.account.find_valid_resource(self.task, {})
+            self.assertFalse(result["success"])
+            self.assertTrue(result["validation_limited"])
+            self.assertFalse(result["search_complete"])
+            self.assertIn("尚未完整确认", result["error"])
+            self.assertEqual(listing.call_args.kwargs["max_pages"], 3)
+
+    def test_one_named_folder_beside_images_and_text_keeps_alias_and_season_checks(self):
+        self.task.update(taskname="黑色召唤师 (2022)", search_aliases=["Black Summoner"])
+        selected = "a" * 32
+        videos = {"code": 0, "data": {"list": [{"fid": "episode", "file_name": "01.mkv", "dir": False}]}}
+        for folder_name, accepted in (("Black Summoner (2022)", True), ("Black Summoner 第二季 (2022)", False),
+                                      ("另一部作品 (2022)", False)):
+            root = {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [
+                {"fid": selected, "file_name": folder_name, "dir": True},
+                {"fid": "cover", "file_name": "封面.png", "dir": False},
+                {"fid": "advert", "file_name": "广告.txt", "dir": False},
+            ]}}
+            with self.subTest(folder_name=folder_name), self.search([self.candidate()]), \
+                    patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                    patch.object(self.account, "get_detail", side_effect=[root, videos]) as listing:
+                result = self.account.find_valid_resource(self.task, {})
+            self.assertEqual(result["success"], accepted)
+            self.assertEqual(listing.call_count, 2 if accepted else 1)
+            if accepted:
+                self.assertEqual(result["candidate"]["pdir_fid"], selected)
+                self.assertTrue(result["candidate"]["shareurl"].endswith("#/list/share/" + selected))
+
+    def test_no_video_reason_reuses_repair_without_claiming_expiry(self):
+        replacement = {**self.candidate(), "pwd_id": "newshare"}
+        with patch.object(self.account, "find_valid_resource", return_value={"success": True, "candidate": replacement}), \
+                patch.object(qas, "print") as output:
+            self.assertEqual(self.account.repair_share(self.task, reason="分享不含视频"), replacement)
+        self.assertIn("分享不含视频", output.call_args_list[0].args[0])
+        self.assertNotIn("分享已失效", output.call_args_list[0].args[0])
 
     def test_empty_or_inaccessible_share_is_not_a_replacement(self):
         for detail in ({"code": 0, "data": {"list": []}}, {"code": 403, "message": "无权限"}):
@@ -538,7 +613,7 @@ class AutoRepairTests(unittest.TestCase):
         self.assertNotIn("private-token", str(self.task))
         self.assertNotIn("abcd", str(self.task["repair_history"]))
         self.assertEqual(self.task["repair_history"][0]["from_id"], "oldshare")
-        save.assert_called_once_with(self.task, "newshare", "private-token", 0)
+        save.assert_called_once_with(self.task, "newshare", "private-token", 0, scan_state={})
 
     def test_temporary_error_never_searches_or_changes_subscription(self):
         for response in ({"status": 500, "message": "request error"}, {"status": 400, "message": "提取码错误"}, {"status": 401, "message": "登录过期"}):
@@ -618,7 +693,7 @@ class AutoRepairTests(unittest.TestCase):
     def test_temporary_listing_failures_do_not_abort_later_subscriptions(self):
         later_task = {**self.task, "taskname": "后续任务"}
         response = Mock()
-        response.json.side_effect = [ValueError("HTML gateway"), {"code": 0, "data": {"list": []}}]
+        response.json.side_effect = [ValueError("HTML gateway"), {"code": 1, "status": 503, "message": "分享服务暂不可用"}]
         with patch.object(self.account, "get_stoken", return_value=TOKEN) as tokens, patch.object(self.account, "_send_request", return_value=response), patch.object(self.account, "repair_share") as repair:
             self.account.do_save_task(self.task)
             self.account.do_save_task(later_task)

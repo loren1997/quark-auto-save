@@ -112,11 +112,11 @@
             <p class="text-muted">找不到可靠匹配时保留原订阅，下次运行重试；不会因网络异常或 Cookie 失效换源。</p>
             <div class="form-group">
               <label for="discovery-savepath">热门订阅的夸克网盘保存目录</label>
-              <input id="discovery-savepath" class="form-control" v-model="formData.discovery.savepath" placeholder="/追更">
+              <input id="discovery-savepath" class="form-control" v-model="formData.discovery.savepath" placeholder="/cartoon">
             </div>
             <div class="form-check my-3">
               <input id="discovery-download" type="checkbox" class="form-check-input" v-model="formData.discovery.auto_download">
-              <label for="discovery-download" class="form-check-label">热门订阅通过 Aria2 下载到 NAS（需先配置下方 Aria2 插件；保存后同步已有热门任务，首次启用会补交已转存文件）</label>
+              <label for="discovery-download" class="form-check-label">热门订阅通过 Aria2 下载视频到 NAS（默认目录 /downloads/cartoon；保存后同步已有热门任务，首次启用会补交已转存视频）</label>
             </div>
 
             <div class="row title" title="通知推送，支持多个渠道，见Wiki">
@@ -331,7 +331,7 @@
               <div class="col"><h2><i class="bi bi-calendar-week"></i> 热门追更</h2></div>
               <div class="col-auto"><button type="button" class="btn btn-outline-primary" @click="loadDiscovery" :disabled="discoveryLoading">刷新</button></div>
             </div>
-            <p>按各自来源热度排列。点击订阅会搜索并验证夸克分享，保存到 {{ formData.discovery.savepath }}，立即转存并按定时规则持续追更。{{ formData.discovery.auto_download ? '转存后自动提交 Aria2 下载到 NAS。' : '当前仅转存到夸克网盘；本地下载可在系统配置中开启。' }}</p>
+            <p>按各自来源热度排列。点击订阅会搜索并验证夸克分享，视频和字幕直接保存到 {{ formData.discovery.savepath }}，按“片名 S01E01”命名，不再创建作品或分享子目录。{{ formData.discovery.auto_download ? '转存后默认只提交视频到 Aria2；字幕保留在网盘。' : '当前仅转存到夸克网盘；本地视频下载可在系统配置中开启。' }}</p>
             <p class="text-muted" v-if="calendar.week_start">{{ calendar.week_start }} — {{ calendar.week_end }} · 北京时间 · {{ calendar.cached ? '缓存数据' : '已更新' }}</p>
             <div v-for="note in calendar.notes" :key="note" class="small text-muted mb-1">{{ note }}</div>
             <div v-if="discoveryError" class="alert alert-danger" role="alert">
@@ -490,7 +490,7 @@
                       </div>
                     </div>
                   </div>
-                  <div class="form-group row" title="可用作筛选，只转存匹配到的文件名的文件，留空则转存所有文件">
+                  <div class="form-group row" title="此规则筛选视频；字幕自动保留，留空则转存全部视频和字幕，其他文件不会转存">
                     <label class="col-sm-2 col-form-label">保存规则</label>
                     <div class="col-sm-10">
                       <div class="input-group">
@@ -740,7 +740,7 @@
         formData: {
           cookie: [],
           auto_repair: true,
-          discovery: { savepath: '/追更' },
+          discovery: { savepath: '/cartoon' },
           push_config: {},
           media_servers: {},
           tasklist: [],
@@ -927,7 +927,7 @@
             .then(response => {
               config_data = response.data.data
               if (config_data.auto_repair === undefined) config_data.auto_repair = true;
-              if (!config_data.discovery) config_data.discovery = { savepath: '/追更' };
+              if (!config_data.discovery) config_data.discovery = { savepath: '/cartoon' };
               // cookie兼容
               if (typeof config_data.cookie === 'string')
                 config_data.cookie = [config_data.cookie];

@@ -2,19 +2,22 @@ import os
 import re
 import requests
 
+from media_files import is_media_file, is_video_file, media_title
+
 
 class Aria2:
 
     default_config = {
         "host_port": "172.17.0.1:6800",  # Aria2 RPC地址，填入格式支持：host:port 或 http(s)://host:port
         "secret": "",  # Aria2 RPC 密钥
-        "dir": "/Downloads",  # 下载目录，需要Aria2有权限访问
+        "dir": "/downloads",  # 下载目录，需要Aria2有权限访问
     }
     default_task_config = {
         "auto_download": False,  # 是否自动添加下载任务
         "download_existing": False,  # 下次运行时补交保存目录内的文件，完成扫描后自动关闭
         "download_subdir": False,  # 是否递归下载子目录和文件
-        "save_path": "",  # 留空时跟随夸克网盘目录结构（dir/夸克路径），填写时下载到 dir/save_path/
+        "download_subtitles": False,  # 默认只下载视频；开启后同时下载字幕
+        "save_path": "",  # 留空时使用任务保存目录，文件直接放入此目录，不复制源子目录结构
         "pause": False,  # 添加任务后为暂停状态，不自动开始（手动下载）
     }
     is_active = False
@@ -47,7 +50,7 @@ class Aria2:
             # 默认使用 HTTP
             return f"http://{self.host_port}/jsonrpc"
 
-    def _recursive_dir(self, account, fid, parent_path, pending, recursive=True):
+    def _recursive_dir(self, account, fid, parent_path, pending, recursive=True, download_subtitles=False):
         """递归遍历目录，获取所有文件和子目录"""
         print(f"Aria2下载: 递归目录 {parent_path}")
         response = account.ls_dir(fid)
@@ -60,14 +63,42 @@ class Aria2:
 
             if item["dir"]:
                 if recursive:
-                    self._recursive_dir(account, item_fid, item_path, pending)
-            else:
+                    self._recursive_dir(account, item_fid, item_path, pending,
+                                        download_subtitles=download_subtitles)
+            elif is_video_file(item) or (download_subtitles and is_media_file(item)):
                 pending[str(item_fid)] = item_path
 
+    @staticmethod
+    def _belongs_to_task(task, path):
+        """共享目录只补交当前任务默认规则已生成的文件，不猜测原始标题。"""
+        template = re.fullmatch(r"\{TASKNAME\}([ ._-]S\d{2,3}E)\{EXX\}\.\{EXT\}", task.get("replace", ""))
+        title = media_title(task.get("taskname", ""))
+        if not template or not title:
+            return False
+        stem = os.path.splitext(os.path.basename(path))[0]
+        prefix = title + template[1]
+        if not stem.startswith(prefix):
+            return False
+        episode, *suffixes = stem[len(prefix):].split(".")
+        return bool(re.fullmatch(r"\d{2,3}", episode) and int(episode) > 0
+                    and (not suffixes or (not is_video_file({"file_name": path})
+                         and all(re.fullmatch(r"[\w-]+", suffix) for suffix in suffixes))))
+
     def run(self, task, **kwargs):
-        task_config = task.get("addition", {}).get(
-            self.plugin_name, self.default_task_config
-        )
+        task_config = task.get("addition", {}).get(self.plugin_name, self.default_task_config)
+        allowed_file = is_media_file if task_config.get("download_subtitles") else is_video_file
+        tree = kwargs.get("tree")
+        rename_failed = {str(node.data["fid"]) for node in tree.all_nodes_itr()
+                         if node.data.get("rename_failed") and node.data.get("fid")} if tree else set()
+        rename_failed.update(str(fid) for fid in task.get("rename_pending", {}))
+        shared_path = kwargs.get("shared_path") or task.get("savepath", "").strip("/") == "cartoon"
+        # 先移除旧队列中的禁用文件和未成功重命名的文件。
+        pending = task.get("aria2_pending", {})
+        for fid, path in list(pending.items()):
+            if fid in rename_failed or not allowed_file({"file_name": path, "dir": False}):
+                pending.pop(fid)
+        if not pending:
+            task.pop("aria2_pending", None)
         if not task_config.get("auto_download"):
             if kwargs.get("tree"):
                 print("Aria2下载: 此任务未开启 auto_download；仅转存到网盘")
@@ -86,15 +117,20 @@ class Aria2:
                 # 先完整扫描再入队，避免子目录失败后重复提交已扫描的文件。
                 existing = {}
                 self._recursive_dir(account, fid, savepath, existing,
-                                    task_config.get("download_subdir", False))
+                                    task_config.get("download_subdir", False),
+                                    task_config.get("download_subtitles", False))
+                if shared_path:
+                    existing = {fid: path for fid, path in existing.items() if self._belongs_to_task(task, path)}
                 pending.update(existing)
                 task_config["download_existing"] = False
                 print(f"Aria2下载: 已补入 {len(existing)} 个已转存文件")
-            if tree := kwargs.get("tree"):
+            if tree:
                 # 按文件路径排序添加下载任务
                 for node in sorted(tree.all_nodes_itr(), key=lambda n: n.data.get("path", "")):
                     if not node.data.get("is_dir", True):
-                        pending[str(node.data["fid"])] = node.data["path"]
+                        if (str(node.data["fid"]) not in rename_failed
+                                and allowed_file({"file_name": node.data["path"], "dir": False})):
+                            pending[str(node.data["fid"])] = node.data["path"]
                     elif not node.is_root() and task_config.get("download_subdir") and node.data.get("fid"):
                         pending_dirs[str(node.data["fid"])] = node.data["path"]
         except Exception as exc:
@@ -103,13 +139,19 @@ class Aria2:
         for fid, path in list(pending_dirs.items()):
             try:
                 files = {}
-                self._recursive_dir(account, fid, path, files)
+                self._recursive_dir(account, fid, path, files,
+                                    download_subtitles=task_config.get("download_subtitles", False))
+                if shared_path:
+                    files = {file_id: file_path for file_id, file_path in files.items()
+                             if self._belongs_to_task(task, file_path)}
                 pending.update(files)
                 pending_dirs.pop(fid)
             except Exception as exc:
                 print(f"Aria2下载: 目录扫描失败 {path}（{type(exc).__name__}），下次重试此目录")
         if not pending_dirs:
             task.pop("aria2_pending_dirs", None)
+        for fid in rename_failed:
+            pending.pop(fid, None)
         if not pending:
             task.pop("aria2_pending", None)
             return task
@@ -128,12 +170,8 @@ class Aria2:
                 if not file_url or str(items[0].get("fid", fid)) != fid:
                     print(f"Aria2下载: 直链缺失或文件不匹配 {file_path}；保留下次重试")
                     continue
-                if task_config.get("save_path"):
-                    file_name = os.path.basename(file_path)
-                    save_path = task_config["save_path"].strip("/")
-                    local_path = f"{self.dir}/{save_path}/{file_name}"
-                else:
-                    local_path = f"{self.dir}{file_path}"
+                save_path = (task_config.get("save_path") or task["savepath"]).strip("/")
+                local_path = f"{self.dir.rstrip('/')}/{save_path}/{os.path.basename(file_path)}"
                 aria2_params = [
                     [file_url],
                     {

@@ -134,6 +134,7 @@ def main():
                 assert retry["resource_id"] == "bangumi:123"
                 assert retry["addition"]["aria2"] == {
                     "auto_download": True, "download_subdir": True, "download_existing": True,
+                    "save_path": "cartoon",
                 }
                 assert "ui-test-only-secret" not in json.dumps(runs)
                 page.locator("#logModal .close").click()

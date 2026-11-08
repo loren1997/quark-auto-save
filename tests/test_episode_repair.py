@@ -133,6 +133,18 @@ class EpisodeRepairTests(unittest.TestCase):
             self.account.repair_episode_gaps(self.task, self.tree())
         search.assert_not_called()
 
+    def test_shared_cartoon_directory_does_not_mix_other_titles_or_subtitles(self):
+        self.task["savepath"] = "/cartoon"
+        self.account.savepath_fid = {"/cartoon": "destination"}
+        target = self.files(["Black Summoner S01E01.mkv", "Black Summoner S01E03.mkv",
+                             "其他作品 S01E02.mkv", "02.mkv", "Black Summoner S01E02.srt"])
+        target["data"]["list"].append({"fid": "foreign", "file_name": "其他作品", "dir": True})
+        with patch.object(self.account, "ls_dir", return_value=target) as listing, \
+                patch.object(self.account, "find_valid_resource", return_value={"success": False, "error": "未找到"}) as search:
+            self.account.repair_episode_gaps(self.task, self.tree())
+        self.assertEqual(search.call_args.kwargs["required_episodes"], {2})
+        listing.assert_called_once_with("destination")
+
     def test_only_middle_gaps_are_requested_and_partial_success_is_reported(self):
         target = self.files(["03.mkv", "05.mkv", "07.mkv"])
         supplemental = self.tree()

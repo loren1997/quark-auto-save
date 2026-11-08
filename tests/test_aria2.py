@@ -41,7 +41,7 @@ class Aria2Tests(unittest.TestCase):
         self.plugin.run(self.task, account=self.account, tree=self.tree)
         self.account.download.assert_called_once_with(["saved-01"])
         options = self.plugin.add_uri.call_args.args[0][1]
-        self.assertEqual(options["dir"], "/Downloads/追更/测试剧")
+        self.assertEqual(options["dir"], "/downloads/追更/测试剧")
         self.assertEqual(options["out"], "01.mkv")
         self.assertEqual(options["pause"], "false")
         self.assertIn("Cookie: PRIVATE_COOKIE", options["header"])
@@ -49,8 +49,58 @@ class Aria2Tests(unittest.TestCase):
         self.assertIn("GID: accepted-gid", self.output.getvalue())
         self.assertNotIn("PRIVATE_COOKIE", self.output.getvalue())
 
+    def test_new_tree_only_submits_videos_by_default(self):
+        for index, name in enumerate(("02.MP4", "02.zh.SRT", "poster.jpg", "广告.html",
+                                      "电影.nfo", "资源.zip", "video.mp4.exe")):
+            self.tree.create_node(name, f"share-extra-{index}", parent="root", data={
+                "is_dir": False, "fid": f"saved-extra-{index}", "path": f"/追更/测试剧/{name}"})
+        self.plugin.run(self.task, account=self.account, tree=self.tree)
+        self.assertEqual([call.args[0] for call in self.account.download.call_args_list],
+                         [["saved-01"], ["saved-extra-0"]])
+        self.assertNotIn("aria2_pending", self.task)
+
+    def test_backfill_scans_nested_folders_but_only_submits_media(self):
+        self.task["addition"]["aria2"]["download_existing"] = True
+        self.task["addition"]["aria2"]["download_subtitles"] = True
+        self.account.ls_dir.side_effect = [
+            {"code": 0, "data": {"list": [
+                {"fid": "video", "file_name": "01.mkv", "dir": False},
+                {"fid": "poster", "file_name": "poster.jpg", "dir": False},
+                {"fid": "subdir", "file_name": "字幕", "dir": True}]}},
+            {"code": 0, "data": {"list": [
+                {"fid": "subtitle", "file_name": "01.zh.ASS", "dir": False},
+                {"fid": "advert", "file_name": "广告.txt", "dir": False}]}}]
+        self.plugin.run(self.task, account=self.account, tree=False)
+        self.assertEqual([call.args[0] for call in self.account.download.call_args_list],
+                         [["video"], ["subtitle"]])
+        self.assertEqual([call.args[0] for call in self.account.ls_dir.call_args_list],
+                         ["saved-folder", "subdir"])
+        self.assertFalse(self.task["addition"]["aria2"]["download_existing"])
+        self.assertNotIn("aria2_pending", self.task)
+
+    def test_legacy_retry_queue_prunes_subtitles_and_keeps_unaccepted_video(self):
+        self.task["aria2_pending"] = {
+            "video": "/追更/测试剧/01.mkv", "subtitle": "/追更/测试剧/01.srt",
+            "poster": "/追更/测试剧/poster.jpg", "advert": "/追更/测试剧/广告.url",
+            "executable": "/追更/测试剧/video.mp4.exe"}
+        self.plugin.is_active = False
+        self.plugin.run(self.task, account=self.account, tree=False)
+        self.account.download.assert_not_called()
+        self.assertEqual(set(self.task["aria2_pending"]), {"video"})
+        self.plugin.is_active = True
+        self.plugin.add_uri.side_effect = [None, "accepted-video"]
+        self.plugin.run(self.task, account=self.account, tree=False)
+        self.assertEqual(self.task["aria2_pending"], {"video": "/追更/测试剧/01.mkv"})
+        self.plugin.run(self.task, account=self.account, tree=False)
+        self.assertEqual([call.args[0] for call in self.account.download.call_args_list],
+                         [["video"], ["video"]])
+        self.assertNotIn("aria2_pending", self.task)
+        self.account.ls_dir.assert_not_called()
+
     def test_existing_files_without_new_transfer_retry_only_unaccepted_files(self):
         self.task["addition"]["aria2"]["download_existing"] = True
+        self.account.ls_dir.return_value["data"]["list"].append(
+            {"fid": "subtitle", "file_name": "01.srt", "dir": False})
         self.plugin.add_uri.side_effect = ["accepted-01", None, "accepted-02"]
         self.plugin.run(self.task, account=self.account, tree=False)
         self.assertEqual(self.task["aria2_pending"], {"saved-02": "/追更/测试剧/02.mkv"})
@@ -75,6 +125,8 @@ class Aria2Tests(unittest.TestCase):
 
     def test_failed_listing_preserves_backfill_and_does_not_submit_partial_scan(self):
         self.task["addition"]["aria2"]["download_existing"] = True
+        self.task["aria2_pending"] = {"poster": "/追更/测试剧/poster.jpg",
+                                      "subtitle": "/追更/测试剧/01.srt", "video": "/追更/测试剧/00.mkv"}
         self.account.ls_dir.side_effect = [
             {"code": 0, "data": {"list": [
                 {"fid": "01", "file_name": "01.mkv", "dir": False},
@@ -83,6 +135,7 @@ class Aria2Tests(unittest.TestCase):
         self.plugin.run(self.task, account=self.account, tree=False)
         self.assertTrue(self.task["addition"]["aria2"]["download_existing"])
         self.plugin.add_uri.assert_not_called()
+        self.assertEqual(self.task["aria2_pending"], {"video": "/追更/测试剧/00.mkv"})
 
     def test_partial_download_api_response_does_not_misname_or_drop_files(self):
         self.account.download.return_value = ({"code": 0, "data": []}, "")
@@ -95,15 +148,107 @@ class Aria2Tests(unittest.TestCase):
         self.tree.create_node("sub", "share-sub", parent="root", data={
             "is_dir": True, "fid": "saved-sub", "path": "/追更/测试剧/新子目录"})
         self.account.ls_dir.side_effect = [{"code": 500}, {"code": 0, "data": {"list": [
-            {"fid": "saved-02", "file_name": "02.mkv", "dir": False}]}}]
+            {"fid": "saved-02", "file_name": "02.mkv", "dir": False},
+            {"fid": "saved-subtitle", "file_name": "02.srt", "dir": False},
+            {"fid": "poster", "file_name": "poster.jpg", "dir": False}]}}]
         self.plugin.run(self.task, account=self.account, tree=self.tree)
         self.assertEqual(self.plugin.add_uri.call_count, 1)
         self.assertFalse(self.task["addition"]["aria2"].get("download_existing", False))
         self.assertEqual(self.task["aria2_pending_dirs"], {"saved-sub": "/追更/测试剧/新子目录"})
         self.plugin.run(self.task, account=self.account, tree=False)
         self.assertEqual([call.args[0] for call in self.account.ls_dir.call_args_list], ["saved-sub", "saved-sub"])
-        self.assertEqual([call.args[0] for call in self.account.download.call_args_list], [["saved-01"], ["saved-02"]])
+        self.assertEqual([call.args[0] for call in self.account.download.call_args_list],
+                         [["saved-01"], ["saved-02"]])
         self.assertNotIn("aria2_pending_dirs", self.task)
+
+    def test_default_directory_is_lowercase_and_source_subfolders_are_flattened(self):
+        self.assertEqual(Aria2.default_config["dir"], "/downloads")
+        self.assertFalse(Aria2.default_task_config["download_subtitles"])
+        self.tree.get_node("share-01").data["path"] = "/追更/测试剧/Season 1/01.mkv"
+        self.plugin.run(self.task, account=self.account, tree=self.tree)
+        options = self.plugin.add_uri.call_args.args[0][1]
+        self.assertEqual((options["dir"], options["out"]), ("/downloads/追更/测试剧", "01.mkv"))
+
+    def test_explicit_save_path_is_respected_without_source_subfolders(self):
+        self.tree.get_node("share-01").data["path"] = "/追更/测试剧/Season 1/01.mkv"
+        for destination in ("cartoon", "/cartoon/", "custom/movies"):
+            with self.subTest(destination=destination):
+                self.task["addition"]["aria2"]["save_path"] = destination
+                self.plugin.run(self.task, account=self.account, tree=self.tree)
+                options = self.plugin.add_uri.call_args.args[0][1]
+                self.assertEqual(options["dir"], "/downloads/" + destination.strip("/"))
+                self.assertEqual(options["out"], "01.mkv")
+
+    def test_subtitle_download_can_be_explicitly_enabled(self):
+        self.task["addition"]["aria2"]["download_subtitles"] = True
+        self.task["aria2_pending"] = {"subtitle": "/追更/测试剧/01.srt", "poster": "/追更/测试剧/poster.jpg"}
+        self.tree.create_node("subtitle", "share-subtitle", parent="root", data={
+            "is_dir": False, "fid": "subtitle-02", "path": "/追更/测试剧/02.ass"})
+        self.plugin.run(self.task, account=self.account, tree=self.tree)
+        self.assertEqual([call.args[0] for call in self.account.download.call_args_list],
+                         [["saved-01"], ["subtitle"], ["subtitle-02"]])
+        self.assertNotIn("aria2_pending", self.task)
+
+    def test_rename_failure_is_removed_from_queue_even_if_directory_scan_finds_it(self):
+        node = self.tree.get_node("share-01")
+        node.data["rename_failed"] = True
+        self.task["aria2_pending"] = {"saved-01": node.data["path"]}
+        self.task["aria2_pending_dirs"] = {"saved-folder": "/追更/测试剧"}
+        self.account.ls_dir.return_value["data"]["list"] = [
+            {"fid": "saved-01", "file_name": "01.mkv", "dir": False}]
+        self.plugin.run(self.task, account=self.account, tree=self.tree)
+        self.account.download.assert_not_called()
+        self.assertNotIn("aria2_pending", self.task)
+        node.data.update(rename_failed=False, path="/追更/测试剧/测试剧 S01E01.mkv")
+        self.plugin.run(self.task, account=self.account, tree=self.tree)
+        self.account.download.assert_called_once_with(["saved-01"])
+        self.assertEqual(self.plugin.add_uri.call_args.args[0][1]["out"], "测试剧 S01E01.mkv")
+
+    def test_shared_backfill_only_submits_exact_current_task_and_season_names(self):
+        self.task.update(savepath="/cartoon", replace="{TASKNAME} S02E{EXX}.{EXT}")
+        self.task["addition"]["aria2"]["download_existing"] = True
+        self.account.savepath_fid["/cartoon"] = "shared-folder"
+        names = ["测试剧 S02E01.mp4", "另一部 S02E01.mp4", "测试剧场 S02E01.mp4",
+                 "测试剧 S01E01.mp4", "测试剧 02.mp4", "01.mp4", "测试剧 S02E02.1080p.mp4"]
+        self.account.ls_dir.return_value["data"]["list"] = [
+            {"fid": str(index), "file_name": name, "dir": False} for index, name in enumerate(names)]
+        self.plugin.run(self.task, account=self.account, tree=False)
+        self.account.download.assert_called_once_with(["0"])
+        self.assertFalse(self.task["addition"]["aria2"]["download_existing"])
+
+    def test_shared_path_argument_also_filters_other_shared_directories(self):
+        self.task["replace"] = "{TASKNAME} S01E{EXX}.{EXT}"
+        self.task["addition"]["aria2"]["download_existing"] = True
+        self.account.ls_dir.return_value["data"]["list"] = [
+            {"fid": "own", "file_name": "测试剧 S01E01.mp4", "dir": False},
+            {"fid": "other", "file_name": "另一部 S01E01.mp4", "dir": False}]
+        self.plugin.run(self.task, account=self.account, tree=False, shared_path=True)
+        self.account.download.assert_called_once_with(["own"])
+
+    def test_shared_pending_directory_scan_does_not_add_other_tasks(self):
+        self.task.update(savepath="/cartoon", replace="{TASKNAME} S01E{EXX}.{EXT}")
+        self.task["aria2_pending_dirs"] = {"shared-folder": "/cartoon"}
+        self.account.ls_dir.return_value["data"]["list"] = [
+            {"fid": "own", "file_name": "测试剧 S01E01.mp4", "dir": False},
+            {"fid": "other", "file_name": "另一部 S01E01.mp4", "dir": False}]
+        self.plugin.run(self.task, account=self.account, tree=False)
+        self.account.download.assert_called_once_with(["own"])
+        self.assertNotIn("aria2_pending_dirs", self.task)
+
+    def test_new_tree_keeps_known_file_identity_in_shared_directory(self):
+        self.task.update(savepath="/cartoon", replace="{TASKNAME} S01E{EXX}.{EXT}")
+        self.plugin.run(self.task, account=self.account, tree=self.tree)
+        self.account.download.assert_called_once_with(["saved-01"])
+
+    def test_persisted_rename_pending_blocks_backfill_and_retry_without_tree(self):
+        self.task["rename_pending"] = {"saved-01": {
+            "original": "01.mkv", "renamed": "测试剧 S01E01.mkv", "path": "/追更/测试剧"}}
+        self.task["aria2_pending"] = {"saved-01": "/追更/测试剧/01.mkv"}
+        self.task["addition"]["aria2"]["download_existing"] = True
+        self.plugin.run(self.task, account=self.account, tree=False)
+        self.account.download.assert_called_once_with(["saved-02"])
+        self.assertNotIn("aria2_pending", self.task)
+        self.assertIn("saved-01", self.task["rename_pending"])
 
     def test_disabled_task_logs_and_never_submits(self):
         self.task["addition"]["aria2"]["auto_download"] = False

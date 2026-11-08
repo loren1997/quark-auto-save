@@ -122,6 +122,17 @@ class ConfigPersistenceTests(unittest.TestCase):
                 Config.merge_runtime_state(current, original, updated)
                 self.assertEqual(current, expected)
 
+    def test_rename_retry_state_survives_runtime_merge_and_clears_on_success(self):
+        original = {"tasklist": [task()]}
+        updated = deepcopy(original)
+        retry = {"saved-id": {"original": "01.mp4", "renamed": "测试剧 S01E01.mp4", "path": "/cartoon"}}
+        updated["tasklist"][0]["rename_pending"] = retry
+        current = deepcopy(original)
+        Config.merge_runtime_state(current, original, updated)
+        self.assertEqual(current["tasklist"][0]["rename_pending"], retry)
+        Config.merge_runtime_state(current, updated, original)
+        self.assertNotIn("rename_pending", current["tasklist"][0])
+
     def test_repaired_link_persists_but_conflicting_episode_marker_does_not(self):
         original = {"tasklist": [task()]}
         updated = deepcopy(original)

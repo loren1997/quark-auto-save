@@ -30,7 +30,8 @@ import re
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
-from quark_auto_save import Quark, Config, MagicRename, resource_titles_match
+from quark_auto_save import Quark, Config, MagicRename, resource_titles_match, apply_media_rename_defaults
+from media_files import MEDIA_PATTERN, is_media_file, is_video_file
 from resource_search import search_resources
 
 print(
@@ -344,9 +345,10 @@ def subscribe_discovery():
     if existing:
         return jsonify(success=True, existing=True, data=existing, message="已经订阅")
     settings = current.get("discovery", {})
-    base = settings.get("savepath", "/追更") if isinstance(settings, dict) else None
+    base = settings.get("savepath", "/cartoon") if isinstance(settings, dict) else None
     if not valid_discovery_path(base):
         return jsonify(success=False, message="热门订阅保存路径必须是以 / 开头的夸克网盘目录"), 400
+    base = base.rstrip("/") or "/"
     auto_download = settings.get("auto_download", False)
     if auto_download and not aria2_download_configured(current):
         return jsonify(success=False, message="请先启用并配置 Aria2 插件的地址、密钥和下载目录"), 400
@@ -364,15 +366,16 @@ def subscribe_discovery():
                        queries=result.get("queries", []), source_errors=result.get("source_errors", []),
                        search_complete=result.get("search_complete", False),
                        message=result.get("error") or "未找到可验证的匹配资源，请在任务列表手动搜索"), 422
-    safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")[:180]
     task.update({
         "shareurl": result["candidate"]["shareurl"],
-        "savepath": base.rstrip("/") + "/" + safe_title,
-        "pattern": r"(?i).*\.(mp4|mkv|mov|m4v|avi|ts)$",
+        "savepath": base,
+        "pattern": MEDIA_PATTERN,
         "replace": "", "update_subdir": ".*",
         "resource_id": entry["id"], "runweek": list(range(1, 8)),
         "addition": deepcopy(task_plugins_config_default),
     })
+    apply_media_rename_defaults(task)
+    task["addition"].setdefault("aria2", {})["save_path"] = base.strip("/")
     if auto_download:
         task["addition"].setdefault("aria2", {}).update(auto_download=True, download_subdir=True)
     with Config.locked(CONFIG_PATH):
@@ -459,27 +462,33 @@ def get_share_detail():
         else:
             dir_file_list = []
             dir_filename_list = []
+        dir_video_filename_list = [item["file_name"] for item in dir_file_list if is_video_file(item)]
 
         pattern, replace = mr.magic_regex_conv(
             task.get("pattern", ""), task.get("replace", "")
         )
         for share_file in data["list"]:
+            if not share_file["dir"] and not is_media_file(share_file):
+                continue
+            is_subtitle = not share_file["dir"] and not is_video_file(share_file)
             search_pattern = (
                 task["update_subdir"]
                 if share_file["dir"] and task.get("update_subdir")
                 else pattern
             )
-            if re.search(search_pattern, share_file["file_name"]):
+            matched = re.search(search_pattern, share_file["file_name"])
+            if matched or is_subtitle:
                 # 文件名重命名，目录不重命名
                 file_name_re = (
                     share_file["file_name"]
-                    if share_file["dir"]
-                    else mr.sub(pattern, replace, share_file["file_name"])
+                    if share_file["dir"] or not matched
+                    else mr.media_name(pattern, replace, share_file["file_name"])
                 )
+                ignore_extension = bool(task.get("ignore_extension") and is_video_file(share_file))
                 if file_name_saved := mr.is_exists(
                     file_name_re,
-                    dir_filename_list,
-                    (task.get("ignore_extension") and not share_file["dir"]),
+                    dir_video_filename_list if ignore_extension else dir_filename_list,
+                    ignore_extension,
                 ):
                     share_file["file_name_saved"] = file_name_saved
                 else:
@@ -719,7 +728,7 @@ def init():
         if not config_data.get("crontab"):
             config_data["crontab"] = "0 8,18,20 * * *"
         config_data.setdefault("auto_repair", True)
-        config_data.setdefault("discovery", {"savepath": "/追更"})
+        config_data.setdefault("discovery", {"savepath": "/cartoon"})
         source = config_data.setdefault("source", {})
         source.setdefault("pansou", {"enable": True, "server": "https://so.252035.xyz"})
         source.setdefault("cloudsaver", {"enable": False, "server": "", "username": "", "password": ""})

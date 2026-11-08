@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from natsort import natsorted
+from media_files import MEDIA_PATTERN, is_media_file, is_video_file, media_title
 
 # 兼容青龙
 try:
@@ -247,6 +248,37 @@ def resource_titles_match(expected, candidate, allow_missing_year=False, aliases
                 or (allow_missing_year and not other_years)))
 
 
+def apply_media_rename_defaults(task):
+    if not task.get("resource_id"):
+        return task
+    title = task.get("taskname", "")
+    safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")[:180]
+    migrated_path = task.get("savepath") in ("/追更", "/追更/" + safe_title)
+    if migrated_path:
+        task["savepath"] = "/cartoon"
+        task.pop("aria2_pending", None)
+        task.pop("aria2_pending_dirs", None)
+    if task.get("savepath") == "/cartoon":
+        aria2 = task.setdefault("addition", {}).setdefault("aria2", {})
+        if migrated_path or aria2.get("save_path") in (None, "", "cartoon", "追更/" + safe_title):
+            aria2["save_path"] = "cartoon"
+        if migrated_path and aria2.get("auto_download"):
+            aria2["download_existing"] = True
+    legacy_pattern = r"(?i).*\.(mp4|mkv|mov|m4v|avi|ts)$"
+    if (task.get("replace")
+            or task.get("pattern") not in (None, "", legacy_pattern, MEDIA_PATTERN)):
+        return task
+    _, seasons, _ = _resource_title_parts(title)
+    if len(seasons) > 1 or re.search(r"第\s*[\d零一二三四五六七八九十两]+\s*[-~～至到、]\s*[\d零一二三四五六七八九十两]+\s*季", title):
+        return task
+    season = next(iter(seasons)) if seasons else 1
+    if season < 1:
+        return task
+    task["pattern"] = MEDIA_PATTERN
+    task["replace"] = f"{{TASKNAME}} S{season:02d}E{{EXX}}.{{EXT}}"
+    return task
+
+
 class Config:
     _thread_lock = threading.RLock()
     _locked_paths = threading.local()
@@ -344,7 +376,7 @@ class Config:
         )]
         if len(matches) != 1:
             return False
-        fields = ("shareurl", "shareurl_ban", "startfid", "repair_history", "addition", "replace", "aria2_pending", "aria2_pending_dirs")
+        fields = ("shareurl", "shareurl_ban", "startfid", "repair_history", "addition", "pattern", "replace", "savepath", "rename_pending", "aria2_pending", "aria2_pending_dirs")
         Config._merge_changes(matches[0], {key: original[key] for key in fields if key in original},
                              {key: updated[key] for key in fields if key in updated})
         return True
@@ -357,6 +389,12 @@ class Config:
                 continue
             matches = [other for other in updated.get("tasklist", []) if all(
                 other.get(key) == task.get(key) for key in identity)]
+            if not matches and task.get("resource_id"):
+                resource_id = task["resource_id"]
+                groups = (originals, updated.get("tasklist", []), current.get("tasklist", []))
+                if any(sum(other.get("resource_id") == resource_id for other in tasks) != 1 for tasks in groups):
+                    continue
+                matches = [other for other in updated.get("tasklist", []) if other.get("resource_id") == resource_id]
             if not matches:
                 # 自动换源会改变 shareurl；仅作品名和保存路径唯一时允许配对。
                 pair = ("taskname", "savepath")
@@ -428,10 +466,18 @@ class Config:
         return plugins_available, plugins_config, task_plugins_config
 
     def breaking_change_update(config_data):
+        discovery = config_data.setdefault("discovery", {})
+        if isinstance(discovery, dict) and discovery.get("savepath") in (None, "/追更"):
+            discovery["savepath"] = "/cartoon"
+        plugins = config_data.get("plugins")
+        aria2 = plugins.get("aria2") if isinstance(plugins, dict) else None
+        if isinstance(aria2, dict) and aria2.get("dir") == "/Downloads":
+            aria2["dir"] = "/downloads"
         # 🔼 Update config v0.5.x to 0.6.0
         for task in config_data.get("tasklist", []):
             if "$TASKNAME" in task.get("replace", ""):
                 task["replace"] = task["replace"].replace("$TASKNAME", "{TASKNAME}")
+            apply_media_rename_defaults(task)
 
 
 class MagicRename:
@@ -470,6 +516,7 @@ class MagicRename:
             r"^\d{1,3}(?=\.\w+)",
             r"(?<!\d)\d{1,3}(?!\d)(?!$)",
         ],
+        "{EXX}": [],  # 严格识别真实集号，最少补齐两位；不使用 {E} 的任意数字兜底。
         "{PART}": [
             r"(?<=[集期话部篇第])[上中下一二三四五六七八九十]",
             r"[上中下一二三四五六七八九十]",
@@ -497,13 +544,13 @@ class MagicRename:
     ]
 
     def __init__(self, magic_regex={}, magic_variable={}):
-        self.magic_regex.update(magic_regex)
-        self.magic_variable.update(magic_variable)
+        self.magic_regex = {**self.magic_regex, **magic_regex}
+        self.magic_variable = {**self.magic_variable, **magic_variable}
         self.dir_filename_dict = {}
 
     def set_taskname(self, taskname):
         """设置任务名称"""
-        self.magic_variable["{TASKNAME}"] = taskname
+        self.magic_variable["{TASKNAME}"] = media_title(taskname)
 
     def magic_regex_conv(self, pattern, replace):
         """魔法正则匹配"""
@@ -514,17 +561,67 @@ class MagicRename:
                 replace = self.magic_regex[keyword]["replace"]
         return pattern, replace
 
+    subtitle_suffix = r"(?:\.(?:zh(?:[-_](?:hans|hant|cn|tw|hk))?|chs|cht|chi|zho|en|eng|ja|jpn|ko|kor|简体|繁体|中英|简英|繁英|forced|sdh|default))+$"
+
+    @classmethod
+    def _strict_episode(cls, file_name):
+        stem = os.path.splitext(file_name)[0].strip()
+        stem = re.sub(r"^\s*(?:[\[【](?:0?[1-9]|1[0-2])月(?:新番)?[\]】]\s*)+", "", stem)
+        while True:
+            clean = re.sub(
+                r"\s*[\[【(（](?:完全无修版|无修版|未删减版|无删减版|修正版|2160p|1080p|720p|4k)[\]】)）]\s*$",
+                "", stem, flags=re.I,
+            )
+            clean = re.sub(r"[ ._-]+(?:2160p|1080p|720p|4k)\s*$", "", clean, flags=re.I).strip()
+            if clean == stem:
+                break
+            stem = clean
+        stem = re.sub(cls.subtitle_suffix, "", stem, flags=re.I)
+        if re.search(r"(?<!\d)\d{1,3}\s*[-~～]\s*\d{1,3}$", stem):
+            return None
+        match = re.fullmatch(
+            r"(.*?)(?:(?<![A-Za-z0-9])s\d{1,2}e(\d{1,3})|(?<![A-Za-z0-9])(?:ep?|episode)[ ._-]*(\d{1,3})|第\s*(\d{1,3})\s*[集话])",
+            stem, re.I,
+        )
+        if match:
+            prefix, *numbers = match.groups()
+            number = next(value for value in numbers if value is not None)
+        elif re.fullmatch(r"\d{1,3}", stem):
+            prefix, number = "", stem
+        elif match := re.fullmatch(r"(.+?)[ ._-]+(0\d{1,2})", stem):
+            prefix, number = match.groups()
+        else:
+            return None
+        if (int(number) < 1 or re.search(r"s\d{1,2}e\d|(?<![A-Za-z])e(?:p)?\d|第\s*\d+\s*[集话]", prefix, re.I)
+                or re.search(r"(?:^|[ ._-])(?:sp|ova|oad|op|ed|pv)\s*$", prefix, re.I)
+                or re.search(r"(?:^|[ ._-])\d{1,3}\s*[-~～]\s*$", prefix)):
+            return None
+        return number
+
     def sub(self, pattern, replace, file_name):
         """魔法正则、变量替换"""
         if not replace:
             return file_name
+        if "{EXX}" in replace:
+            episode = self._strict_episode(file_name)
+            if episode is None:
+                return file_name
+            replace = replace.replace("{EXX}", episode.zfill(2))
         # 预处理替换变量
         for key, p_list in self.magic_variable.items():
             if key in replace:
+                match = None
                 # 正则类替换变量
                 if p_list and isinstance(p_list, list):
+                    source_name = file_name
+                    if key == "{E}":
+                        # 发布月份不是集号；只去掉明确的开头月份标签。
+                        source_name = re.sub(
+                            r"^\s*(?:[\[【](?:0?[1-9]|1[0-2])月(?:新番)?[\]】]\s*)+",
+                            "", file_name,
+                        )
                     for p in p_list:
-                        match = re.search(p, file_name)
+                        match = re.search(p, source_name)
                         if match:
                             # 匹配成功，替换为匹配到的值
                             value = match.group()
@@ -553,6 +650,32 @@ class MagicRename:
         else:
             file_name = replace
         return file_name
+
+    def media_name(self, pattern, replace, file_name):
+        """保留媒体类型和安全文件名；不适用的字幕规则保留原名。"""
+        original = {"file_name": file_name, "dir": False}
+        if not is_media_file(original):
+            return file_name
+        try:
+            pattern, replace = self.magic_regex_conv(pattern, replace)
+            if pattern and not re.search(pattern, file_name):
+                return file_name
+            renamed = self.sub(pattern, replace, file_name)
+        except (re.error, IndexError):
+            return file_name
+        if not is_video_file(original) and renamed != file_name:
+            if suffix := re.search(self.subtitle_suffix, os.path.splitext(file_name)[0], re.I):
+                stem, extension = os.path.splitext(renamed)
+                if not stem.casefold().endswith(suffix.group().casefold()):
+                    renamed = stem + suffix.group() + extension
+        if (not renamed or renamed != renamed.strip() or renamed.endswith(".")
+                or ".." in renamed or re.search(r'[\\/:*?"<>|]', renamed)
+                or any(unicodedata.category(char).startswith("C") for char in renamed)):
+            return file_name
+        result = {"file_name": renamed, "dir": False}
+        if not is_media_file(result) or is_video_file(result) != is_video_file(original):
+            return file_name
+        return renamed
 
     def _custom_sort_key(self, name):
         """自定义排序键"""
@@ -848,6 +971,8 @@ class Quark:
             else:
                 break
             if len(list_merge) >= total or (max_pages and page > max_pages):
+                if len(list_merge) < total:
+                    response["data"]["truncated"] = True
                 break
         response["data"]["list"] = list_merge
         return response
@@ -1112,7 +1237,10 @@ class Quark:
             pwd_id, passcode, pdir_fid, _ = self.extract_url(shareurl)
             stoken = self.get_stoken(pwd_id, passcode)["data"]["stoken"]
             share_file_list = self.get_detail(pwd_id, stoken, pdir_fid)["data"]["list"]
-            print(f"获取分享: {share_file_list}")
+            share_file_list = [item for item in share_file_list if is_media_file(item)]
+            if not any(is_video_file(item) for item in share_file_list):
+                print("转存测试已跳过：当前目录没有可转存的视频")
+                return False
             fid_list = [item["fid"] for item in share_file_list]
             fid_token_list = [item["share_fid_token"] for item in share_file_list]
             get_fids = self.get_fids([savepath])
@@ -1270,6 +1398,17 @@ class Quark:
         name, seasons, years = _resource_title_parts(title)
         names = {name} | {_resource_title_parts(alias)[0] for alias in aliases}
         names |= {first + second for first in names for second in names if first != second}
+
+        def listing_is_complete(detail):
+            nonlocal limited
+            data = detail.get("data") or {}
+            files = data.get("list", [])
+            total = (detail.get("metadata") or {}).get("_total", len(files))
+            complete = not data.get("truncated") and type(total) is int and 0 <= total <= len(files)
+            if not complete:
+                limited = True
+            return complete
+
         for candidate in candidates:
             found_results = True
             if checked >= max_checked:
@@ -1299,9 +1438,9 @@ class Quark:
                 stoken = (token.get("data") or {}).get("stoken")
                 if token.get("status") != 200 or not stoken:
                     continue
-                detail = self.get_detail(pwd_id, stoken, pdir_fid, _fetch_share=1, max_pages=1)
+                detail = self.get_detail(pwd_id, stoken, pdir_fid, _fetch_share=1, max_pages=3)
                 files = (detail.get("data") or {}).get("list", [])
-                if detail.get("code") != 0 or not files:
+                if detail.get("code") != 0 or not listing_is_complete(detail) or not files:
                     continue
                 directory_evidence = []
                 share = detail["data"].get("share")
@@ -1312,8 +1451,17 @@ class Quark:
                 base_title = re.sub(_RESOURCE_SEASON_PATTERN, " ", title, flags=re.I)
                 # Follow one verified path; sibling seasons are neither evidence nor a save target.
                 for _ in range(3):
+                    folders = [item for item in files if item.get("dir")]
+                    named_single_folder = len(folders) == 1 and not any(is_video_file(item) for item in files) and resource_titles_match(
+                        title, folders[0]["file_name"], allow_missing_year=True, aliases=aliases)
                     if len(files) == 1 and files[0].get("dir"):
                         folder = files[0]
+                    elif named_single_folder:
+                        folder = folders[0]
+                        if not re.fullmatch(r"[A-Za-z0-9_]{32}", str(folder.get("fid", ""))):
+                            ambiguous = True
+                            break
+                        selected_fid = folder["fid"]
                     else:
                         if len(seasons) != 1:
                             break
@@ -1343,18 +1491,20 @@ class Quark:
                         selected_fid = folder["fid"]
                     directory_evidence.append(folder["file_name"])
                     verified_pdir_fid = folder["fid"]
-                    detail = self.get_detail(pwd_id, stoken, folder["fid"], max_pages=1)
+                    detail = self.get_detail(pwd_id, stoken, folder["fid"], max_pages=3)
                     files = (detail.get("data") or {}).get("list", [])
-                    if detail.get("code") != 0 or not files:
+                    if detail.get("code") != 0 or not listing_is_complete(detail) or not files:
                         break
-                if ambiguous or detail.get("code") != 0 or not files:
+                else:
+                    if any(item.get("dir") for item in files) and not any(is_video_file(item) for item in files):
+                        limited = True
+                if ambiguous or detail.get("code") != 0 or not listing_is_complete(detail) or not files:
                     continue
-                evidence = directory_evidence + [item.get("file_name", "") for item in files]
-                video_files = [item for item in files if not item.get("dir")
-                               and re.search(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", item.get("file_name", ""), re.I)
-                               and item.get("obj_category", "video") == "video"]
-                if task.get("resource_type") in ("anime", "tv") and not video_files:
+                video_files = [item for item in files if is_video_file(item)]
+                if not video_files:
                     continue
+                evidence = directory_evidence + [item.get("file_name", "") for item in files
+                                                  if item.get("dir") or is_video_file(item)]
                 video_names = {item["file_name"] for item in video_files}
                 evidence = [_resource_video_title(value) if value in video_names else value for value in evidence]
                 if any(other_name in names | {""} and (
@@ -1411,16 +1561,17 @@ class Quark:
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 print(f"候选分享验证失败：{type(exc).__name__}")
         return {"success": False, "candidate": None, "code": "no_match" if found_results else "no_results", "validation_limited": limited,
-                "error": "未找到经夸克文件验证的同名、同季、同年份资源，请尝试其他译名或手动选择链接" if found_results
+                "error": "候选目录验证达到分页或深度上限，尚未完整确认可用视频" if limited else
+                "未找到经夸克视频文件验证的同名、同季、同年份资源，请尝试其他译名或手动选择链接" if found_results
                 else "已查询的来源未返回该名称的夸克资源，请尝试其他译名或手动搜索"}
 
-    def repair_share(self, task):
+    def repair_share(self, task, reason="分享已失效"):
         if not task.get("auto_repair", CONFIG_DATA.get("auto_repair", True)):
             return None
         if task.get("update_subdir_resave_mode"):
             print("自动换源已跳过：此任务开启了删除子目录后重存，请手工检查新资源")
             return None
-        print(f"🔎《{task['taskname']}》分享已失效，查找同名同季资源")
+        print(f"🔎《{task['taskname']}》{reason}，查找同名同季资源")
         result = self.find_valid_resource(task, CONFIG_DATA)
         if not result["success"]:
             print(f"自动换源未完成：{result['error']}")
@@ -1460,7 +1611,11 @@ class Quark:
             if response.get("code") != 0 or not isinstance(files, list):
                 print("缺集检查暂不可用：无法读取保存目录，下次运行重试")
                 return
-            folders = [item for item in files if item.get("dir")]
+            shared_path = savepath == "/cartoon" or sum(
+                other.get("savepath", "").rstrip("/") == savepath.rstrip("/")
+                for other in CONFIG_DATA.get("tasklist", [])
+            ) > 1
+            folders = [] if shared_path else [item for item in files if item.get("dir")]
             if len(folders) > 3:
                 print("缺集检查已跳过：保存目录子目录较多，请先确认同一季的目录")
                 return
@@ -1470,10 +1625,18 @@ class Quark:
                 if children.get("code") != 0 or child_list != [] or (children.get("metadata") or {}).get("_total", 0):
                     print("缺集检查已跳过：子目录非空或读取失败，请先确认同一季的目录")
                     return
-            names = [item.get("file_name", "") for item in files
-                     if re.search(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", item.get("file_name", ""), re.I)]
+            names = [item["file_name"] for item in files if is_video_file(item)]
+            if shared_path:
+                titles = [_resource_title_parts(task["taskname"])[0]] + [
+                    _resource_title_parts(alias)[0] for alias in task.get("search_aliases", []) if isinstance(alias, str)
+                ]
+                # 共用目录中纯数字文件无法确定作品，仅具名视频参与该订阅的缺集检查。
+                names = [name for name in names if any(
+                    title and title in re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", name).casefold())
+                    for title in titles
+                )]
             names += [node.data.get("file_name", "") for node in tree.all_nodes()
-                      if node.data and not node.data.get("is_dir")]
+                      if node.data and is_video_file(node.data)]
             episodes = {_resource_episode_number(task, filename) for filename in names}
             if None in episodes:
                 print("缺集检查已跳过：存在无法可靠识别集号的视频，不推测缺集")
@@ -1498,10 +1661,11 @@ class Quark:
                 if node.identifier == supplement.root or not node.data or node.data.get("is_dir"):
                     continue
                 episode = _resource_episode_number(task, node.data.get("file_name", ""))
-                if episode in missing:
+                if episode in missing or (is_media_file(node.data) and not is_video_file(node.data)):
                     tree.create_node(node.tag, f"episode-repair:{candidate['pwd_id']}:{node.identifier}",
                                      parent=tree.root, data=node.data)
-                    saved.add(episode)
+                    if episode in missing:
+                        saved.add(episode)
             if saved:
                 print(f"补集转存成功：{sorted(saved)}；保留原订阅继续追更")
             remaining = missing - saved
@@ -1511,6 +1675,7 @@ class Quark:
             print(f"补集暂未完成（{type(exc).__name__}）；保留原订阅和已有文件")
 
     def do_save_task(self, task):
+        apply_media_rename_defaults(task)
         # Recheck historical bans: older versions also banned temporary login errors.
         repaired = False
         pwd_id, passcode, pdir_fid, _ = self.extract_url(task["shareurl"])
@@ -1539,16 +1704,19 @@ class Quark:
         else:
             task.pop("shareurl_ban", None)
 
-        updated_tree = self.dir_check_and_save(task, pwd_id, stoken, pdir_fid)
-        if not repaired and is_expired_share({"message": task.get("shareurl_ban", "")}):
-            replacement = self.repair_share(task)
+        scan_state = {}
+        updated_tree = self.dir_check_and_save(task, pwd_id, stoken, pdir_fid, scan_state=scan_state)
+        no_video = scan_state.get("complete") and not scan_state.get("has_video")
+        if not repaired and (no_video or is_expired_share({"message": task.get("shareurl_ban", "")})):
+            replacement = self.repair_share(task, reason="分享不含视频") if no_video else self.repair_share(task)
             if replacement:
                 updated_tree = self.dir_check_and_save(
                     task, replacement["pwd_id"], replacement["stoken"], replacement["pdir_fid"]
                 )
+        self.do_rename(updated_tree, task=task)
         self.repair_episode_gaps(task, updated_tree)
         if updated_tree.size(1) > 0:
-            self.do_rename(updated_tree)
+            self.do_rename(updated_tree, task=task)
             print()
             add_notify(f"✅《{task['taskname']}》添加追更：\n{updated_tree}")
             return updated_tree
@@ -1556,223 +1724,195 @@ class Quark:
             print(f"任务结束：没有新的转存任务")
             return False
 
-    def dir_check_and_save(self, task, pwd_id, stoken, pdir_fid="", subdir_path="", allowed_episode_fids=None):
+    def _scan_share_media(self, task, pwd_id, stoken, pdir_fid, subdir_path=""):
+        state = {"complete": False, "has_video": False, "directories": []}
+        visited, count = set(), 0
+
+        def visit(fid, path, depth=0, include=True):
+            nonlocal count
+            if depth > 8 or len(visited) >= 100 or str(fid) in visited:
+                raise ValueError("目录检查达到限制")
+            visited.add(str(fid))
+            response = self.get_detail(pwd_id, stoken, fid, max_pages=20)
+            if response.get("code") != 0:
+                if is_expired_share(response):
+                    task["shareurl_ban"] = response["message"]
+                raise ValueError("分享目录读取失败")
+            data = response.get("data") or {}
+            files = data.get("list")
+            if not isinstance(files, list) or data.get("truncated"):
+                raise ValueError("分享目录未完整读取")
+            total = (response.get("metadata") or {}).get("_total", len(files))
+            if type(total) is not int or total > len(files):
+                raise ValueError("分享目录未完整读取")
+            count += len(files)
+            if count > 10000:
+                raise ValueError("文件检查达到限制")
+            # 延续单层包装目录直接展开到任务保存路径的行为。
+            if depth == 0 and not path and len(files) == 1 and files[0].get("dir"):
+                visit(files[0]["fid"], path, depth + 1, include)
+                return
+            state["has_video"] |= any(is_video_file(item) for item in files)
+            if include:
+                state["directories"].append((fid, path, files))
+            for item in files:
+                if item.get("dir"):
+                    name = item["file_name"]
+                    if name in (".", "..") or re.search(r"[\\/\x00-\x1f]", name):
+                        raise ValueError("目录名称不安全")
+                    folder_pattern = task.get("update_subdir") or ".*"
+                    if folder_pattern in (MEDIA_PATTERN, task.get("pattern")):
+                        folder_pattern = ".*"
+                    selected = include and bool(re.search(folder_pattern, name))
+                    visit(item["fid"], path + "/" + name, depth + 1, selected)
+
+        try:
+            visit(pdir_fid, subdir_path)
+            state["complete"] = True
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            print(f"媒体检查未完成（{type(exc).__name__}）；本次不转存，也不据此判断分享无视频")
+        return state
+
+    def dir_check_and_save(self, task, pwd_id, stoken, pdir_fid="", subdir_path="", allowed_episode_fids=None, scan_state=None):
         tree = Tree()
-        # 获取分享文件列表
-        detail = self.get_detail(pwd_id, stoken, pdir_fid)
-        if detail.get("code") != 0 or not isinstance(detail.get("data"), dict):
-            if not subdir_path and is_expired_share(detail):
-                task["shareurl_ban"] = detail["message"]
-            print(f"读取分享失败：{detail.get('message', '服务暂不可用')}；下次重试")
+        state = self._scan_share_media(task, pwd_id, stoken, pdir_fid, subdir_path)
+        if scan_state is not None:
+            scan_state.update(state)
+        if not state["complete"]:
             return tree
-        share_file_list = detail["data"].get("list", [])
-        # print("share_file_list: ", share_file_list)
-
-        if not share_file_list:
-            if subdir_path == "":
-                task["shareurl_ban"] = "分享为空，文件已被分享者删除"
-                add_notify(f"❌《{task['taskname']}》：{task['shareurl_ban']}\n")
+        if not state["has_video"]:
+            print("分享内没有视频文件，跳过其中的字幕和其他文件")
             return tree
-        elif (
-            len(share_file_list) == 1
-            and share_file_list[0]["dir"]
-            and subdir_path == ""
-        ):  # 仅有一个文件夹
-            print("🧠 该分享是一个文件夹，读取文件夹内列表")
-            detail = self.get_detail(
-                pwd_id, stoken, share_file_list[0]["fid"]
-            )
-            if detail.get("code") != 0 or not isinstance(detail.get("data"), dict):
-                if is_expired_share(detail):
-                    task["shareurl_ban"] = detail["message"]
-                print(f"读取分享子目录失败：{detail.get('message', '服务暂不可用')}；下次重试")
-                return tree
-            share_file_list = detail["data"].get("list", [])
-
-        if allowed_episode_fids is not None:
-            verified = _episode_repair_files(task, share_file_list, set(allowed_episode_fids.values()))
-            share_file_list = [item for item in share_file_list
-                               if item.get("fid") in verified
-                               and verified[item["fid"]] == allowed_episode_fids.get(item["fid"])]
-
-        # 获取目标目录文件列表
-        savepath = re.sub(r"/{2,}", "/", f"/{task['savepath']}{subdir_path}")
-        if not self.savepath_fid.get(savepath):
-            if get_fids := self.get_fids([savepath]):
-                self.savepath_fid[savepath] = get_fids[0]["fid"]
-            else:
-                print(f"❌ 目录 {savepath} fid获取失败，跳过转存")
-                return tree
-        to_pdir_fid = self.savepath_fid[savepath]
-        dir_file_list = self.ls_dir(to_pdir_fid)["data"]["list"]
-        dir_filename_list = [dir_file["file_name"] for dir_file in dir_file_list]
-        # print("dir_file_list: ", dir_file_list)
-
-        tree.create_node(
-            savepath,
-            pdir_fid,
-            data={
-                "is_dir": True,
-            },
-        )
-
-        # 文件命名类
+        rootpath = re.sub(r"/{2,}", "/", f"/{task['savepath']}")
+        tree.create_node(rootpath, pdir_fid, data={"is_dir": True})
         mr = MagicRename(CONFIG_DATA.get("magic_regex", {}))
         mr.set_taskname(task["taskname"])
+        pattern, replace = mr.magic_regex_conv(task.get("pattern", ""), task.get("replace", ""))
+        if task.get("update_subdir_resave_mode"):
+            print("媒体白名单模式按文件检查子目录，不整目录删除重存")
+        planned_names = set()
+        shared_path = rootpath == "/cartoon" or sum(
+            other.get("savepath", "").rstrip("/") == rootpath.rstrip("/")
+            for other in CONFIG_DATA.get("tasklist", [])
+        ) > 1
 
-        # 魔法正则转换
-        pattern, replace = mr.magic_regex_conv(
-            task.get("pattern", ""), task.get("replace", "")
-        )
-        # 需保存的文件清单
-        need_save_list = []
-        # 添加符合的
-        for share_file in share_file_list:
-            search_pattern = (
-                task["update_subdir"]
-                if share_file["dir"] and task.get("update_subdir")
-                else pattern
-            )
-            # 正则文件名匹配
-            if re.search(search_pattern, share_file["file_name"]):
-                # 判断原文件名是否存在，处理忽略扩展名
-                if not mr.is_exists(
-                    share_file["file_name"],
-                    dir_filename_list,
-                    (task.get("ignore_extension") and not share_file["dir"]),
-                ):
-                    # 文件夹、子目录文件不进行重命名
-                    if share_file["dir"] or subdir_path:
-                        share_file["file_name_re"] = share_file["file_name"]
-                        need_save_list.append(share_file)
-                    else:
-                        # 替换后的文件名
-                        file_name_re = mr.sub(pattern, replace, share_file["file_name"])
-                        # 判断替换后的文件名是否存在
-                        if not mr.is_exists(
-                            file_name_re,
-                            dir_filename_list,
-                            task.get("ignore_extension"),
-                        ):
-                            share_file["file_name_re"] = file_name_re
-                            need_save_list.append(share_file)
-                elif share_file["dir"]:
-                    # 存在并是一个目录，历遍子目录
-                    if task.get("update_subdir", False) and re.search(
-                        task["update_subdir"], share_file["file_name"]
-                    ):
-                        if task.get("update_subdir_resave_mode", False):
-                            # 重存模式：删除该目录下所有文件，重新转存
-                            print(f"重存子目录：{savepath}/{share_file['file_name']}")
-                            # 删除子目录、回收站中彻底删除
-                            subdir = next(
-                                (
-                                    f
-                                    for f in dir_file_list
-                                    if f["file_name"] == share_file["file_name"]
-                                ),
-                                None,
-                            )
-                            delete_return = self.delete([subdir["fid"]])
-                            self.query_task(delete_return["data"]["task_id"])
-                            recycle_list = self.recycle_list()
-                            record_id_list = [
-                                item["record_id"]
-                                for item in recycle_list
-                                if item["fid"] == subdir["fid"]
-                            ]
-                            self.recycle_remove(record_id_list)
-                            # 作为新文件添加到转存列表
-                            share_file["file_name_re"] = share_file["file_name"]
-                            need_save_list.append(share_file)
-                        else:
-                            # 递归模式
-                            print(f"检查子目录：{savepath}/{share_file['file_name']}")
-                            subdir_tree = self.dir_check_and_save(
-                                task,
-                                pwd_id,
-                                stoken,
-                                share_file["fid"],
-                                f"{subdir_path}/{share_file['file_name']}",
-                            )
-                            if subdir_tree.size(1) > 0:
-                                # 合并子目录树
-                                tree.create_node(
-                                    "📁" + share_file["file_name"],
-                                    share_file["fid"],
-                                    parent=pdir_fid,
-                                    data={
-                                        "is_dir": share_file["dir"],
-                                    },
-                                )
-                                tree.merge(share_file["fid"], subdir_tree, deep=False)
-            # 指定文件开始订阅/到达指定文件（含）结束历遍
-            if share_file["fid"] == task.get("startfid", ""):
-                break
-
-        if re.search(r"\{I+\}", replace):
-            mr.set_dir_file_list(dir_file_list, replace)
-            mr.sort_file_list(need_save_list)
-
-        # 转存文件
-        fid_list = [item["fid"] for item in need_save_list]
-        fid_token_list = [item["share_fid_token"] for item in need_save_list]
-        if fid_list:
-            err_msg = None
-            save_as_top_fids = []
-            while fid_list:
-                # 分次转存，100个/次，因query_task返回save_as_top_fids最多100
-                save_file_return = self.save_file(
-                    fid_list[:100], fid_token_list[:100], to_pdir_fid, pwd_id, stoken
-                )
-                fid_list = fid_list[100:]
-                fid_token_list = fid_token_list[100:]
-                if save_file_return["code"] == 0:
-                    # 转存成功，查询转存结果
-                    task_id = save_file_return["data"]["task_id"]
-                    query_task_return = self.query_task(task_id)
-                    if query_task_return["code"] == 0:
-                        save_as_top_fids.extend(
-                            query_task_return["data"]["save_as"]["save_as_top_fids"]
-                        )
-                    else:
-                        err_msg = query_task_return["message"]
+        for source_fid, path, source_files in state["directories"]:
+            verified = (_episode_repair_files(task, source_files, set(allowed_episode_fids.values()))
+                        if allowed_episode_fids is not None else None)
+            eligible = []
+            for item in source_files:
+                if is_media_file(item):
+                    video = is_video_file(item)
+                    allowed = not video or re.search(pattern, item["file_name"])
+                    if video and verified is not None:
+                        allowed = item["fid"] in verified and verified[item["fid"]] == allowed_episode_fids.get(item["fid"])
+                    if allowed:
+                        eligible.append(deepcopy(item))
+                if item.get("fid") == task.get("startfid", ""):
+                    break
+            if not eligible:
+                continue
+            savepath = rootpath
+            if savepath not in self.savepath_fid:
+                existing = self.get_fids([savepath])
+                if existing:
+                    self.savepath_fid[savepath] = existing[0]["fid"]
                 else:
-                    err_msg = save_file_return["message"]
-                if err_msg:
-                    add_notify(f"❌《{task['taskname']}》转存失败：{err_msg}\n")
-            # 建立目录树
-            if len(need_save_list) == len(save_as_top_fids):
-                for index, item in enumerate(need_save_list):
-                    icon = self._get_file_icon(item)
-                    tree.create_node(
-                        f"{icon}{item['file_name_re']}",
-                        item["fid"],
-                        parent=pdir_fid,
-                        data={
-                            "file_name": item["file_name"],
-                            "file_name_re": item["file_name_re"],
-                            "fid": f"{save_as_top_fids[index]}",
-                            "path": f"{savepath}/{item['file_name_re']}",
-                            "is_dir": item["dir"],
-                            "obj_category": item.get("obj_category", ""),
-                        },
-                    )
+                    created = self.mkdir(savepath)
+                    if created.get("code") != 0:
+                        print(f"无法创建媒体目录：{savepath}；下次重试")
+                        continue
+                    self.savepath_fid[savepath] = created["data"]["fid"]
+            destination_fid = self.savepath_fid[savepath]
+            listing = self.ls_dir(destination_fid)
+            if listing.get("code") != 0:
+                print(f"无法读取保存目录：{savepath}；下次重试")
+                continue
+            existing_files = listing["data"]["list"]
+            names = [item["file_name"] for item in existing_files]
+            video_names = [item["file_name"] for item in existing_files if is_video_file(item)]
+            for item in eligible:
+                item["file_name_re"] = mr.media_name(pattern, replace, item["file_name"])
+            if re.search(r"\{I+\}", replace):
+                mr.set_dir_file_list(existing_files, replace)
+                mr.sort_file_list(eligible)
+
+            def add_saved(item, fid):
+                if tree.contains(str(fid)):
+                    return
+                if item["file_name"] != item["file_name_re"]:
+                    task.setdefault("rename_pending", {})[str(fid)] = {
+                        "original": item["file_name"], "renamed": item["file_name_re"], "path": savepath}
+                tree.create_node(self._get_file_icon(item) + item["file_name_re"], str(fid), parent=pdir_fid,
+                                 data={"file_name": item["file_name"], "file_name_re": item["file_name_re"],
+                                       "fid": str(fid), "path": f"{savepath}/{item['file_name']}",
+                                       "is_dir": False, "obj_category": item.get("obj_category", "")})
+
+            pending = []
+            reserved = set(names) | planned_names
+            for item in eligible:
+                original, renamed = item["file_name"], item["file_name_re"]
+                ignore_extension = bool(task.get("ignore_extension") and is_video_file(item))
+                comparable_names = video_names if ignore_extension else names
+                # 字幕必须按完整文件名判断，不能被同名视频的不同后缀吞掉。
+                present = next((f for f in existing_files if not f.get("dir") and f["file_name"] == original), None)
+                if present and renamed not in reserved:
+                    recorded = task.get("rename_pending", {}).get(str(present["fid"]), {})
+                    owned = (not shared_path or
+                             (item.get("md5") and item["md5"] == present.get("md5")) or
+                             (recorded.get("original") == original and recorded.get("path") == savepath))
+                    if not owned:
+                        print(f"保存目录已有同名文件 {original}，无法确认属于《{task['taskname']}》；跳过，避免改名或覆盖其他作品")
+                        continue
+                if present and renamed != original and renamed not in planned_names and not mr.is_exists(renamed, comparable_names, ignore_extension):
+                    add_saved(item, present["fid"])
+                    reserved.add(renamed)
+                    planned_names.add(renamed)
+                elif mr.is_exists(original, comparable_names, ignore_extension) or renamed in reserved or mr.is_exists(renamed, comparable_names, ignore_extension):
+                    continue
+                else:
+                    pending.append(item)
+                    reserved.add(renamed)
+                    planned_names.add(renamed)
+            for offset in range(0, len(pending), 100):
+                batch = pending[offset:offset + 100]
+                response = self.save_file([item["fid"] for item in batch], [item["share_fid_token"] for item in batch],
+                                          destination_fid, pwd_id, stoken)
+                if response.get("code") == 0:
+                    response = self.query_task(response["data"]["task_id"])
+                    saved = ((response.get("data") or {}).get("save_as") or {}).get("save_as_top_fids", [])
+                    if response.get("code") == 0 and len(saved) == len(batch):
+                        for item, fid in zip(batch, saved):
+                            add_saved(item, fid)
+                        continue
+                add_notify(f"❌《{task['taskname']}》媒体转存失败或结果不完整，下次重试")
         return tree
 
-    def do_rename(self, tree, node_id=None):
-        if node_id is None:
-            node_id = tree.root
-        for child in tree.children(node_id):
-            file = child.data
-            if file.get("is_dir"):
-                # self.do_rename(tree, child.identifier)
-                pass
-            elif file.get("file_name_re") and file["file_name_re"] != file["file_name"]:
-                rename_ret = self.rename(file["fid"], file["file_name_re"])
-                print(f"重命名：{file['file_name']} → {file['file_name_re']}")
-                if rename_ret["code"] != 0:
-                    print(f"      ↑ 失败，{rename_ret['message']}")
+    def do_rename(self, tree, node_id=None, task=None):
+        for node in tree.all_nodes():
+            file = node.data or {}
+            if file.get("is_dir", True) or not file.get("file_name_re"):
+                continue
+            original, renamed = file["file_name"], file["file_name_re"]
+            if original != renamed:
+                if file.get("renamed") or file.get("rename_failed"):
+                    continue
+                try:
+                    response = self.rename(file["fid"], renamed)
+                except (requests.RequestException, ValueError):
+                    response = {"code": 1}
+                if response.get("code") != 0:
+                    file["rename_failed"] = True
+                    print(f"重命名失败：{original} → {renamed}；保留原文件，下次运行重试")
+                    continue
+                print(f"重命名：{original} → {renamed}")
+                file["renamed"] = True
+            file["path"] = file["path"].rsplit("/", 1)[0] + "/" + renamed
+            node.tag = self._get_file_icon({"obj_category": file.get("obj_category")}) + renamed
+            if task is not None:
+                task.get("rename_pending", {}).pop(str(file["fid"]), None)
+                if not task.get("rename_pending"):
+                    task.pop("rename_pending", None)
 
     def _get_file_icon(self, f):
         if f.get("dir"):
@@ -1863,6 +2003,8 @@ def do_save(account, tasklist=[]):
     print()
     print(f"转存账号: {account.nickname}")
     # 获取全部保存目录fid
+    for task in tasklist:
+        apply_media_rename_defaults(task)
     account.update_savepath_fid(tasklist)
 
     def is_time(task):
@@ -1939,8 +2081,14 @@ def do_save(account, tasklist=[]):
                     if hasattr(plugin, "run") and (
                         plugin_name == "aria2" or (is_new_tree and plugin.is_active)
                     ):
+                        options = {}
+                        if plugin_name == "aria2":
+                            options["shared_path"] = task["savepath"].rstrip("/") == "/cartoon" or sum(
+                                other.get("savepath", "").rstrip("/") == task["savepath"].rstrip("/")
+                                for other in CONFIG_DATA.get("tasklist", tasklist)
+                            ) > 1
                         task = (
-                            plugin.run(task, account=account, tree=is_new_tree) or task
+                            plugin.run(task, account=account, tree=is_new_tree, **options) or task
                         )
     print()
     print(f"===============插件收尾===============")

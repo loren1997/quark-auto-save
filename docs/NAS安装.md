@@ -6,7 +6,7 @@
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.2 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.2) 中的 `quark-auto-save-nas-docker-v3.2.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.3 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.3) 中的 `quark-auto-save-nas-docker-v3.3.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -54,11 +54,13 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 1. 在自己的浏览器登录夸克网盘，按原项目方式取得 Cookie，粘贴到系统配置的第一个 Cookie 输入框并保存。不要将 Cookie、Aria2 密钥或真实 `config/` 上传 GitHub。
 2. 确认 PanSou 启用，服务器是 `http://pansou:8888`。首次搜索可能需要等待索引源返回。
-3. 设置“热门订阅的夸克网盘保存目录”，默认 `/追更`。
+3. 设置“热门订阅的夸克网盘保存目录”，默认 `/cartoon`。文件直接放入此目录，不再追加剧名或来源子目录。
 4. 默认每天 08:00、18:00、20:00 检查更新；可用 Crontab 调整。
 5. 先在任务列表添加一个自己有权保存的分享，运行并检查日志与实际网盘目录。
 
 新安装的任务列表为空，不会自动转存上游示例资源。原有 `config/quark_config.json` 的订阅不会被模板替换。
+
+只转存白名单视频和字幕；图片、文本、压缩包和可执行文件均跳过。分享中的目录会逐层检查，允许的文件平铺到任务保存目录，不整文件夹转存。热门任务默认按 `片名 S01E01.原后缀` 命名，明确第三季使用 `S03`；MKV、MP4、ASS、SRT 等保留原后缀，不进行转码。无法可靠识别集号时保留原文件名，已有自定义命名规则保留。
 
 ## 3. 搜索与自动换源
 
@@ -70,9 +72,9 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 使用仓库或发布包的 Compose 时，可在 `.env` 增加 `QAS_PROXY=http://你的代理局域网地址:端口`，然后 `docker compose up -d` 重建应用容器。默认不启用代理；不要把 NAS 以外的代理写成 `127.0.0.1`，该地址在容器内指向容器自身。
 
-“分享失效时自动搜索并替换”默认启用。每次正常任务运行时，会重新检查原分享和旧版标记失效的分享；只有明确取消、过期、不存在等失效响应才换源，登录、提取码、网络和限流错误会保留原订阅，下次重试。
+“分享失效时自动搜索并替换”默认启用。每次正常任务运行时，会重新检查原分享和旧版标记失效的分享；明确取消、过期、不存在，或完整扫描确认分享不含视频时，会尝试查找新来源。只有字幕的分享也不作为视频资源。登录、提取码、网络和限流错误，以及未完成的分页或目录扫描，都不会被误判为无视频，会保留原订阅，下次重试。
 
-候选需满足标题、季数和已知年份约束，并验证实际夸克分享内容。索引最多检查 5 个候选，网页补搜最多检查 3 个新候选；无法可靠匹配时保留原订阅并输出日志。原保存目录、正则、重命名和周期保持不变。旧分享中的 `startfid` 无法迁移，会清除；最近 10 次替换记录保存在任务 `repair_history`，仅包含分享 ID，不包含验证 token。
+候选需满足标题、季数和已知年份约束，并确认实际分享包含视频；纯字幕、文档或广告候选会跳过并继续查找。索引最多检查 5 个候选，网页补搜最多检查 3 个新候选；每层目录最多验证 3 页，未完整读取时不贸然确认。无法可靠匹配时保留原订阅并输出日志。换源沿用任务当前的目录、筛选、命名和周期；旧分享的 `startfid` 无法迁移，会清除。最近 10 次替换记录仅保存分享 ID，不包含验证 token。
 
 热门订阅会使用目录来源的别名，包括 Bangumi 中原名相同且明确关联为原作书籍的中文译名。最多保留 8 个别名，先查询不带年份的不同名称，再补充季号写法与基础片名；索引阶段最多 12 个关键词并设有时间预算，连续两次所有源失败会提前进入网页补搜。网页补搜最多 2 个名称。查询时去掉年份或季数不代表取消验证约束。
 
@@ -111,29 +113,31 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 本项目已有 Aria2 下载插件，安装或使用 NAS 上现有的 Aria2 服务后：
 
 1. 系统配置 → 插件 → aria2，填写 `host_port`（如 `http://NAS局域网IP:6800`）、`secret` 和 `dir`。
-2. `dir` 是 **Aria2 进程看到的下载目录**。Aria2 在容器内运行时，需先将 NAS 下载文件夹挂载到该容器，例如 `/downloads`，这里填写 `/downloads`。
+2. `dir` 是 **Aria2 进程看到的下载根目录**，默认填写 `/downloads`。热门任务的 `save_path` 为 `cartoon`，所以文件直接下载到 `/downloads/cartoon`，不再追加剧名或来源子目录。NAS 上的实际位置由 Aria2 容器的目录挂载决定。
 3. 开启“热门订阅通过 Aria2 下载到 NAS”并保存。仅填写 RPC 连接参数不会启用下载。
-4. 保存后，新旧热门订阅都会启用下载；刚启用的旧任务会在下一次运行时补交保存目录中的文件。到“任务列表”运行原任务即可，无需删除文件或重新订阅。
+4. 保存后，新旧热门订阅都会启用下载；刚启用的旧任务会在下一次运行时补交符合条件的视频。默认不下载字幕，需要时将该任务 `addition.aria2.download_subtitles` 设为 `true`。到“任务列表”运行原任务即可，无需删除文件或重新订阅。
 5. 日志出现 `Aria2已提交` 和 `GID` 表示下载器已受理；实际进度、完成情况和磁盘路径在 Aria2 查看。RPC 未连接、任务未开启、请求被拒绝会分别提示。
 
-无法提交的文件及未扫描成功的子目录会保留到下次运行重试，即使没有新转存也会重试；不保存临时下载直链或 Cookie。普通手动任务仍使用自己的 `addition.aria2` 设置：开启 `auto_download`，需要子目录时开启 `download_subdir`；要补交历史文件，可将 `download_existing` 设为 `true`，完成扫描后自动关闭。显式再次补交会重新提交目录中的所有文件，适用于此前尚未下载的任务。
+无法提交的文件及未扫描成功的子目录会保留到下次运行重试，即使没有新转存也会重试；不保存临时下载直链或 Cookie。普通手动任务仍使用自己的 `addition.aria2` 设置：开启 `auto_download`，需扫描旧子目录时开启 `download_subdir`，下载仍平铺到目标目录；要补交历史文件，可将 `download_existing` 设为 `true`，完成扫描后自动关闭。共享目录补交只选择能按当前任务标准命名规则确认归属的文件；不认领其他剧集或纯集号文件。重命名失败的文件保留待办，成功更名后才提交下载。显式再次补交会重新提交目录中的允许文件，适用于此前尚未下载的任务。
 
 这里不内置第二套下载器；Aria2 负责下载队列、磁盘空间和重试。夸克 Cookie、账号权限和下载直链可用性会影响实际下载。系统中“通知测试”按钮包含上游的转存/清理测试；建议验收自己的独立测试目录。
 
 ## 6. 更新、备份与回退
 
+V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/cartoon`，空白或旧默认命名改为 `片名 S01E01.原后缀`；全局旧默认 `/Downloads` 改为 `/downloads`。自定义目录和命名规则保留。实际迁移旧目录的任务会清除旧下载待办，已开启下载的任务重新检查新目录。更新只调整配置与后续任务，不移动或删除 NAS 上已有文件。
+
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.2：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.3：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.2/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.3/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.2-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.3-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"
