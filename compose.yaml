@@ -1,0 +1,35 @@
+services:
+  quark-auto-save:
+    build: .
+    image: quark-auto-save:local
+    container_name: quark-auto-save
+    restart: unless-stopped
+    ports:
+      - "${QAS_PORT:-5005}:5005"
+    volumes:
+      - ./config:/app/config
+    environment:
+      TZ: Asia/Shanghai
+      WEBUI_USERNAME: ${WEBUI_USERNAME:-admin}
+      WEBUI_PASSWORD: ${WEBUI_PASSWORD:?请在 .env 中设置管理密码}
+      PANSOU_SERVER: http://pansou:8888
+    depends_on:
+      - pansou
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+  pansou:
+    image: ghcr.io/fish2018/pansou:latest
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - pansou-data:/app/data
+      - pansou-logs:/app/logs
+
+volumes:
+  pansou-data:
+  pansou-logs:

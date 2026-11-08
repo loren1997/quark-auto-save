@@ -1,3 +1,9 @@
+> 本维护版新增：修复名称搜索、失效订阅自动换源、热门动漫/电视剧周历和一键订阅，支持复用 Aria2 下载到 NAS。
+>
+> **安装本维护版请使用 [NAS 安装说明](docs/NAS安装.md) 和仓库自带的 `compose.yaml`。** 下文 `cp0204/quark-auto-save` 镜像及原作者更新链接属于上游版本，不包含这些改动。
+>
+> 开发者验证：`python -m unittest discover -s tests -v`；可选无头浏览器检查：`python tests/ui_smoke.py`（需安装 Playwright 和 Chromium）。
+
 <div align="center">
 
 ![quark-logo](img/icon.png)

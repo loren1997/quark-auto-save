@@ -15,9 +15,8 @@ from flask import (
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from sdk.cloudsaver import CloudSaver
-from sdk.pansou import PanSou
+from sdk.discovery import get_calendar
+from copy import deepcopy
 from datetime import timedelta
 import subprocess
 import requests
@@ -31,7 +30,8 @@ import re
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
-from quark_auto_save import Quark, Config, MagicRename
+from quark_auto_save import Quark, Config, MagicRename, resource_titles_match
+from resource_search import search_resources
 
 print(
     r"""
@@ -66,7 +66,7 @@ def get_app_ver():
 
 
 # 文件路径
-PYTHON_PATH = "python3" if os.path.exists("/usr/bin/python3") else "python"
+PYTHON_PATH = sys.executable
 SCRIPT_PATH = os.environ.get("SCRIPT_PATH", "./quark_auto_save.py")
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "./config/quark_config.json")
 PLUGIN_FLAGS = os.environ.get("PLUGIN_FLAGS", "")
@@ -77,6 +77,10 @@ TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", 1800))
 
 config_data = {}
 task_plugins_config_default = {}
+
+
+def config_revision(data):
+    return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 app = Flask(__name__)
 app.config["APP_VERSION"] = get_app_ver()
@@ -177,7 +181,9 @@ def get_data():
     if not is_login():
         return jsonify({"success": False, "message": "未登录"})
     data = Config.read_json(CONFIG_PATH)
+    revision = config_revision(data)
     del data["webui"]
+    data["config_revision"] = revision
     data["api_token"] = get_login_token()
     data["task_plugins_config_default"] = task_plugins_config_default
     return jsonify({"success": True, "data": data})
@@ -191,15 +197,40 @@ def update():
         return jsonify({"success": False, "message": "未登录"})
     # 使用允许列表防止批量赋值攻击
     allowed_keys = ["cookie", "crontab", "push_config", "tasklist",
-                    "magic_regex", "plugins", "source"]
-    for key, value in request.json.items():
-        if key in allowed_keys:
-            config_data.update({key: value})
-    Config.write_json(CONFIG_PATH, config_data)
+                    "magic_regex", "plugins", "source", "auto_repair", "discovery"]
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(success=False, message="配置必须是 JSON 对象"), 400
+    if "auto_repair" in payload and not isinstance(payload["auto_repair"], bool):
+        return jsonify(success=False, message="自动换源必须是开关值"), 400
+    if "discovery" in payload and (not isinstance(payload["discovery"], dict)
+            or not valid_discovery_path(payload["discovery"].get("savepath"))
+            or not isinstance(payload["discovery"].get("auto_download", False), bool)):
+        return jsonify(success=False, message="热门订阅保存路径必须是以 / 开头的夸克网盘目录"), 400
+    if "source" in payload and (not isinstance(payload["source"], dict)
+            or any(not isinstance(value, dict) for value in payload["source"].values())):
+        return jsonify(success=False, message="搜索配置格式错误"), 400
+    if "plugins" in payload and (not isinstance(payload["plugins"], dict)
+            or any(not isinstance(value, dict) for value in payload["plugins"].values())):
+        return jsonify(success=False, message="插件配置格式错误"), 400
+    try:
+        if "crontab" in payload:
+            CronTrigger.from_crontab(payload["crontab"])
+    except (TypeError, ValueError):
+        return jsonify(success=False, message="定时规则格式错误"), 400
+    with Config.locked(CONFIG_PATH):
+        current = Config.read_json(CONFIG_PATH)
+        if payload.get("config_revision") and payload["config_revision"] != config_revision(current):
+            return jsonify(success=False, message="配置已被任务或其他页面更新，请刷新后重新编辑，避免覆盖自动换源结果"), 409
+        config_data = current
+        for key, value in payload.items():
+            if key in allowed_keys:
+                config_data[key] = value
+        Config.write_json(CONFIG_PATH, config_data)
     # 重新加载任务
     if reload_tasks():
         logging.info(f">>> 配置更新成功")
-        return jsonify({"success": True, "message": "配置更新成功"})
+        return jsonify({"success": True, "message": "配置更新成功", "config_revision": config_revision(config_data)})
     else:
         logging.info(f">>> 配置更新失败")
         return jsonify({"success": False, "message": "配置更新失败"})
@@ -239,6 +270,7 @@ def run_script_now():
             errors="replace",
             bufsize=1,
             env=process_env,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         try:
             for line in iter(process.stdout.readline, ""):
@@ -259,64 +291,89 @@ def run_script_now():
 def get_task_suggestions():
     if not is_login():
         return jsonify({"success": False, "message": "未登录"})
-    query = request.args.get("q", "").lower()
-    deep = request.args.get("d", "").lower()
-    cs_data = config_data.get("source", {}).get("cloudsaver", {})
-    ps_data = config_data.get("source", {}).get("pansou", {})
+    return jsonify(search_resources(
+        request.args.get("q", ""), Config.read_json(CONFIG_PATH),
+        refresh=request.args.get("d") == "1",
+    ))
 
-    def cs_search():
-        if (
-            cs_data.get("server")
-            and cs_data.get("username")
-            and cs_data.get("password")
-        ):
-            cs = CloudSaver(cs_data.get("server"))
-            cs.set_auth(
-                cs_data.get("username", ""),
-                cs_data.get("password", ""),
-                cs_data.get("token", ""),
-            )
-            search = cs.auto_login_search(query)
-            if search.get("success"):
-                if search.get("new_token"):
-                    cs_data["token"] = search.get("new_token")
-                    Config.write_json(CONFIG_PATH, config_data)
-                search_results = cs.clean_search_results(search.get("data"))
-                return search_results
-        return []
 
-    def ps_search():
-        if ps_data.get("server"):
-            ps = PanSou(ps_data.get("server"))
-            return ps.search(query, deep == "1")
-        return []
+@app.route("/api/discovery")
+def discovery():
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    return jsonify(success=True, data=get_calendar())
 
-    try:
-        search_results = []
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            features = []
-            if str(cs_data.get("enable", "true")).lower() == "true":
-                features.append(executor.submit(cs_search))
-            if str(ps_data.get("enable", "true")).lower() == "true":
-                features.append(executor.submit(ps_search))
-            for future in as_completed(features):
-                result = future.result()
-                search_results.extend(result)
 
-        # 按时间排序并去重
-        results = []
-        link_array = []
-        search_results.sort(key=lambda x: x.get("datetime", ""), reverse=True)
-        for item in search_results:
-            url = item.get("shareurl", "")
-            if url != "" and url not in link_array:
-                link_array.append(url)
-                results.append(item)
+@app.route("/api/discovery/subscribe", methods=["POST"])
+def subscribe_discovery():
+    global config_data
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
+        return jsonify(success=False, message="缺少资源 ID"), 400
+    entry = next((dict(item, resource_type=kind) for day in get_calendar()["days"]
+                  for kind in ("anime", "tv") for item in day[kind]
+                  if item["id"] == payload["id"]), None)
+    if entry is None:
+        return jsonify(success=False, message="该资源不在本周列表中，请刷新后重试"), 404
+    current = Config.read_json(CONFIG_PATH)
+    title = entry["search_title"]
+    if re.fullmatch(r"\d{4}", str(entry.get("year", ""))):
+        title += f" ({entry['year']})"
+    existing = existing_subscription(current.get("tasklist", []), entry["id"], title)
+    if existing:
+        return jsonify(success=True, existing=True, data=existing, message="已经订阅")
+    settings = current.get("discovery", {})
+    base = settings.get("savepath", "/追更") if isinstance(settings, dict) else None
+    if not valid_discovery_path(base):
+        return jsonify(success=False, message="热门订阅保存路径必须是以 / 开头的夸克网盘目录"), 400
+    auto_download = settings.get("auto_download", False)
+    if auto_download:
+        plugins = current.get("plugins") or {}
+        aria2 = plugins.get("aria2") if isinstance(plugins, dict) else None
+        if ("-aria2" in PLUGIN_FLAGS.split(",") or not isinstance(aria2, dict)
+                or not all(aria2.get(key) for key in ("host_port", "secret", "dir"))):
+            return jsonify(success=False, message="请先启用并配置 Aria2 插件的地址、密钥和下载目录"), 400
+    cookies = current.get("cookie") or []
+    cookie = cookies[0] if isinstance(cookies, list) and cookies else cookies
+    if not isinstance(cookie, str) or not cookie.strip() or cookie.startswith("Your "):
+        return jsonify(success=False, message="请先在系统配置中保存有效的夸克 Cookie"), 400
+    task = {"taskname": title, "resource_type": entry["resource_type"]}
+    result = Quark(cookie).find_valid_resource(task, current)
+    if not result.get("success") or not result.get("candidate"):
+        return jsonify(success=False, message=result.get("error") or "未找到可验证的匹配资源，请在任务列表手动搜索"), 422
+    safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")[:180]
+    task.update({
+        "shareurl": result["candidate"]["shareurl"],
+        "savepath": base.rstrip("/") + "/" + safe_title,
+        "pattern": r"(?i).*\.(mp4|mkv|mov|m4v|avi|ts)$",
+        "replace": "", "update_subdir": ".*",
+        "resource_id": entry["id"], "runweek": list(range(1, 8)),
+        "addition": deepcopy(task_plugins_config_default),
+    })
+    if auto_download:
+        task["addition"].setdefault("aria2", {}).update(auto_download=True, download_subdir=True)
+    with Config.locked(CONFIG_PATH):
+        config_data = Config.read_json(CONFIG_PATH)
+        existing = existing_subscription(config_data.get("tasklist", []), entry["id"], title)
+        if existing:
+            return jsonify(success=True, existing=True, data=existing, message="已经订阅")
+        config_data.setdefault("tasklist", []).append(task)
+        Config.write_json(CONFIG_PATH, config_data)
+    return jsonify(success=True, existing=False, data=task, message="订阅已保存，正在开始转存")
 
-        return jsonify({"success": True, "data": results})
-    except Exception as e:
-        return jsonify({"success": True, "message": f"error: {str(e)}"})
 
+def valid_discovery_path(path):
+    return (isinstance(path, str) and path.startswith("/") and len(path) <= 500
+            and not re.search(r'[\\\x00-\x1f]', path)
+            and not any(part in (".", "..") for part in path.split("/")))
+
+
+def existing_subscription(tasks, resource_id, title):
+    return next((task for task in tasks if task.get("resource_id") == resource_id
+                 or (resource_titles_match(title, task.get("taskname", ""))
+                     and resource_titles_match(task.get("taskname", ""), title))), None)
 
 @app.route("/get_share_detail", methods=["POST"])
 def get_share_detail():
@@ -527,8 +584,10 @@ def add_task():
     if not request_data.get("addition"):
         request_data["addition"] = task_plugins_config_default
     # 添加任务
-    config_data["tasklist"].append(request_data)
-    Config.write_json(CONFIG_PATH, config_data)
+    with Config.locked(CONFIG_PATH):
+        config_data = Config.read_json(CONFIG_PATH)
+        config_data["tasklist"].append(request_data)
+        Config.write_json(CONFIG_PATH, config_data)
     logging.info(f">>> 通过API添加任务: {request_data['taskname']}")
     return jsonify(
         {"success": True, "code": 0, "message": "任务添加成功", "data": request_data}
@@ -540,13 +599,13 @@ def run_python(args):
     logging.info(f">>> 定时运行任务")
     try:
         result = subprocess.run(
-            f"{PYTHON_PATH} {args}",
-            shell=True,
+            [PYTHON_PATH, *args],
             timeout=TASK_TIMEOUT,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         # 输出执行日志
         if result.stdout:
@@ -581,7 +640,7 @@ def reload_tasks():
         scheduler.add_job(
             run_python,
             trigger=trigger,
-            args=[f"{SCRIPT_PATH} {CONFIG_PATH}"],
+            args=[[SCRIPT_PATH, CONFIG_PATH]],
             id=SCRIPT_PATH,
             max_instances=1,  # 最多允许1个实例运行
             coalesce=True,  # 合并错过的任务，避免堆积
@@ -606,44 +665,52 @@ def reload_tasks():
 def init():
     global config_data, task_plugins_config_default
     logging.info(">>> 初始化配置")
-    # 检查配置文件是否存在
-    if not os.path.exists(CONFIG_PATH):
-        if not os.path.exists(os.path.dirname(CONFIG_PATH)):
-            os.makedirs(os.path.dirname(CONFIG_PATH))
-        with open("quark_config.json", "rb") as src, open(CONFIG_PATH, "wb") as dest:
-            dest.write(src.read())
+    os.makedirs(os.path.dirname(os.path.abspath(CONFIG_PATH)), exist_ok=True)
+    with Config.locked(CONFIG_PATH):
+        # 检查配置文件是否存在
+        new_config = not os.path.exists(CONFIG_PATH)
+        if new_config:
+            with open("quark_config.json", "rb") as src, open(CONFIG_PATH, "wb") as dest:
+                dest.write(src.read())
 
-    # 读取配置
-    config_data = Config.read_json(CONFIG_PATH)
-    Config.breaking_change_update(config_data)
-    if not config_data.get("magic_regex"):
-        config_data["magic_regex"] = MagicRename().magic_regex
+        # 读取配置
+        config_data = Config.read_json(CONFIG_PATH)
+        Config.breaking_change_update(config_data)
+        if not config_data.get("magic_regex"):
+            config_data["magic_regex"] = MagicRename().magic_regex
 
-    # 默认管理账号
-    config_data["webui"] = {
-        "username": os.environ.get("WEBUI_USERNAME")
-        or config_data.get("webui", {}).get("username", "admin"),
-        "password": os.environ.get("WEBUI_PASSWORD")
-        or config_data.get("webui", {}).get("password", "admin123"),
-    }
+        # 默认管理账号
+        config_data["webui"] = {
+            "username": os.environ.get("WEBUI_USERNAME")
+            or config_data.get("webui", {}).get("username", "admin"),
+            "password": os.environ.get("WEBUI_PASSWORD")
+            or config_data.get("webui", {}).get("password", "admin123"),
+        }
 
-    # 默认定时规则
-    if not config_data.get("crontab"):
-        config_data["crontab"] = "0 8,18,20 * * *"
+        # 默认定时规则
+        if not config_data.get("crontab"):
+            config_data["crontab"] = "0 8,18,20 * * *"
+        config_data.setdefault("auto_repair", True)
+        config_data.setdefault("discovery", {"savepath": "/追更"})
+        source = config_data.setdefault("source", {})
+        source.setdefault("pansou", {"enable": True, "server": "https://so.252035.xyz"})
+        source.setdefault("cloudsaver", {"enable": False, "server": "", "username": "", "password": ""})
+        if new_config and os.getenv("PANSOU_SERVER"):
+            source["pansou"]["server"] = os.environ["PANSOU_SERVER"]
 
-    # 初始化插件配置
-    _, plugins_config_default, task_plugins_config_default = Config.load_plugins()
-    for name, config in plugins_config_default.items():
-        for key, value in config.items():
-            config[key] = (
-                config_data.setdefault("plugins", {})
-                .setdefault(name, {})
-                .get(key, value)
-            )
-    config_data["plugins"] = plugins_config_default
+        # 初始化插件配置
+        _, plugins_config_default, task_plugins_config_default = Config.load_plugins()
+        for name, config in plugins_config_default.items():
+            for key, value in config.items():
+                config[key] = (
+                    config_data.setdefault("plugins", {})
+                    .setdefault(name, {})
+                    .get(key, value)
+                )
+        config_data["plugins"] = plugins_config_default
 
-    # 更新配置
-    Config.write_json(CONFIG_PATH, config_data)
+        # 更新配置
+        Config.write_json(CONFIG_PATH, config_data)
 
 
 if __name__ == "__main__":

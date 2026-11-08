@@ -1,4 +1,10 @@
 .git
 .github
-__pycache__
 /img
+.venv
+__pycache__
+*.pyc
+config
+test-results
+.env
+quark_config_debug.json

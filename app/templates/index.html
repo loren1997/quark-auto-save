@@ -38,6 +38,11 @@
               </a>
             </li>
             <li class="nav-item">
+              <a class="nav-link" href="#" :class="{active: activeTab === 'discovery'}" @click.prevent="changeTab('discovery')">
+                <i class="bi bi-calendar-week"></i> 热门追更
+              </a>
+            </li>
+            <li class="nav-item">
               <a class="nav-link" href="#" :class="{active: activeTab === 'tasklist'}" @click="changeTab('tasklist')">
                 <i class="bi bi-list-task"></i> 任务列表
               </a>
@@ -99,6 +104,19 @@
                 <span class="input-group-text">Crontab</span>
               </div>
               <input type="text" v-model="formData.crontab" class="form-control" placeholder="必填">
+            </div>
+            <div class="form-check my-3">
+              <input id="auto-repair" type="checkbox" class="form-check-input" v-model="formData.auto_repair">
+              <label for="auto-repair" class="form-check-label">分享失效时自动搜索并替换为验证通过的同名资源</label>
+            </div>
+            <p class="text-muted">找不到可靠匹配时保留原订阅，下次运行重试；不会因网络异常或 Cookie 失效换源。</p>
+            <div class="form-group">
+              <label for="discovery-savepath">热门订阅的夸克网盘保存目录</label>
+              <input id="discovery-savepath" class="form-control" v-model="formData.discovery.savepath" placeholder="/追更">
+            </div>
+            <div class="form-check my-3">
+              <input id="discovery-download" type="checkbox" class="form-check-input" v-model="formData.discovery.auto_download">
+              <label for="discovery-download" class="form-check-label">热门订阅同时通过 Aria2 下载到 NAS（需先配置下方 Aria2 插件）</label>
             </div>
 
             <div class="row title" title="通知推送，支持多个渠道，见Wiki">
@@ -268,12 +286,68 @@
               <div class="form-group row">
                 <label class="col-sm-2 col-form-label">服务器</label>
                 <div class="col-sm-10">
-                  <input type="text" v-model="formData.source.pansou.server" class="form-control" placeholder="资源搜索服务器地址，如 https://so.252035.xyz">
+                  <input type="text" v-model="formData.source.pansou.server" class="form-control" placeholder="留空使用 https://so.252035.xyz；自托管示例 http://pansou:8888">
                 </div>
               </div>
             </div>
 
+            <div class="form-group row ml-3">
+              <label class="col-sm-2 col-form-label">备用搜索源</label>
+              <div class="col-sm-10">
+                <textarea v-model="formData.source.pansou.fallback_servers" class="form-control" rows="2" placeholder="可选，每行一个 PanSou 地址，主源失败或无结果时依次尝试"></textarea>
+              </div>
+            </div>
+            <div class="form-group row ml-3">
+              <label class="col-sm-2 col-form-label">PanSou Token</label>
+              <div class="col-sm-10">
+                <input type="password" v-model="formData.source.pansou.token" class="form-control" placeholder="仅主源要求认证时填写">
+              </div>
+            </div>
+
           </div>
+
+          <section v-if="activeTab === 'discovery'" aria-label="热门追更">
+            <div class="row title align-items-center">
+              <div class="col"><h2><i class="bi bi-calendar-week"></i> 热门追更</h2></div>
+              <div class="col-auto"><button type="button" class="btn btn-outline-primary" @click="loadDiscovery" :disabled="discoveryLoading">刷新</button></div>
+            </div>
+            <p>按各自来源热度排列。点击订阅会搜索并验证夸克分享，保存到 {{ formData.discovery.savepath }}，立即转存并按定时规则持续追更。{{ formData.discovery.auto_download ? '转存后自动提交 Aria2 下载到 NAS。' : '当前仅转存到夸克网盘；本地下载可在系统配置中开启。' }}</p>
+            <p class="text-muted" v-if="calendar.week_start">{{ calendar.week_start }} — {{ calendar.week_end }} · 北京时间 · {{ calendar.cached ? '缓存数据' : '已更新' }}</p>
+            <div v-for="note in calendar.notes" :key="note" class="small text-muted mb-1">{{ note }}</div>
+            <div v-if="discoveryError" class="alert alert-danger" role="alert">{{ discoveryError }}</div>
+            <div v-for="warning in calendar.warnings" :key="warning" class="alert alert-warning" role="status">{{ warning }}</div>
+            <p v-if="discoveryLoading" role="status">正在读取本周排期，请稍候…</p>
+            <div class="btn-group flex-wrap my-3" role="group" aria-label="更新星期">
+              <button v-for="(day, i) in weekdays" :key="i" type="button" class="btn" :class="discoveryDay === i + 1 ? 'btn-primary' : 'btn-outline-primary'" :aria-pressed="discoveryDay === i + 1" @click="discoveryDay = i + 1">{{ day }}</button>
+            </div>
+            <div class="btn-group ml-2" role="group" aria-label="资源类型">
+              <button type="button" class="btn" :class="discoveryKind === 'anime' ? 'btn-dark' : 'btn-outline-dark'" @click="discoveryKind = 'anime'">动漫</button>
+              <button type="button" class="btn" :class="discoveryKind === 'tv' ? 'btn-dark' : 'btn-outline-dark'" @click="discoveryKind = 'tv'">电视剧</button>
+            </div>
+            <div v-for="day in calendar.days" :key="day.weekday" v-show="day.weekday === discoveryDay">
+              <h3 class="h5 my-3">{{ day.label }} · {{ day.date }}</h3>
+              <p v-if="!discoveryLoading && !day[discoveryKind].length" class="text-muted">当天暂无已收录的更新；可到任务列表按名称搜索。</p>
+              <div class="row">
+                <div v-for="(item, rank) in day[discoveryKind]" :key="item.id" class="col-xl-4 col-lg-6 mb-3">
+                  <article class="card h-100">
+                    <div class="card-body d-flex">
+                      <img v-if="item.poster" :src="item.poster" alt="" loading="lazy" referrerpolicy="no-referrer" style="width:72px;height:100px;object-fit:cover" class="mr-3 rounded">
+                      <div class="flex-grow-1">
+                        <h4 class="h6">{{ rank + 1 }}. {{ item.title }}</h4>
+                        <p class="small mb-1">{{ item.heat_label }}：{{ item.heat }}</p>
+                        <p class="small text-muted mb-1">{{ item.schedule_note }}</p>
+                        <a :href="item.source_url" target="_blank" rel="noopener noreferrer" class="small">{{ item.source }} 来源</a>
+                      </div>
+                    </div>
+                    <div class="card-footer bg-white">
+                      <button type="button" class="btn btn-primary btn-block" :disabled="!!subscribing || isSubscribed(item)" @click="subscribeDiscovery(item)">{{ isSubscribed(item) ? '已订阅' : subscribing === item.id ? '正在查找并验证资源…' : '一键订阅并转存' }}</button>
+                    </div>
+                  </article>
+                </div>
+              </div>
+            </div>
+            <p class="small text-muted">剧集数据来自 <a href="https://www.tvmaze.com/api" target="_blank" rel="noopener noreferrer">TVmaze</a>，按 <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener noreferrer">CC BY-SA</a> 使用。动漫数据来自 <a href="https://bgm.tv" target="_blank" rel="noopener noreferrer">Bangumi</a>。</p>
+          </section>
 
           <div v-if="activeTab === 'tasklist'">
             <div class="row title">
@@ -320,7 +394,7 @@
                   <div class="col-auto">
                     <button type="button" class="btn btn-outline-primary btn-sm" @click="copyTaskToClipboard(index)" title="复制任务参数到粘贴板"><i class=" bi bi-clipboard-check-fill"></i></button>
                     <button class="btn btn-warning btn-sm" v-if="task.shareurl_ban" :title="task.shareurl_ban" disabled><i class="bi bi-exclamation-triangle-fill"></i></button>
-                    <button type="button" class="btn btn-outline-primary btn-sm" @click="runScriptNow(index)" title="运行此任务" v-else><i class="bi bi-play-fill"></i></button>
+                    <button type="button" class="btn btn-outline-primary btn-sm" @click="runScriptNow(index)" title="运行此任务（失效时重试与自动换源）"><i class="bi bi-play-fill"></i></button>
                     <button type="button" class="btn btn-outline-danger btn-sm" @click="removeTask(index)" title="删除此任务"><i class="bi bi-trash3-fill"></i></button>
                   </div>
                 </div>
@@ -331,11 +405,12 @@
                     <div class="col-sm-10">
                       <div class="input-group">
                         <input type="text" name="taskname[]" class="form-control" v-model="task.taskname" placeholder="必填" @focus="smart_param.showSuggestions=true;focusTaskname(index, task)" @input="changeTaskname(index, task)">
-                        <div class="dropdown-menu show task-suggestions" v-if="smart_param.showSuggestions && smart_param.taskSuggestions.success && smart_param.index === index">
+                        <div class="dropdown-menu show task-suggestions" v-if="smart_param.showSuggestions && smart_param.taskSuggestions.success !== undefined && smart_param.index === index">
                           <div class="dropdown-item text-muted text-center" style="font-size:12px;">
-                            <span v-if="smart_param.isVerifying" class="mr-1"><i class="spinner-border spinner-border-sm" role="status"></i> 正在检查链接有效性...</span>
-                            <span v-else>{{ smart_param.taskSuggestions.message ? smart_param.taskSuggestions.message : smart_param.taskSuggestions.data.length ? `以下资源来自网络搜索，请自行辨识，如有侵权请联系资源方` : "未搜索到资源" }}</span>
+                            <span v-if="smart_param.isVerifying" class="mr-1"><i class="spinner-border spinner-border-sm" role="status"></i> 正在检查前 20 个链接...</span>
+                            <span v-else>{{ smart_param.taskSuggestions.message || (smart_param.taskSuggestions.data.length ? '以下资源来自网络搜索，请自行辨识' : '未搜索到资源') }}</span>
                           </div>
+                          <div v-if="smart_param.isVerifying && smart_param.taskSuggestions.message" class="dropdown-item text-warning small">{{ smart_param.taskSuggestions.message }}</div>
                           <div v-for="(suggestion, sIndex) in smart_param.taskSuggestions.data" :key="suggestion.shareurl" class="dropdown-item cursor-pointer" @click.prevent="selectSuggestion(index, suggestion)" style="font-size: 12px;" :title="suggestion.content">
                             <span>{{ suggestion.verify === true ? '✅' : suggestion.verify === false ? '❌' : '❔' }}</span> {{ suggestion.taskname }}
                             <small class="text-muted">
@@ -633,6 +708,8 @@
         weekdays: ['周一', '周二', '周三', '周四', '周五', '周六', '周日'],
         formData: {
           cookie: [],
+          auto_repair: true,
+          discovery: { savepath: '/追更' },
           push_config: {},
           media_servers: {},
           tasklist: [],
@@ -653,6 +730,12 @@
           },
         },
         toasts: [],
+        calendar: { days: [], warnings: [], notes: [] },
+        discoveryLoading: false,
+        discoveryError: '',
+        discoveryDay: new Date(Date.now() + 8 * 3600000).getUTCDay() || 7,
+        discoveryKind: 'anime',
+        subscribing: '',
         newTask: {
           taskname: "",
           shareurl: "",
@@ -678,6 +761,7 @@
           isSearching: false,
           isVerifying: false,
           searchTimer: null,
+          searchSequence: 0,
         },
         activeTab: 'tasklist',
         configModified: false,
@@ -736,8 +820,48 @@
       methods: {
         changeTab(tab) {
           this.activeTab = tab;
+          if (tab === 'discovery' && !this.calendar.days.length) this.loadDiscovery();
           if (window.innerWidth <= 768) {
             $('#sidebarMenu').collapse('toggle')
+          }
+        },
+        async loadDiscovery() {
+          this.discoveryLoading = true;
+          this.discoveryError = '';
+          try {
+            const response = await axios.get('/api/discovery');
+            if (!response.data.success) throw new Error(response.data.message);
+            this.calendar = response.data.data;
+          } catch (error) {
+            this.discoveryError = error.response?.data?.message || error.message || '获取排期失败，请重试';
+          } finally {
+            this.discoveryLoading = false;
+          }
+        },
+        isSubscribed(item) {
+          const title = item.search_title + (item.year ? ` (${item.year})` : '');
+          return this.formData.tasklist.some(task => task.resource_id === item.id || task.taskname === title);
+        },
+        async subscribeDiscovery(item) {
+          if (this.configModified) {
+            this.showToast('请先保存当前配置，再订阅资源', 'warning');
+            return;
+          }
+          this.subscribing = item.id;
+          this.discoveryError = '';
+          try {
+            const response = await axios.post('/api/discovery/subscribe', { id: item.id });
+            if (!response.data.success) throw new Error(response.data.message);
+            await this.fetchData();
+            this.showToast(response.data.message, 'success');
+            if (!response.data.existing) {
+              const index = this.formData.tasklist.findIndex(task => task.resource_id === item.id);
+              if (index >= 0) await this.runScriptNow(index);
+            }
+          } catch (error) {
+            this.discoveryError = error.response?.data?.message || error.message || '订阅失败，请重试';
+          } finally {
+            this.subscribing = '';
           }
         },
         checkNewVersion() {
@@ -755,9 +879,11 @@
             });
         },
         fetchData() {
-          axios.get('/data')
+          return axios.get('/data')
             .then(response => {
               config_data = response.data.data
+              if (config_data.auto_repair === undefined) config_data.auto_repair = true;
+              if (!config_data.discovery) config_data.discovery = { savepath: '/追更' };
               // cookie兼容
               if (typeof config_data.cookie === 'string')
                 config_data.cookie = [config_data.cookie];
@@ -789,8 +915,12 @@
               }
               if (!config_data.source.pansou) {
                 config_data.source.pansou = {
-                  server: ""
+                  enable: true, server: "https://so.252035.xyz"
                 };
+              }
+              if (config_data.source.pansou.enable === undefined) config_data.source.pansou.enable = true;
+              if (Array.isArray(config_data.source.pansou.fallback_servers)) {
+                config_data.source.pansou.fallback_servers = config_data.source.pansou.fallback_servers.join('\n');
               }
               if (!config_data.source.net) {
                 config_data.source.net = {
@@ -828,7 +958,9 @@
           axios.post('/update', this.formData)
             .then(response => {
               if (response.data.success) {
+                this.$set(this.formData, 'config_revision', response.data.config_revision);
                 this.configModified = false;
+                this.$nextTick(() => { this.configModified = false; });
                 this.showToast(response.data.message, 'success');
               } else {
                 this.showToast(response.data.message, 'error');
@@ -837,6 +969,7 @@
             })
             .catch(error => {
               console.error('Error saving config:', error);
+              this.showToast(error.response?.data?.message || '保存失败，请重试', 'error', 8000);
             });
         },
         addCookie() {
@@ -999,7 +1132,7 @@
                   const eventData = line.substring(5).trim();
                   if (eventData === '[DONE]') {
                     this.modalLoading = false;
-                    if (task_index == null) {
+                    if (!this.configModified && !test) {
                       this.fetchData();
                     }
                     break;
@@ -1053,6 +1186,7 @@
           }
         },
         searchSuggestions(index, taskname, deep = 1) {
+          const sequence = ++this.smart_param.searchSequence;
           taskname = taskname.replace(/\((19|20)\d{2}\)/g, '').trim();
           if (taskname.length < 2) {
             console.log(`任务名[${taskname}]过短${taskname.length} 不进行搜索`);
@@ -1068,17 +1202,21 @@
                 d: deep
               }
             }).then(response => {
+              if (sequence !== this.smart_param.searchSequence) return;
               this.smart_param.taskSuggestions = response.data;
               this.smart_param.showSuggestions = true;
               this.smart_param.isSearching = false;
               const data = response.data.data;
               if (data && data.length > 0) {
-                this.verifyShareLinks(data);
+                this.verifyShareLinks(data.slice(0, 20), sequence);
               }
             }).catch(error => {
+              if (sequence !== this.smart_param.searchSequence) return;
               console.error('Error fetching suggestions:', error);
+              this.smart_param.taskSuggestions = { success: false, message: error.response?.data?.message || '搜索请求失败，请重试', data: [] };
+              this.smart_param.showSuggestions = true;
             }).finally(() => {
-              this.smart_param.isSearching = false;
+              if (sequence === this.smart_param.searchSequence) this.smart_param.isSearching = false;
             });
           } catch (e) {
             this.smart_param.taskSuggestions = {
@@ -1086,12 +1224,12 @@
             };
           }
         },
-        verifyShareLinks(data, concurrency = 10) {
+        verifyShareLinks(data, sequence, concurrency = 2) {
           this.smart_param.isVerifying = true;
           let idx = 0;
           const next = () => {
             // 当发起下一次搜索时放弃本批验证
-            if (this.smart_param.isSearching || idx >= data.length) {
+            if (sequence !== this.smart_param.searchSequence || this.smart_param.isSearching || idx >= data.length) {
               this.smart_param.isVerifying = false;
               return;
             }

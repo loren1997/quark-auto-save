@@ -1,6 +1,6 @@
 import re
 import requests
-from sdk.common import iso_to_cst
+from .common import iso_to_cst, normalize_share_url
 
 
 class CloudSaver:
@@ -9,7 +9,7 @@ class CloudSaver:
     """
 
     def __init__(self, server):
-        self.server = server
+        self.server = server.rstrip("/")
         self.username = None
         self.password = None
         self.token = None
@@ -28,9 +28,12 @@ class CloudSaver:
         try:
             url = f"{self.server}/api/user/login"
             data = {"username": self.username, "password": self.password}
-            response = self.session.post(url, json=data)
+            response = self.session.post(url, json=data, timeout=(5, 25))
+            response.raise_for_status()
             result = response.json()
-            if result.get("success"):
+            if not isinstance(result, dict):
+                return {"success": False, "message": "CloudSaver登录响应格式错误"}
+            if result.get("success") and isinstance(result.get("data"), dict) and result["data"].get("token"):
                 self.token = result.get("data", {}).get("token")
                 self.session.headers.update({"Authorization": f"Bearer {self.token}"})
                 return {"success": True, "token": self.token}
@@ -39,8 +42,10 @@ class CloudSaver:
                     "success": False,
                     "message": f"CloudSaver登录{result.get('message', '未知错误')}",
                 }
-        except Exception as e:
-            return {"success": False, "message": str(e)}
+        except requests.HTTPError as e:
+            return {"success": False, "message": f"CloudSaver登录 HTTP {e.response.status_code}"}
+        except (requests.RequestException, ValueError) as e:
+            return {"success": False, "message": f"CloudSaver登录失败 ({type(e).__name__})"}
 
     def search(self, keyword, last_message_id=""):
         """
@@ -56,15 +61,24 @@ class CloudSaver:
         try:
             url = f"{self.server}/api/search"
             params = {"keyword": keyword, "lastMessageId": last_message_id}
-            response = self.session.get(url, params=params)
+            response = self.session.get(url, params=params, timeout=(5, 25))
+            if response.status_code in (401, 403):
+                return {"success": False, "auth_error": True, "message": "CloudSaver登录已失效"}
+            response.raise_for_status()
             result = response.json()
+            if not isinstance(result, dict):
+                return {"success": False, "message": "CloudSaver响应格式错误"}
             if result.get("success"):
                 data = result.get("data", [])
+                if not isinstance(data, list):
+                    return {"success": False, "message": "CloudSaver搜索结果格式错误"}
                 return {"success": True, "data": data}
             else:
                 return {"success": False, "message": result.get("message", "未知错误")}
-        except Exception as e:
-            return {"success": False, "message": str(e)}
+        except requests.HTTPError as e:
+            return {"success": False, "message": f"CloudSaver HTTP {e.response.status_code}"}
+        except (requests.RequestException, ValueError) as e:
+            return {"success": False, "message": f"CloudSaver搜索失败 ({type(e).__name__})"}
 
     def auto_login_search(self, keyword, last_message_id=""):
         """
@@ -79,6 +93,8 @@ class CloudSaver:
             return result
         else:
             if (
+                result.get("auth_error")
+                or
                 result.get("message") == "无效的 token"
                 or result.get("message") == "未提供 token"
             ):
@@ -109,17 +125,24 @@ class CloudSaver:
         clean_results = []
         link_array = []
         for channel in search_results:
-            for item in channel.get("list", []):
-                cloud_links = item.get("cloudLinks", [])
+            if not isinstance(channel, dict):
+                continue
+            for item in channel.get("list") or []:
+                if not isinstance(item, dict):
+                    continue
+                cloud_links = item.get("cloudLinks") or []
                 for link in cloud_links:
-                    if link.get("cloudType") == "quark":
+                    if isinstance(link, dict) and link.get("cloudType") == "quark":
                         # 清洗标题
-                        title = item.get("title", "")
+                        title = str(item.get("title") or "")
                         if match := re.search(pattern_title, title, re.DOTALL):
                             title = match.group(2)
                         title = title.replace("&amp;", "&").strip()
                         # 清洗内容
-                        content = item.get("content", "")
+                        content = str(item.get("content") or "")
+                        url = normalize_share_url(link.get("link"), link.get("password") or link.get("code"), content)
+                        if not url:
+                            continue
                         if match := re.search(pattern_content, content, re.DOTALL):
                             content = match.group(2)
                         content = content.replace('<mark class="highlight">', "")
@@ -130,11 +153,11 @@ class CloudSaver:
                         if pubdate:
                             pubdate = iso_to_cst(pubdate)
                         # 链接去重
-                        if link.get("link") not in link_array:
-                            link_array.append(link.get("link"))
+                        if url not in link_array:
+                            link_array.append(url)
                             clean_results.append(
                                 {
-                                    "shareurl": link.get("link"),
+                                    "shareurl": url,
                                     "taskname": title,
                                     "content": content,
                                     "datetime": pubdate,

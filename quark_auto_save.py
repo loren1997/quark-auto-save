@@ -18,6 +18,11 @@ import requests
 import importlib
 import traceback
 import urllib.parse
+import unicodedata
+import tempfile
+import threading
+from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime
 from natsort import natsorted
 
@@ -59,7 +64,95 @@ def add_notify(text):
     return text
 
 
+def is_expired_share(response):
+    """Only an explicit cancelled/expired share permits changing a subscription."""
+    if response.get("status") in (401, 403, 429) or str(response.get("status", "")).startswith("5"):
+        return False
+    message = str(response.get("message", "")).lower()
+    if re.search(r"提取码|访问码|密码|验证码|登录|登陆|权限|网络|超时|繁忙|频繁|风控|认证|password|passcode|login|timeout|permission", message):
+        return False
+    return bool(re.search(
+        r"(?:分享|链接).{0,12}(?:已取消|已被取消|取消了|已过期|已失效|不存在|已被删除)"
+        r"|(?:取消|删除)了.{0,6}分享|(?:share|link).{0,20}(?:expired|cancelled|canceled|not found)",
+        message,
+    ))
+
+
+def _resource_title_parts(title):
+    title = unicodedata.normalize("NFKC", str(title)).casefold()
+    seasons = []
+
+    def season_number(match):
+        value = next(value for value in match.groups() if value)
+        if value.isdigit():
+            seasons.append(int(value))
+        else:
+            digits = {char: i for i, char in enumerate("零一二三四五六七八九")}
+            value = value.replace("两", "二")
+            if "十" in value:
+                tens, ones = value.split("十", 1)
+                seasons.append(digits.get(tens, 1) * 10 + digits.get(ones, 0))
+            else:
+                seasons.append(digits.get(value, -1))
+        return " "
+
+    title = re.sub(r"第\s*([\d零一二三四五六七八九十两]+)\s*[季部]|\bseason\s*(\d{1,2})\b|(?<![a-z])s(\d{1,2})(?=e\d|\b)", season_number, title)
+    years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title))
+    title = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", title)
+    # shortcut: only known release labels are stripped; ambiguous names stay manual.
+    title = re.sub(r"(?:更新至?|更至|全)\s*\d+\s*集?|第\s*\d+(?:\s*[-~至]\s*\d+)?\s*集|\be\d{1,3}\b", " ", title)
+    title = re.sub(r"\b(?:2160p|1080p|720p|4k|hdr|hdr10|bluray|web[- .]?dl|h\.?26[45]|x26[45])\b|中文字幕|中英双字|简繁字幕|国语中字|高码率|高码|杜比视界|内嵌简中|高清|超清|完结|持续更新|连载中", " ", title)
+    return re.sub(r"[\W_]+", "", title), set(seasons), years
+
+
+def resource_titles_match(expected, candidate, allow_missing_year=False):
+    name, seasons, years = _resource_title_parts(expected)
+    other_name, other_seasons, other_years = _resource_title_parts(candidate)
+    return bool(name and name == other_name and seasons == other_seasons
+                and len(seasons) <= 1 and (not years or years == other_years
+                or (allow_missing_year and not other_years)))
+
+
 class Config:
+    _thread_lock = threading.RLock()
+    _locked_paths = threading.local()
+
+    @staticmethod
+    @contextmanager
+    def locked(config_path):
+        """同目录锁文件跨进程协调读改写；同线程允许嵌套调用。"""
+        path = os.path.normcase(os.path.realpath(os.path.abspath(config_path)))
+        with Config._thread_lock:
+            held = getattr(Config._locked_paths, "paths", set())
+            if path in held:
+                yield
+                return
+            with open(path + ".lock", "a+b") as lock:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock.seek(0, os.SEEK_END)
+                    if not lock.tell():
+                        lock.write(b"\0")
+                        lock.flush()
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                Config._locked_paths.paths = held
+                held.add(path)
+                try:
+                    yield
+                finally:
+                    held.remove(path)
+                    if os.name == "nt":
+                        lock.seek(0)
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
     # 下载配置
     def download_file(url, save_path):
         response = requests.get(url)
@@ -72,14 +165,76 @@ class Config:
 
     # 读取 JSON 文件内容
     def read_json(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with Config.locked(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
         return data
 
     # 将数据写入 JSON 文件
     def write_json(config_path, data):
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, sort_keys=False, indent=2)
+        config_path = os.path.realpath(os.path.abspath(config_path))
+        with Config.locked(config_path):
+            fd, temporary = tempfile.mkstemp(prefix=".quark-config-", suffix=".tmp", dir=os.path.dirname(config_path))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, sort_keys=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if os.path.exists(config_path):
+                    os.chmod(temporary, os.stat(config_path).st_mode & 0o777)
+                os.replace(temporary, config_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+
+    def _merge_changes(current, original, updated):
+        """仅写入运行期间改变、且磁盘仍保留原值的字段。"""
+        missing = object()
+        for key in original.keys() | updated.keys():
+            before = original.get(key, missing)
+            after = updated.get(key, missing)
+            latest = current.get(key, missing)
+            if before == after:
+                continue
+            if isinstance(after, dict) and isinstance(latest, dict) and (isinstance(before, dict) or before is missing):
+                Config._merge_changes(current[key], {} if before is missing else before, after)
+            elif latest == before:
+                if after is missing:
+                    current.pop(key, None)
+                else:
+                    current[key] = deepcopy(after)
+
+    def merge_task_state(config_data, original, updated):
+        matches = [task for task in config_data.get("tasklist", []) if all(
+            task.get(key) == original.get(key) for key in ("taskname", "shareurl", "savepath")
+        )]
+        if len(matches) != 1:
+            return False
+        fields = ("shareurl", "shareurl_ban", "startfid", "repair_history", "addition", "replace")
+        Config._merge_changes(matches[0], {key: original[key] for key in fields if key in original},
+                             {key: updated[key] for key in fields if key in updated})
+        return True
+
+    def merge_runtime_state(current, original, updated):
+        originals = original.get("tasklist", [])
+        for task in originals:
+            identity = ("taskname", "shareurl", "savepath")
+            if sum(all(other.get(key) == task.get(key) for key in identity) for other in originals) != 1:
+                continue
+            matches = [other for other in updated.get("tasklist", []) if all(
+                other.get(key) == task.get(key) for key in identity)]
+            if not matches:
+                # 自动换源会改变 shareurl；仅作品名和保存路径唯一时允许配对。
+                pair = ("taskname", "savepath")
+                if sum(all(other.get(key) == task.get(key) for key in pair) for other in originals) != 1:
+                    continue
+                matches = [other for other in updated.get("tasklist", []) if all(
+                    other.get(key) == task.get(key) for key in pair)]
+            if len(matches) == 1:
+                Config.merge_task_state(current, task, matches[0])
+        Config._merge_changes(current, {"plugins": original["plugins"]} if "plugins" in original else {},
+                             {"plugins": updated["plugins"]} if "plugins" in updated else {})
+        return current
 
     # 读取CK
     def get_cookies(cookie_val):
@@ -500,13 +655,15 @@ class Quark:
         querystring = {"pr": "ucpro", "fr": "pc"}
         payload = {"pwd_id": pwd_id, "passcode": passcode}
         response = self._send_request(
-            "POST", url, json=payload, params=querystring
+            "POST", url, json=payload, params=querystring, timeout=(5, 15)
         ).json()
         return response
 
     def get_detail(
-        self, pwd_id, stoken, pdir_fid, _fetch_share=0, fetch_share_full_path=0
+        self, pwd_id, stoken, pdir_fid, _fetch_share=0, fetch_share_full_path=0,
+        max_pages=None,
     ):
+        temporary_error = {"code": 1, "status": 503, "message": "分享服务暂不可用或返回格式异常，请稍后重试"}
         list_merge = []
         page = 1
         while True:
@@ -527,15 +684,36 @@ class Quark:
                 "ver": "2",
                 "fetch_share_full_path": fetch_share_full_path,
             }
-            response = self._send_request("GET", url, params=querystring).json()
+            try:
+                response = self._send_request(
+                    "GET", url, params=querystring, timeout=(5, 15)
+                ).json()
+            except (requests.RequestException, ValueError) as exc:
+                print(f"读取分享暂时失败：{type(exc).__name__}")
+                return temporary_error
+            if not isinstance(response, dict) or "code" not in response:
+                return temporary_error
+            if str(response.get("status", "")).startswith("5"):
+                return temporary_error
             if response["code"] != 0:
                 return response
-            if response["data"]["list"]:
-                list_merge += response["data"]["list"]
+            data = response.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+                return temporary_error
+            files = data["list"]
+            if any(not isinstance(item, dict) or not isinstance(item.get("file_name"), str)
+                   or "fid" not in item or not isinstance(item.get("dir"), bool) for item in files):
+                return temporary_error
+            if files:
+                metadata = response.get("metadata")
+                total = metadata.get("_total") if isinstance(metadata, dict) else None
+                if type(total) is not int or total < 0:
+                    return temporary_error
+                list_merge += files
                 page += 1
             else:
                 break
-            if len(list_merge) >= response["metadata"]["_total"]:
+            if len(list_merge) >= total or (max_pages and page > max_pages):
                 break
         response["data"]["list"] = list_merge
         return response
@@ -836,30 +1014,151 @@ class Quark:
             print(f"❌ 转存测试失败: {str(e)}")
             traceback.print_exc()
 
+    def find_valid_resource(self, task, config):
+        from resource_search import search_resources
+
+        title = task.get("taskname", "").strip()
+        if not title:
+            return {"success": False, "candidate": None, "error": "缺少资源名称"}
+        old_id = self.extract_url(task.get("shareurl", ""))[0]
+        seen = {old_id} | {
+            entry.get("from_id") for entry in task.get("repair_history", [])
+            if isinstance(entry, dict)
+        }
+        try:
+            result = search_resources(title, config, refresh=True)
+        except Exception as exc:
+            print(f"资源搜索异常：{type(exc).__name__}")
+            return {"success": False, "candidate": None, "error": "资源搜索暂不可用"}
+        if not result.get("success"):
+            return {"success": False, "candidate": None, "error": "搜索源不可用，请检查搜索配置"}
+        checked = 0
+        for candidate in result.get("data", [])[:50]:
+            if checked >= 5:
+                break
+            if not isinstance(candidate, dict) or not resource_titles_match(
+                title, candidate.get("taskname", ""), allow_missing_year=True
+            ):
+                continue
+            shareurl = candidate.get("shareurl", "")
+            if not isinstance(shareurl, str):
+                continue
+            try:
+                parsed = urllib.parse.urlsplit(shareurl)
+            except ValueError:
+                continue
+            if parsed.scheme != "https" or parsed.netloc != "pan.quark.cn":
+                continue
+            pwd_id, passcode, pdir_fid, _ = self.extract_url(shareurl)
+            if not pwd_id or pwd_id in seen:
+                continue
+            seen.add(pwd_id)
+            checked += 1
+            try:
+                token = self.get_stoken(pwd_id, passcode)
+                stoken = (token.get("data") or {}).get("stoken")
+                if token.get("status") != 200 or not stoken:
+                    continue
+                detail = self.get_detail(pwd_id, stoken, pdir_fid, _fetch_share=1, max_pages=1)
+                files = (detail.get("data") or {}).get("list", [])
+                if detail.get("code") != 0 or not files:
+                    continue
+                evidence = [item.get("file_name", "") for item in files]
+                share = detail["data"].get("share")
+                if isinstance(share, dict) and isinstance(share.get("title"), str):
+                    evidence.append(share["title"])
+                if len(files) == 1 and files[0].get("dir"):
+                    detail = self.get_detail(pwd_id, stoken, files[0]["fid"], max_pages=1)
+                    files = (detail.get("data") or {}).get("list", [])
+                    if detail.get("code") != 0 or not files:
+                        continue
+                    evidence.extend(item.get("file_name", "") for item in files)
+                if task.get("resource_type") in ("anime", "tv") and not any(not item.get("dir")
+                           and re.search(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", item.get("file_name", ""), re.I)
+                           and item.get("obj_category", "video") == "video" for item in files):
+                    continue
+                evidence = [re.sub(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", "", name, flags=re.I) for name in evidence]
+                name, seasons, years = _resource_title_parts(title)
+                if any(other_name in ("", name) and (
+                    (other_seasons and other_seasons != seasons)
+                    or (years and other_years and years != other_years)
+                ) for other_name, other_seasons, other_years in map(_resource_title_parts, evidence)):
+                    continue
+                if not any(
+                    resource_titles_match(title, name)
+                    for name in evidence
+                ):
+                    continue
+                return {"success": True, "candidate": {
+                    **candidate, "pwd_id": pwd_id, "passcode": passcode,
+                    "pdir_fid": pdir_fid, "stoken": stoken,
+                }, "error": ""}
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                print(f"候选分享验证失败：{type(exc).__name__}")
+        return {"success": False, "candidate": None,
+                "error": "未找到标题、季数和年份匹配的有效资源，保留原订阅"}
+
+    def repair_share(self, task):
+        if not task.get("auto_repair", CONFIG_DATA.get("auto_repair", True)):
+            return None
+        if task.get("update_subdir_resave_mode"):
+            print("自动换源已跳过：此任务开启了删除子目录后重存，请手工检查新资源")
+            return None
+        print(f"🔎《{task['taskname']}》分享已失效，查找同名同季资源")
+        result = self.find_valid_resource(task, CONFIG_DATA)
+        if not result["success"]:
+            print(f"自动换源未完成：{result['error']}")
+            return None
+        candidate = result["candidate"]
+        old_id = self.extract_url(task["shareurl"])[0]
+        task["shareurl"] = candidate["shareurl"]
+        task.pop("shareurl_ban", None)
+        # The old file boundary belongs to the old share and cannot be reused.
+        task.pop("startfid", None)
+        task["repair_history"] = (task.get("repair_history", []) + [{
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "from_id": old_id, "to_id": candidate["pwd_id"],
+            "source": candidate.get("source", ""),
+        }])[-10:]
+        add_notify(f"🔄《{task['taskname']}》已自动换源：{old_id} → {candidate['pwd_id']}；保留转存规则")
+        return candidate
+
     def do_save_task(self, task):
-        # 判断资源失效记录
-        if task.get("shareurl_ban"):
-            print(f"《{task['taskname']}》：{task['shareurl_ban']}")
-            return
-
-        # 链接转换所需参数
+        # Recheck historical bans: older versions also banned temporary login errors.
+        repaired = False
         pwd_id, passcode, pdir_fid, _ = self.extract_url(task["shareurl"])
-
-        # 获取stoken，同时可验证资源是否失效
-        get_stoken = self.get_stoken(pwd_id, passcode)
-        if get_stoken.get("status") == 200:
-            stoken = get_stoken["data"]["stoken"]
-        elif get_stoken.get("status") == 500:
-            print(f"跳过任务：网络异常 {get_stoken.get('message')}")
+        try:
+            token = self.get_stoken(pwd_id, passcode)
+        except (requests.RequestException, ValueError) as exc:
+            print(f"跳过任务：分享验证暂不可用（{type(exc).__name__}）")
             return
+        stoken = (token.get("data") or {}).get("stoken")
+        if token.get("status") != 200 or not stoken:
+            message = str(token.get("message") or "分享验证失败，请稍后重试")
+            if is_expired_share(token):
+                if task.get("shareurl_ban") != message:
+                    add_notify(f"❌《{task['taskname']}》：{message}\n")
+                task["shareurl_ban"] = message
+                replacement = self.repair_share(task)
+                if not replacement:
+                    return
+                pwd_id, pdir_fid, stoken = (
+                    replacement["pwd_id"], replacement["pdir_fid"], replacement["stoken"]
+                )
+                repaired = True
+            else:
+                print(f"跳过任务：{message}；保留原订阅，下次重试")
+                return
         else:
-            message = get_stoken.get("message")
-            add_notify(f"❌《{task['taskname']}》：{message}\n")
-            task["shareurl_ban"] = message
-            return
-        # print("stoken: ", stoken)
+            task.pop("shareurl_ban", None)
 
         updated_tree = self.dir_check_and_save(task, pwd_id, stoken, pdir_fid)
+        if not repaired and is_expired_share({"message": task.get("shareurl_ban", "")}):
+            replacement = self.repair_share(task)
+            if replacement:
+                updated_tree = self.dir_check_and_save(
+                    task, replacement["pwd_id"], replacement["stoken"], replacement["pdir_fid"]
+                )
         if updated_tree.size(1) > 0:
             self.do_rename(updated_tree)
             print()
@@ -872,7 +1171,13 @@ class Quark:
     def dir_check_and_save(self, task, pwd_id, stoken, pdir_fid="", subdir_path=""):
         tree = Tree()
         # 获取分享文件列表
-        share_file_list = self.get_detail(pwd_id, stoken, pdir_fid)["data"]["list"]
+        detail = self.get_detail(pwd_id, stoken, pdir_fid)
+        if detail.get("code") != 0 or not isinstance(detail.get("data"), dict):
+            if not subdir_path and is_expired_share(detail):
+                task["shareurl_ban"] = detail["message"]
+            print(f"读取分享失败：{detail.get('message', '服务暂不可用')}；下次重试")
+            return tree
+        share_file_list = detail["data"].get("list", [])
         # print("share_file_list: ", share_file_list)
 
         if not share_file_list:
@@ -886,9 +1191,15 @@ class Quark:
             and subdir_path == ""
         ):  # 仅有一个文件夹
             print("🧠 该分享是一个文件夹，读取文件夹内列表")
-            share_file_list = self.get_detail(
+            detail = self.get_detail(
                 pwd_id, stoken, share_file_list[0]["fid"]
-            )["data"]["list"]
+            )
+            if detail.get("code") != 0 or not isinstance(detail.get("data"), dict):
+                if is_expired_share(detail):
+                    task["shareurl_ban"] = detail["message"]
+                print(f"读取分享子目录失败：{detail.get('message', '服务暂不可用')}；下次重试")
+                return tree
+            share_file_list = detail["data"].get("list", [])
 
         # 获取目标目录文件列表
         savepath = re.sub(r"/{2,}", "/", f"/{task['savepath']}{subdir_path}")
@@ -1287,6 +1598,7 @@ def main():
     else:
         print(f"⚙️ 正从 {config_path} 文件中读取配置")
         CONFIG_DATA = Config.read_json(config_path)
+        original_config = deepcopy(CONFIG_DATA)
         Config.breaking_change_update(CONFIG_DATA)
         cookie_val = CONFIG_DATA.get("cookie")
         cookie_form_file = True
@@ -1310,7 +1622,10 @@ def main():
         print(f"===============转存任务===============")
         # 任务列表
         if tasklist_from_env:
+            originals = deepcopy(tasklist_from_env)
             do_save(accounts[0], tasklist_from_env)
+            for original, updated in zip(originals, tasklist_from_env):
+                Config.merge_task_state(CONFIG_DATA, original, updated)
         else:
             do_save(accounts[0], CONFIG_DATA.get("tasklist", []))
         print()
@@ -1321,8 +1636,12 @@ def main():
         send_ql_notify("【夸克自动转存】", notify_body)
         print()
     if cookie_form_file:
-        # 更新配置
-        Config.write_json(config_path, CONFIG_DATA)
+        # 网络任务执行期间用户可能新增或修改订阅，仅合并未发生冲突的运行状态。
+        with Config.locked(config_path):
+            latest = Config.read_json(config_path)
+            Config.merge_runtime_state(latest, original_config, CONFIG_DATA)
+            Config.write_json(config_path, latest)
+            CONFIG_DATA = latest
 
     print(f"===============程序结束===============")
     duration = datetime.now() - start_time
