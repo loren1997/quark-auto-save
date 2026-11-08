@@ -4,7 +4,25 @@
 
 ## 1. 用 Docker Compose 安装
 
+### 与原作者版本并行安装（推荐）
+
+使用 [维护版 V3 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3) 中的 `quark-auto-save-nas-docker-v3.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+
+```sh
+cd /root/quark-save-gpt
+mkdir -p config
+docker compose -p qas-maintained config --quiet
+docker compose -p qas-maintained pull
+docker compose -p qas-maintained up -d
+```
+
+发布包默认端口 **5006**，项目名 `qas-maintained`，没有固定容器名；与原版使用不同目录和数据卷。已有维护版的 `.env` 和 `config/` 必须保留，不要重新复制模板。更新方法见第 6 节。
+
+### 从源码构建
+
 支持安装了 Docker/Container Manager 的 Intel/AMD x86-64 和 ARM64 NAS。以下使用源码构建本维护版，不依赖原作者发布镜像，也不需要 Docker Hub 发布凭据。
+
+仓库根目录的源码 Compose 沿用端口 **5005** 和容器名 `quark-auto-save`；已安装原作者版本时，请使用上面的并行发布包，避免端口和容器名冲突。
 
 1. 将你的维护仓库下载或克隆到 NAS，例如群晖 `/volume1/docker/quark-auto-save`、飞牛 `/vol1/1000/docker/quark-auto-save`。实际存储路径以你的 NAS 为准。
 2. 将 `.env.example` 复制为 `.env`，把 `WEBUI_PASSWORD` 改成自己的管理密码。端口被占用时修改 `QAS_PORT`。
@@ -46,13 +64,21 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 在任务名称中输入资源名，或点击名称旁的搜索按钮。PanSou 兼容新版原生接口和公共代理接口；支持提取码。可填写多个 PanSou 聚合地址，每行一个；主源、聚合源与启用的 CloudSaver 会一起查询、去重，并标注来源。单个源失败不影响其他源的结果，全部失败时明确报错。频道和插件筛选留空时使用 PanSou 服务已启用的全部渠道，也可填写逗号分隔的名称进行筛选。
 
-搜索会从索引返回的结构化结果和公开帖子正文中提取夸克链接、就近关联提取码。这里的“嗅探”针对公开搜索结果，不抓取私人页面，也不绕过网站登录。自动订阅仍会检查真实夸克目录及视频文件，不会只凭搜索标题就转存。
+搜索会从索引返回的结构化结果和公开帖子正文中提取夸克链接、就近关联提取码。“网页搜索”默认启用，通过 DuckDuckGo 和 Bing 查询公开网页，再读取有限数量的结果页面提取夸克链接。任务列表搜索会合并这些结果；自动订阅与失效换源在索引未找到可验证候选时再补搜网页。页面不执行脚本、不登录，也不绕过验证码；搜索引擎返回验证码或网络失败会明确报错。
+
+网页搜索使用独立请求，不使用账号 Cookie、`.netrc` 或操作系统保存的代理配置；NAS 必须能访问对应搜索引擎和网页。可在容器环境中显式设置 `HTTP_PROXY` / `HTTPS_PROXY` 使用自己信任的代理，代理负责最终域名解析和转发。网络受限时也可在系统配置关闭“网页搜索”，继续使用自托管 PanSou/CloudSaver。网页来源及真实标题会保留，自动订阅仍检查夸克分享中的实际文件。
+
+使用仓库或发布包的 Compose 时，可在 `.env` 增加 `QAS_PROXY=http://你的代理局域网地址:端口`，然后 `docker compose up -d` 重建应用容器。默认不启用代理；不要把 NAS 以外的代理写成 `127.0.0.1`，该地址在容器内指向容器自身。
 
 “分享失效时自动搜索并替换”默认启用。每次正常任务运行时，会重新检查原分享和旧版标记失效的分享；只有明确取消、过期、不存在等失效响应才换源，登录、提取码、网络和限流错误会保留原订阅，下次重试。
 
-候选需满足标题、季数和已知年份约束，并验证实际夸克分享内容。最多检查 5 个候选；无法可靠匹配时保留原订阅并输出日志。原保存目录、正则、重命名和周期保持不变。旧分享中的 `startfid` 无法迁移，会清除；最近 10 次替换记录保存在任务 `repair_history`，仅包含分享 ID，不包含验证 token。
+候选需满足标题、季数和已知年份约束，并验证实际夸克分享内容。索引最多检查 5 个候选，网页补搜最多检查 3 个新候选；无法可靠匹配时保留原订阅并输出日志。原保存目录、正则、重命名和周期保持不变。旧分享中的 `startfid` 无法迁移，会清除；最近 10 次替换记录保存在任务 `repair_history`，仅包含分享 ID，不包含验证 token。
 
-热门订阅会使用目录来源提供的官方别名，支持“中文名＋日文名”等双语分享标题；原关键词无结果或查询失败时，再尝试去掉年份、标点或使用别名，总计最多 4 个关键词。查询时去掉年份不代表取消验证年份；年份和错季检查仍保留。有明确首播年份、未写季数的首季作品兼容 `S01` 文件标记，`S02` 不会被当成首季。
+热门订阅会使用目录来源的别名，包括 Bangumi 中原名相同且明确关联为原作书籍的中文译名。最多保留 8 个别名，先查询不带年份的不同名称，再补充季号写法与基础片名；索引阶段最多 12 个关键词并设有时间预算，连续两次所有源失败会提前进入网页补搜。网页补搜最多 2 个名称。查询时去掉年份或季数不代表取消验证约束。
+
+同一实际目录的片名与视频的 `S03E09` 等季号可联合验证。多季合集中有唯一且明确匹配的目标季目录时，订阅会指向该子目录；不会把其他季一起加入。目录中混入冲突季数、旧电影或仅有不完整片名时仍拒绝自动订阅。报错可展开“查看搜索详情”，了解已尝试关键词及来源故障；部分源不可用不会被表述成全网没有资源。
+
+查询数量、页面大小和并发均有限制。时间预算用于停止后续查询，操作系统 DNS 解析和远端缓慢发送响应头仍可能延长实际等待时间。
 
 自动查询复用搜索服务缓存，避免每次订阅强制重新抓取全部频道；每个候选分享仍实时验证。需要强制刷新索引时，可使用任务列表的手动搜索按钮。
 
@@ -68,6 +94,7 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 - 电视剧使用 TVmaze 中国播出日历，展示本周热度前 10 部，按实际集日期归日；不代表全网完整影视榜。
 - Bangumi 不可达时，优先使用本周缓存；无缓存时提示来源错误，国漫栏目继续可用。
 - 电视剧与 TVmaze 国漫保留普通季号，避免第四季误订到首季；来源的年份型季号不会被当成几千季。国内年番与来源季号不一致时，可能需要手动选取正确分享。来源未提供当前季年份或重拍版本时，请核对实际目录。
+- TVmaze 官方链接指向同一哔哩哔哩节目时，会核对 B站媒体/季度 ID，在同日同系列的重复条目中优先保留 B站周历，避免将连续更新误显示为额外一季。身份核对失败时保留来源条目，不凭相似片名合并。
 - 数据缓存一小时，错误后五分钟重试。刷新按钮重新读取当前缓存，不会强制高频抓取外部源。
 - 新热门订阅每日按定时规则检查；周历展示首播安排，网盘资源上传时间可能更晚，所以不会只在播出当天检查。
 
@@ -87,6 +114,31 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 这里不内置第二套下载器；Aria2 负责下载队列、磁盘空间和重试。夸克 Cookie、账号权限和下载直链可用性会影响实际下载。系统中“通知测试”按钮包含上游的转存/清理测试；建议验收自己的独立测试目录。
 
 ## 6. 更新、备份与回退
+
+### 已安装并行发布包（`/root/quark-save-gpt`）
+
+以下从 V1/V2 更新至 V3：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+
+```sh
+(
+set -e
+cd /root/quark-save-gpt
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3/compose.yaml -o compose.yaml.next
+docker compose -p qas-maintained -f compose.yaml.next config --quiet
+docker compose -p qas-maintained -f compose.yaml.next pull
+backup="backup-v3-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$backup"
+docker compose -p qas-maintained stop quark-auto-save
+cp -a compose.yaml .env config "$backup/"
+mv compose.yaml.next compose.yaml
+docker compose -p qas-maintained up -d
+docker compose -p qas-maintained ps
+)
+```
+
+更新后强制刷新浏览器页面。默认仍访问 `http://NAS局域网IP:5006`；如果 `.env` 改过 `QAS_PORT`，继续使用该端口。需要回退时停止维护版，将这次备份中的 `compose.yaml`、`.env` 和 `config/` 恢复到原位置后重新 `up -d`。
+
+### 从源码构建的安装
 
 更新前备份整个 `config/` 目录。在项目目录：
 

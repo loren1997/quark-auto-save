@@ -1,0 +1,32 @@
+name: Read-only public search probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: 搜索词
+        required: true
+        default: 大理寺日志 第三季
+      title:
+        description: 用于核对的准确片名、季数
+        required: true
+        default: 大理寺日志 第3季
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements.txt
+      - name: Search and verify public shares without an account
+        env:
+          SEARCH_QUERY: ${{ inputs.query }}
+          VERIFY_TITLE: ${{ inputs.title }}
+        run: python scripts/probe_web_search.py "$SEARCH_QUERY" --title "$VERIFY_TITLE"

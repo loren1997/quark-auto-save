@@ -78,6 +78,9 @@ def is_expired_share(response):
     ))
 
 
+_RESOURCE_SEASON_PATTERN = r"第\s*([\d零一二三四五六七八九十两]+)\s*[季部]|\bseason\s*(\d{1,2})\b|(?<![a-z])s(\d{1,2})(?=e\d|\b)"
+
+
 def _resource_title_parts(title):
     title = unicodedata.normalize("NFKC", str(title)).casefold()
     seasons = []
@@ -96,7 +99,7 @@ def _resource_title_parts(title):
                 seasons.append(digits.get(value, -1))
         return " "
 
-    title = re.sub(r"第\s*([\d零一二三四五六七八九十两]+)\s*[季部]|\bseason\s*(\d{1,2})\b|(?<![a-z])s(\d{1,2})(?=e\d|\b)", season_number, title)
+    title = re.sub(_RESOURCE_SEASON_PATTERN, season_number, title)
     years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title))
     title = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", title)
     # shortcut: only known release labels are stripped; ambiguous names stay manual.
@@ -111,11 +114,57 @@ def _resource_seasons_match(expected, actual, years):
     return expected == actual or (bool(years) and not expected and actual == {1})
 
 
+def _resource_candidate_parts(expected, candidate):
+    name, seasons, _ = _resource_title_parts(expected)
+    other_name, other_seasons, other_years = _resource_title_parts(candidate)
+    # Only a task with an explicit season can interpret its exact base name + number.
+    if len(seasons) == 1 and not other_seasons:
+        numbered = re.fullmatch(re.escape(name) + r"(\d{1,2})", other_name)
+        if numbered:
+            other_name, other_seasons = name, {int(numbered.group(1))}
+    return other_name, other_seasons, other_years
+
+
+def _resource_search_queries(title, aliases):
+    queries, seen = [], set()
+
+    def add(name):
+        name = unicodedata.normalize("NFKC", name)
+        name = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", name)
+        query = re.sub(r"[^\w\s/']+", " ", name.replace("’", "'"))
+        query = re.sub(r"\s+", " ", query).strip()
+        key = re.sub(r"[\W_]+", "", query.casefold())
+        if key and key not in seen:
+            seen.add(key)
+            queries.append(query)
+
+    # Give every official name a turn before spending requests on season spellings.
+    for name in [title] + aliases:
+        add(name)
+    _, seasons, _ = _resource_title_parts(title)
+    if len(seasons) == 1:
+        season = next(iter(seasons))
+        if 0 < season < 100:
+            number = "零一二三四五六七八九"
+            chinese = number[season] if season < 10 else (
+                (number[season // 10] if season >= 20 else "") + "十"
+                + (number[season % 10] if season % 10 else "")
+            )
+            initial = len(queries)
+            for label in (f"第{season}季", f"第{chinese}季", f"S{season:02d}"):
+                add(re.sub(_RESOURCE_SEASON_PATTERN, label, title, flags=re.I))
+                if len(queries) - initial == 2:
+                    break
+            # Broaden only the lookup; verification still requires the original season.
+            add(re.sub(_RESOURCE_SEASON_PATTERN, " ", title, flags=re.I))
+    return queries
+
+
 def resource_titles_match(expected, candidate, allow_missing_year=False, aliases=()):
     name, seasons, years = _resource_title_parts(expected)
-    other_name, other_seasons, other_years = _resource_title_parts(candidate)
+    other_name, other_seasons, other_years = _resource_candidate_parts(expected, candidate)
     names = {name}
-    for alias in aliases[:5] if isinstance(aliases, (list, tuple)) else ():
+    for alias in aliases[:8] if isinstance(aliases, (list, tuple)) else ():
         if not isinstance(alias, str) or len(alias) > 200:
             continue
         alias_name, alias_seasons, alias_years = _resource_title_parts(alias)
@@ -1032,65 +1081,142 @@ class Quark:
             traceback.print_exc()
 
     def find_valid_resource(self, task, config):
-        from resource_search import search_resources
+        from resource_search import search_resources, search_web_resources
 
         title = task.get("taskname", "").strip()
         if not title:
             return {"success": False, "candidate": None, "code": "no_results", "error": "缺少资源名称"}
         aliases = task.get("search_aliases", [])
-        aliases = [alias for alias in aliases[:5] if isinstance(alias, str) and 0 < len(alias) <= 200] if isinstance(aliases, list) else []
-        queries = [title]
-        for name in [title] + aliases:
-            # Indexes often omit the premiere year and punctuation from their titles.
-            query = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", name)
-            query = re.sub(r"[^\w\s/]+", " ", query).strip()
-            query = re.sub(r"\s+", " ", query)
-            if query and query not in queries:
-                queries.append(query)
-        queries = queries[:4]
+        aliases = list(dict.fromkeys(alias.strip() for alias in aliases
+                                    if isinstance(alias, str) and alias.strip() and len(alias) <= 200))[:8] if isinstance(aliases, list) else []
+        queries = _resource_search_queries(title, aliases)
         old_id = self.extract_url(task.get("shareurl", ""))[0]
         seen = {old_id} | {
             entry.get("from_id") for entry in task.get("repair_history", [])
             if isinstance(entry, dict)
         }
-        def search_candidates():
+        attempted, source_errors = [], []
+        index_deadline = time.monotonic() + 60
+        interrupted = False
+
+        def record_error(source, message):
+            source = source if isinstance(source, str) and re.fullmatch(r"[\w -]{1,40}", source) else "搜索源"
+            message = str(message)
+            status = re.search(r"HTTP\s*(\d{3})", message, re.I)
+            reason = (f"HTTP {status.group(1)}" if status else "请求超时" if re.search(r"timeout|超时", message, re.I)
+                      else "需要人工验证" if re.search(r"验证码|人工验证|captcha|challenge", message, re.I)
+                      else "响应格式异常" if re.search(r"json|格式", message, re.I)
+                      else "网络连接失败" if re.search(r"connect|网络", message, re.I)
+                      else "查询失败")
+            error = {"source": source, "message": reason}
+            if error not in source_errors:
+                source_errors.append(error)
+
+        def search_candidates(words, web=False):
+            nonlocal interrupted
             had_error, had_results = False, False
-            for query in queries:
+            consecutive_errors = 0
+            for query in words:
+                if not web and time.monotonic() >= index_deadline:
+                    interrupted = True
+                    break
+                attempted.append(("web" if web else "index", query))
                 try:
                     # Reuse index caches; share validity is checked live below.
-                    result = search_resources(query, config, refresh=False)
-                except (requests.RequestException, ValueError, TypeError):
+                    result = search_web_resources(query, config, refresh=False) if web else search_resources(
+                        query, config, refresh=False, include_web=False
+                    )
+                except (requests.RequestException, ValueError, TypeError) as exc:
+                    record_error("网页搜索" if web else "索引搜索", type(exc).__name__)
                     had_error = True
+                    consecutive_errors += 1
+                    if not web and consecutive_errors == 2:
+                        interrupted = True
+                        break
                     continue
+                errors = result.get("errors") or []
+                for error in errors:
+                    if isinstance(error, dict):
+                        record_error(error.get("source"), error.get("message"))
                 if not result.get("success"):
                     had_error = True
+                    if not errors:
+                        record_error("网页搜索" if web else "索引搜索", result.get("message", ""))
+                    consecutive_errors += 1
+                    if not web and consecutive_errors == 2:
+                        interrupted = True
+                        break
                     continue
+                consecutive_errors = 0
                 entries = result.get("data", [])
+                if not entries and errors:
+                    had_error = True
                 had_results = had_results or bool(entries)
-                yield from entries[:50]
+                for candidate in entries[:50]:
+                    if not web and time.monotonic() >= index_deadline:
+                        interrupted = True
+                        return
+                    yield candidate
             if had_error and not had_results:
                 raise requests.RequestException("搜索源不可用，请检查搜索配置")
 
-        try:
-            return self._find_verified_resource(task, search_candidates(), seen, aliases)
-        except (requests.RequestException, ValueError, TypeError) as exc:
-            print(f"资源搜索异常：{type(exc).__name__}")
-            return {"success": False, "candidate": None, "code": "unavailable", "error": "搜索源暂不可用，请检查搜索配置或稍后重试"}
+        title_queries = _resource_search_queries(title, [])
+        web_queries = title_queries[:1]
+        # Some web indexes distinguish 第3季 from 第三季 even for the same work.
+        if re.search(r"[\u4e00-\u9fff]", _resource_title_parts(title)[0]):
+            chinese_season = next((word for word in title_queries[1:]
+                                   if re.search(r"第[零一二三四五六七八九十]+季", word)), None)
+            if chinese_season:
+                web_queries.append(chinese_season)
+        for alias in aliases:
+            if re.search(r"[\u4e00-\u9fff]", alias) and not re.search(r"[\u3040-\u30ff]", alias):
+                words = _resource_search_queries(alias, [])
+                if words and words[0] not in web_queries:
+                    web_queries.append(words[0])
+                    break
+        failures, visited = [], set()
+        for web, words in ((False, queries), (True, web_queries[:2])):
+            try:
+                result = self._find_verified_resource(task, search_candidates(words, web), seen, aliases,
+                                                      visited=visited, max_checked=3 if web else 5,
+                                                      verify_index_title=not web)
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                print(f"资源搜索异常：{type(exc).__name__}")
+                result = {"success": False, "candidate": None, "code": "unavailable",
+                          "error": "搜索源暂不可用，请检查搜索配置或稍后重试"}
+            if result["success"]:
+                return result
+            failures.append(result)
+        result = next((result for result in failures if result["code"] == "no_match"),
+                      next((result for result in failures if result["code"] == "unavailable"), failures[0]))
+        result["queries"] = list(dict.fromkeys(query for _, query in attempted))
+        result["source_errors"] = source_errors
+        result["search_complete"] = not (source_errors or interrupted or any(item.get("validation_limited") for item in failures))
+        if source_errors or interrupted:
+            summary = "；".join(f"{error['source']}：{error['message']}" for error in source_errors[:3])
+            prefix = f"部分来源查询失败（{summary}）" if summary else "索引查询已达到时间预算，部分关键词尚未查询"
+            result["error"] = prefix + "；已查询的来源未找到可验证的匹配资源，可稍后重试或手动选择链接"
+            if result["code"] == "no_results":
+                result["code"] = "unavailable"
+        return result
 
-    def _find_verified_resource(self, task, candidates, seen, aliases):
+    def _find_verified_resource(self, task, candidates, seen, aliases, visited=None,
+                                max_checked=5, verify_index_title=True):
         title = task["taskname"]
         checked, found_results = 0, False
-        visited = set()
+        limited = False
+        visited = visited if visited is not None else set()
         name, seasons, years = _resource_title_parts(title)
         names = {name} | {_resource_title_parts(alias)[0] for alias in aliases}
         names |= {first + second for first in names for second in names if first != second}
         for candidate in candidates:
             found_results = True
-            if checked >= 5:
+            if checked >= max_checked:
+                limited = True
                 break
-            if not isinstance(candidate, dict) or not resource_titles_match(
+            if not isinstance(candidate, dict) or (verify_index_title and not resource_titles_match(
                 title, candidate.get("taskname", ""), allow_missing_year=True, aliases=aliases
-            ):
+            )):
                 continue
             shareurl = candidate.get("shareurl", "")
             if not isinstance(shareurl, str):
@@ -1116,45 +1242,96 @@ class Quark:
                 files = (detail.get("data") or {}).get("list", [])
                 if detail.get("code") != 0 or not files:
                     continue
-                evidence = [item.get("file_name", "") for item in files]
+                directory_evidence = []
                 share = detail["data"].get("share")
                 if isinstance(share, dict) and isinstance(share.get("title"), str):
-                    evidence.append(share["title"])
-                # Follow bounded, single-folder wrappers without broadening to sibling shows.
+                    directory_evidence.append(share["title"])
+                selected_fid, ambiguous = None, False
+                base_title = re.sub(_RESOURCE_SEASON_PATTERN, " ", title, flags=re.I)
+                # Follow one verified path; sibling seasons are neither evidence nor a save target.
                 for _ in range(3):
-                    if len(files) != 1 or not files[0].get("dir"):
-                        break
-                    detail = self.get_detail(pwd_id, stoken, files[0]["fid"], max_pages=1)
+                    if len(files) == 1 and files[0].get("dir"):
+                        folder = files[0]
+                    else:
+                        if len(seasons) != 1:
+                            break
+                        parent_named = any(resource_titles_match(base_title, value, allow_missing_year=True, aliases=aliases)
+                                           or resource_titles_match(title, value, allow_missing_year=True, aliases=aliases)
+                                           for value in directory_evidence)
+                        matching = []
+                        for item in files:
+                            if not item.get("dir"):
+                                continue
+                            child_name, child_seasons, child_years = _resource_candidate_parts(title, item["file_name"])
+                            if resource_titles_match(title, item["file_name"], allow_missing_year=True, aliases=aliases) or (
+                                parent_named and not child_name and child_seasons == seasons
+                                and (not years or not child_years or child_years == years)
+                            ):
+                                matching.append(item)
+                        total = (detail.get("metadata") or {}).get("_total", len(files))
+                        if len(matching) > 1 or (matching and total > len(files)):
+                            ambiguous = True
+                            break
+                        if not matching:
+                            break
+                        folder = matching[0]
+                        if not re.fullmatch(r"[A-Za-z0-9_]{32}", str(folder.get("fid", ""))):
+                            ambiguous = True
+                            break
+                        selected_fid = folder["fid"]
+                    directory_evidence.append(folder["file_name"])
+                    detail = self.get_detail(pwd_id, stoken, folder["fid"], max_pages=1)
                     files = (detail.get("data") or {}).get("list", [])
                     if detail.get("code") != 0 or not files:
                         break
-                    evidence.extend(item.get("file_name", "") for item in files)
-                if detail.get("code") != 0 or not files:
+                if ambiguous or detail.get("code") != 0 or not files:
                     continue
-                if task.get("resource_type") in ("anime", "tv") and not any(not item.get("dir")
-                           and re.search(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", item.get("file_name", ""), re.I)
-                           and item.get("obj_category", "video") == "video" for item in files):
+                evidence = directory_evidence + [item.get("file_name", "") for item in files]
+                video_files = [item for item in files if not item.get("dir")
+                               and re.search(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", item.get("file_name", ""), re.I)
+                               and item.get("obj_category", "video") == "video"]
+                if task.get("resource_type") in ("anime", "tv") and not video_files:
                     continue
                 evidence = [re.sub(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", "", name, flags=re.I) for name in evidence]
                 if any(other_name in names | {""} and (
                     (other_seasons and not _resource_seasons_match(seasons, other_seasons, years))
                     or (years and other_years and years != other_years)
-                ) for other_name, other_seasons, other_years in map(_resource_title_parts, evidence)):
+                ) for other_name, other_seasons, other_years in (_resource_candidate_parts(title, value) for value in evidence)):
                     continue
-                if not any(
+                exact = any(
                     resource_titles_match(title, name, aliases=aliases)
                     for name in evidence
-                ):
+                )
+                numbered_episodes = [re.fullmatch(
+                    r"s(\d{1,2})e\d{1,4}(?:[ ._-]+(?:2160p|1080p|720p|4k))?(?:-[a-z0-9]{1,20})?",
+                    re.sub(r"\.[^.]+$", "", item.get("file_name", "")).strip(), re.I,
+                ) for item in video_files]
+                episode_seasons = {int(match.group(1)) for match in numbered_episodes if match}
+                declared_seasons = {int(match.group(1)) for item in video_files
+                                    if (match := re.match(r"s(\d{1,2})e\d{1,4}(?=\b|[._-])", item["file_name"], re.I))}
+                if declared_seasons and not _resource_seasons_match(seasons, declared_seasons, years):
                     continue
+                # A named directory and its plain SxxExx video files describe the same show.
+                path_seasons = set().union(*(other_seasons for other_name, other_seasons, _ in
+                                            (_resource_candidate_parts(title, value) for value in directory_evidence) if not other_name))
+                combined = bool(seasons and (episode_seasons | path_seasons) == seasons and any(
+                    resource_titles_match(base_title, value, aliases=aliases)
+                    for value in directory_evidence
+                ))
+                if not exact and not combined:
+                    continue
+                if selected_fid:
+                    pdir_fid = selected_fid
+                    shareurl = urllib.parse.urlunsplit(parsed._replace(fragment=f"/list/share/{selected_fid}"))
                 return {"success": True, "candidate": {
-                    **candidate, "pwd_id": pwd_id, "passcode": passcode,
+                    **candidate, "shareurl": shareurl, "pwd_id": pwd_id, "passcode": passcode,
                     "pdir_fid": pdir_fid, "stoken": stoken,
                 }, "error": ""}
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 print(f"候选分享验证失败：{type(exc).__name__}")
-        return {"success": False, "candidate": None, "code": "no_match" if found_results else "no_results",
+        return {"success": False, "candidate": None, "code": "no_match" if found_results else "no_results", "validation_limited": limited,
                 "error": "未找到经夸克文件验证的同名、同季、同年份资源，请尝试其他译名或手动选择链接" if found_results
-                else "搜索源暂无该名称的夸克资源，请尝试其他译名或手动搜索"}
+                else "已查询的来源未返回该名称的夸克资源，请尝试其他译名或手动搜索"}
 
     def repair_share(self, task):
         if not task.get("auto_repair", CONFIG_DATA.get("auto_repair", True)):

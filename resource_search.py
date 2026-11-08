@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from app.sdk.cloudsaver import CloudSaver
 from app.sdk.common import SearchError
 from app.sdk.pansou import PanSou
+from app.sdk.websearch import WebSearch
 
 
 DEFAULT_PANSOU_SERVER = "https://so.252035.xyz"
@@ -40,8 +41,28 @@ def _selection(value, label):
     return list(dict.fromkeys(item.lstrip("@") for item in value))
 
 
-def search_resources(query, config, refresh=False):
-    """最多聚合三个 PanSou 与一个 CloudSaver，并发为 2，保留部分源故障。
+def search_web_resources(query, config, refresh=False):
+    """自动订阅在网盘索引未找到可验证资源时，单独查询公开网页。"""
+    source = (config.get("source") or {}).get("websearch") or {}
+    if not _enabled(source):
+        return {"success": True, "data": [], "errors": [], "message": ""}
+    if not isinstance(query, str) or not query.strip() or len(query) > 200:
+        return {"success": False, "data": [], "errors": [], "message": "搜索词必须是 200 字以内的文本"}
+    client = WebSearch()
+    try:
+        entries = client.search(query.strip(), refresh=refresh)
+        errors = [{"source": "网页搜索", "message": str(error)} for error in client.errors]
+        return {"success": True, "data": entries, "errors": errors,
+                "message": "；".join(error["message"] for error in errors)}
+    except (SearchError, ValueError) as error:
+        return {"success": False, "data": [], "errors": [{"source": "网页搜索", "message": str(error)}],
+                "message": str(error)}
+    finally:
+        client.session.close()
+
+
+def search_resources(query, config, refresh=False, include_web=True):
+    """聚合网盘索引与公开网页；索引源最多三个 PanSou 与一个 CloudSaver。
 
     PanSou fallback_servers 与 PANSOU_FALLBACK_SERVERS 环境变量为补充源，
     不转发主源 token；channels/plugins 可为数组或逗号、空白分隔名称。
@@ -91,9 +112,16 @@ def search_resources(query, config, refresh=False):
             jobs.append(("CloudSaver", _server_url(cs["server"]), ""))
         except (SearchError, ValueError) as error:
             errors.append({"source": "CloudSaver", "message": str(error)})
+    if include_web and _enabled(sources.get("websearch") or {}):
+        jobs.append(("网页搜索", "", ""))
 
     def search_source(job):
         label, server, token = job
+        if label == "网页搜索":
+            response = search_web_resources(query, config, refresh=refresh)
+            if not response["success"]:
+                raise SearchError(response["message"])
+            return response["data"], response["errors"]
         client = CloudSaver(server) if label == "CloudSaver" else PanSou(server, token=token)
         try:
             if label == "CloudSaver":
@@ -101,8 +129,8 @@ def search_resources(query, config, refresh=False):
                 response = client.auto_login_search(query)
                 if not response.get("success"):
                     raise SearchError(response.get("message", "搜索失败"))
-                return client.clean_search_results(response.get("data", []))
-            return client.search(query, refresh=refresh, **selection)
+                return client.clean_search_results(response.get("data", [])), []
+            return client.search(query, refresh=refresh, **selection), []
         finally:
             client.session.close()
 
@@ -110,13 +138,15 @@ def search_resources(query, config, refresh=False):
         futures = [(job[0], executor.submit(search_source, job)) for job in jobs]
         for label, future in futures:
             try:
-                entries = future.result()
+                entries, warnings = future.result()
                 successful += 1
-                results.extend({**item, "source": label} for item in entries)
+                errors.extend(warnings)
+                results.extend({**item, "source": item.get("source") or label} if label == "网页搜索"
+                               else {**item, "source": label} for item in entries)
             except (SearchError, ValueError) as error:
                 errors.append({"source": label, "message": str(error)})
     if not successful and not errors:
-        errors.append({"source": "搜索配置", "message": "没有启用的搜索源，请启用 PanSou 或配置 CloudSaver"})
+        errors.append({"source": "搜索配置", "message": "没有启用的搜索源，请启用 PanSou、网页搜索或配置 CloudSaver"})
     results.sort(key=lambda item: item.get("datetime", ""), reverse=True)
     unique = {}
     for item in results:

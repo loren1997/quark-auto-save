@@ -12,6 +12,7 @@ class CalendarTests(unittest.TestCase):
         discovery._cache = None
         discovery._expires = 0
         discovery._aliases.clear()
+        discovery._bilibili_media.clear()
         self.clock = patch.object(discovery, "datetime")
         clock = self.clock.start()
         clock.now.return_value = datetime(2026, 11, 8, 12, tzinfo=discovery.CHINA_TZ)
@@ -323,19 +324,149 @@ class CalendarTests(unittest.TestCase):
         entry = {"id": "bangumi:123", "title": "作品中文名", "search_title": "作品中文名",
                  "search_aliases": ["日文原名"]}
         response = get.return_value.__enter__.return_value
-        response.json.return_value = {"name_cn": "作品中文名", "name": "日文原名", "infobox": [
+        response.json.side_effect = [{"id": 123, "type": 2, "name_cn": "作品中文名", "name": "日文原名", "infobox": [
             {"key": "别名", "value": [{"v": "常见译名"}, {"v": "常见译名"}, {"v": []}]},
             {"key": "中文名", "value": "另一个中文名"}, {"key": "作者", "value": "不能用来搜资源"},
-        ]}
+        ]}, []]
         aliases = discovery.get_search_aliases(entry)
         self.assertEqual(aliases, ["作品中文名", "日文原名", "常见译名", "另一个中文名"])
-        get.assert_called_once()
-        self.assertIn("/v0/subjects/123", get.call_args.args[0])
+        self.assertEqual(get.call_count, 2)
+        self.assertIn("/v0/subjects/123/subjects", get.call_args.args[0])
         get.side_effect = requests.Timeout("超时")
         self.assertEqual(discovery.get_search_aliases(entry), ["作品中文名", "日文原名"])
         get.reset_mock()
         self.assertEqual(discovery.get_search_aliases({"id": "bilibili:123", "title": "国创"}), ["国创"])
         get.assert_not_called()
+
+    @patch.object(discovery.requests, "get")
+    def test_same_named_source_book_adds_chinese_alias_before_romanized_names(self, get):
+        response = get.return_value.__enter__.return_value
+        response.json.side_effect = [
+            {"id": 630160, "type": 2, "name_cn": "黑暗召唤师在地下恋爱中", "name": "ダークサモナーとデキている",
+             "infobox": [{"key": "别名", "value": [{"v": "Dark Summoner to Dekiteiru"}, {"v": "I'm Dating a Dark Summoner!"}]}]},
+            [{"type": 1, "relation": "书籍", "name": "ダークサモナーとデキている", "name_cn": "与暗黑召唤师秘密恋爱中"},
+             {"type": 2, "relation": "衍生", "name": "ダークサモナーとデキている", "name_cn": "迷你动画"},
+             {"type": 1, "relation": "书籍", "name": "别的原作", "name_cn": "另一本书"},
+             {"type": 1, "relation": "片头曲", "name": "ダークサモナーとデキている", "name_cn": "同名音乐"}],
+        ]
+        aliases = discovery.get_search_aliases({"id": "bangumi:630160", "title": "黑暗召唤师在地下恋爱中"})
+        self.assertEqual(aliases[:2], ["黑暗召唤师在地下恋爱中", "与暗黑召唤师秘密恋爱中"])
+        self.assertEqual(get.call_count, 2)
+        self.assertFalse({"迷你动画", "另一本书", "同名音乐"}.intersection(aliases))
+
+    @patch.object(discovery.requests, "get")
+    def test_unrelated_subject_response_does_not_supply_names(self, get):
+        response = get.return_value.__enter__.return_value
+        response.json.return_value = {"id": 555605, "type": 2, "name_cn": "另一部作品", "name": "Wrong Subject"}
+        aliases = discovery.get_search_aliases({"id": "bangumi:630160", "title": "黑暗召唤师在地下恋爱中"})
+        self.assertEqual(aliases, ["黑暗召唤师在地下恋爱中"])
+        get.assert_called_once()
+
+    @patch.object(discovery.requests, "get")
+    def test_failed_relations_preserve_subject_aliases(self, get):
+        response = get.return_value.__enter__.return_value
+        response.json.side_effect = [{"id": 123, "type": 2, "name": "Original", "name_cn": "中文名"}, requests.Timeout("timeout")]
+        self.assertEqual(discovery.get_search_aliases({"id": "bangumi:123", "title": "中文名"}), ["中文名", "Original"])
+
+    def official_duplicate_sources(self, url):
+        if url == discovery.BILIBILI_CALENDAR:
+            return [{"date_ts": 1793980800, "episodes": [{"season_id": 1733, "title": "罗小黑战记", "follows": "983万追番"}]}]
+        if url.startswith(discovery.BILIBILI_SEASON):
+            return [{"season_id": 1733, "media_id": 9999}]
+        if "/akas" in url:
+            return [{"name": "罗小黑战记", "country": {"code": "CN"}}]
+        if "2026-11-07" in url:
+            return [{"airdate": "2026-11-07", "season": 3, "number": 3,
+                     "show": {"id": 7750, "name": "The Legend of Luoxiaohei", "type": "Animation",
+                              "officialSite": "https://www.bilibili.com/bangumi/media/md9999/"}}]
+        return []
+
+    @patch.object(discovery, "_get_json")
+    def test_exact_bilibili_media_mapping_prefers_official_continuous_numbering(self, fetch):
+        fetch.side_effect = self.official_duplicate_sources
+        items = discovery.get_calendar()["days"][5]["donghua"]
+        self.assertEqual([item["id"] for item in items], ["bilibili:1733"])
+        self.assertEqual(items[0]["search_title"], "罗小黑战记")
+        self.assertEqual(sum(call.args[0].startswith(discovery.BILIBILI_SEASON) for call in fetch.call_args_list), 1)
+        discovery._expires = 0
+        discovery.get_calendar()
+        self.assertEqual(sum(call.args[0].startswith(discovery.BILIBILI_SEASON) for call in fetch.call_args_list), 1)
+
+    @patch.object(discovery, "_get_json")
+    def test_official_season_link_needs_no_extra_lookup(self, fetch):
+        def sources(url):
+            data = self.official_duplicate_sources(url)
+            if "2026-11-07" in url:
+                data[0]["show"]["officialSite"] = "https://www.bilibili.com/bangumi/play/ss1733/?from=source"
+            return data
+        fetch.side_effect = sources
+        items = discovery.get_calendar()["days"][5]["donghua"]
+        self.assertEqual([item["id"] for item in items], ["bilibili:1733"])
+        self.assertFalse(any(call.args[0].startswith(discovery.BILIBILI_SEASON) for call in fetch.call_args_list))
+
+    @patch.object(discovery, "_get_json")
+    def test_catalog_lookup_budget_is_bounded_and_unverified_rows_are_preserved(self, fetch):
+        items = []
+        for number in range(1, 15):
+            items.extend([
+                {"id": f"bilibili:{number}", "title": f"国漫{number}", "source": "Bilibili"},
+                {"id": f"tvmaze:{number}:s3", "title": f"国漫{number} 第3季", "series_title": f"国漫{number}",
+                 "source": "TVmaze", "official_site": f"https://www.bilibili.com/bangumi/media/md{number + 100}/"}])
+        fetch.side_effect = lambda url: [{"season_id": int(url.split("=")[-1]), "media_id": int(url.split("=")[-1]) + 100}]
+        days = [{"date": "2026-11-13", "donghua": items}]
+        self.assertTrue(discovery._prefer_official_bilibili(days, []))
+        self.assertEqual(fetch.call_count, 12)
+        self.assertEqual(sum(item["source"] == "TVmaze" for item in days[0]["donghua"]), 2)
+
+    @patch.object(discovery, "_get_json")
+    def test_unknown_or_failed_bilibili_identity_keeps_tvmaze_and_caches_failure(self, fetch):
+        def failed(url):
+            if url.startswith(discovery.BILIBILI_SEASON):
+                raise requests.Timeout("timeout")
+            return self.official_duplicate_sources(url)
+        fetch.side_effect = failed
+        data = discovery.get_calendar()
+        self.assertEqual(len(data["days"][5]["donghua"]), 2)
+        self.assertTrue(any("身份" in warning for warning in data["warnings"]))
+        discovery._expires = 0
+        discovery.get_calendar()
+        self.assertEqual(sum(call.args[0].startswith(discovery.BILIBILI_SEASON) for call in fetch.call_args_list), 1)
+
+    @patch.object(discovery, "_get_json")
+    def test_bilibili_ids_are_not_assumed_equal_and_other_seasons_stay_separate(self, fetch):
+        def mismatch(url):
+            if url.startswith(discovery.BILIBILI_SEASON):
+                return [{"season_id": 1733, "media_id": 1733}]
+            return self.official_duplicate_sources(url)
+        fetch.side_effect = mismatch
+        self.assertEqual(len(discovery.get_calendar()["days"][5]["donghua"]), 2)
+        discovery._cache = None
+        def distinct_season(url):
+            data = self.official_duplicate_sources(url)
+            if url == discovery.BILIBILI_CALENDAR:
+                data[0]["episodes"][0]["title"] = "罗小黑战记 第2季"
+            return data
+        fetch.reset_mock()
+        fetch.side_effect = distinct_season
+        self.assertEqual(len(discovery.get_calendar()["days"][5]["donghua"]), 2)
+        self.assertFalse(any(call.args[0].startswith(discovery.BILIBILI_SEASON) for call in fetch.call_args_list))
+
+    @patch.object(discovery, "_get_json")
+    def test_official_identity_is_date_specific_and_rejects_other_hosts(self, fetch):
+        for site in ("https://www.bilibili.com.evil.example/bangumi/media/md9999/", "https://www.bilibili.com/bangumi/media/md9999/"):
+            discovery._cache = None
+            def sources(url):
+                data = self.official_duplicate_sources(url)
+                if "2026-11-07" in url:
+                    data[0]["show"]["officialSite"] = site
+                    if site.endswith("md9999/") and "evil" not in site:
+                        data[0]["airdate"] = "2026-11-06"
+                return data
+            fetch.reset_mock()
+            fetch.side_effect = sources
+            data = discovery.get_calendar()
+            self.assertEqual(sum(len(day["donghua"]) for day in data["days"]), 2)
+            self.assertFalse(any(call.args[0].startswith(discovery.BILIBILI_SEASON) for call in fetch.call_args_list))
 
 
 if __name__ == "__main__":

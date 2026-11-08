@@ -36,6 +36,9 @@
     "savepath": "/追更"
   },
   "source": {
+    "websearch": {
+      "enable": true
+    },
     "pansou": {
       "enable": true,
       "server": "https://so.252035.xyz",

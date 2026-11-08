@@ -347,6 +347,8 @@ def subscribe_discovery():
     result = Quark(cookie).find_valid_resource(task, current)
     if not result.get("success") or not result.get("candidate"):
         return jsonify(success=False, code=result.get("code", "no_match"),
+                       queries=result.get("queries", []), source_errors=result.get("source_errors", []),
+                       search_complete=result.get("search_complete", False),
                        message=result.get("error") or "未找到可验证的匹配资源，请在任务列表手动搜索"), 422
     safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")[:180]
     task.update({
@@ -700,6 +702,7 @@ def init():
         source = config_data.setdefault("source", {})
         source.setdefault("pansou", {"enable": True, "server": "https://so.252035.xyz"})
         source.setdefault("cloudsaver", {"enable": False, "server": "", "username": "", "password": ""})
+        source.setdefault("websearch", {"enable": True})
         if new_config and os.getenv("PANSOU_SERVER"):
             source["pansou"]["server"] = os.environ["PANSOU_SERVER"]
 

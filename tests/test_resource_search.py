@@ -2,6 +2,7 @@ import unittest
 import os
 import threading
 import time
+from functools import partial
 from unittest.mock import Mock, patch
 
 import requests
@@ -9,7 +10,10 @@ import requests
 from app.sdk.cloudsaver import CloudSaver
 from app.sdk.common import SearchError, extract_share_urls, iso_to_cst, normalize_share_url
 from app.sdk.pansou import PanSou
-from resource_search import DEFAULT_PANSOU_SERVER, search_resources
+from resource_search import DEFAULT_PANSOU_SERVER, search_resources as aggregate_search_resources, search_web_resources
+
+# Existing adapter cases isolate the index providers; web aggregation is tested below.
+search_resources = partial(aggregate_search_resources, include_web=False)
 
 
 URL = "https://pan.quark.cn/s/abc123"
@@ -258,6 +262,45 @@ class SharedSearchTests(unittest.TestCase):
         result = search_resources("作品", {"source": {"pansou": {"server": "file:///secret"}}})
         self.assertFalse(result["success"])
         pansou.assert_not_called()
+
+
+class WebAggregationTests(unittest.TestCase):
+    @patch("resource_search.WebSearch")
+    def test_web_search_defaults_on_and_preserves_partial_engine_failure(self, web):
+        web.return_value.search.return_value = [{**entry(), "source": "DuckDuckGo", "page_url": "https://public.example/post"}]
+        web.return_value.errors = ["Bing: 连接超时"]
+        result = aggregate_search_resources("作品", {"source": {"pansou": {"enable": False}}})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"][0]["source"], "DuckDuckGo")
+        self.assertEqual(result["data"][0]["page_url"], "https://public.example/post")
+        self.assertIn("Bing", result["message"])
+        web.return_value.session.close.assert_called_once()
+
+    @patch("resource_search.WebSearch")
+    def test_disabled_web_never_contacts_engines(self, web):
+        result = search_web_resources("作品", {"source": {"websearch": {"enable": False}}})
+        self.assertEqual(result["data"], [])
+        web.assert_not_called()
+
+    @patch("resource_search.WebSearch")
+    def test_web_failure_remains_a_source_error(self, web):
+        web.return_value.search.side_effect = SearchError("搜索引擎要求验证码")
+        result = search_web_resources("作品", {})
+        self.assertFalse(result["success"])
+        self.assertIn("验证码", result["errors"][0]["message"])
+        web.return_value.session.close.assert_called_once()
+
+    @patch("resource_search.WebSearch")
+    @patch("resource_search.PanSou")
+    def test_web_and_index_duplicates_keep_both_sources_and_password(self, pansou, web):
+        pansou.return_value.search.return_value = [entry()]
+        web.return_value.search.return_value = [{**entry(URL + "?pwd=1234"), "source": "DuckDuckGo"}]
+        web.return_value.errors = []
+        result = aggregate_search_resources("作品", {})
+        self.assertEqual(len(result["data"]), 1)
+        self.assertEqual(result["data"][0]["shareurl"], URL + "?pwd=1234")
+        self.assertIn("PanSou", result["data"][0]["source"])
+        self.assertIn("DuckDuckGo", result["data"][0]["source"])
 
 
 if __name__ == "__main__":

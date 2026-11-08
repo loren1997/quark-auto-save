@@ -80,10 +80,13 @@ class AppIntegrationTests(unittest.TestCase):
             current = self.saved_config()
             self.assertEqual(current["source"]["pansou"]["server"], "http://pansou:8888")
             self.assertEqual(current["tasklist"], [])
+            self.assertTrue(current["source"]["websearch"]["enable"])
             current["source"]["pansou"]["server"] = "https://custom.example"
+            current["source"]["websearch"]["enable"] = False
             web.Config.write_json(self.config_path, current)
             web.init()
             self.assertEqual(self.saved_config()["source"]["pansou"]["server"], "https://custom.example")
+            self.assertFalse(self.saved_config()["source"]["websearch"]["enable"])
 
     def test_update_rejects_malformed_new_settings_without_writing(self):
         for payload in ({"plugins": None}, {"plugins": {"aria2": None}},
@@ -240,10 +243,15 @@ class AppIntegrationTests(unittest.TestCase):
 
     def test_subscription_failure_returns_reason_without_saving(self):
         self.find.return_value = {"success": False, "candidate": None,
-                                  "error": "搜索源暂不可用", "code": "unavailable"}
+                                  "error": "搜索源暂不可用", "code": "unavailable",
+                                  "queries": ["测试动漫", "Test Anime"], "search_complete": False,
+                                  "source_errors": [{"source": "网页搜索", "message": "请求超时"}]}
         response = self.subscribe()
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json["code"], "unavailable")
+        self.assertEqual(response.json["queries"], ["测试动漫", "Test Anime"])
+        self.assertFalse(response.json["search_complete"])
+        self.assertEqual(response.json["source_errors"][0]["message"], "请求超时")
         self.assertEqual(self.saved_config(), self.config)
 
     def test_new_subscription_inherits_disabled_global_auto_repair(self):

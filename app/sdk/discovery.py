@@ -9,6 +9,7 @@ from time import monotonic
 import logging
 import re
 import unicodedata
+from urllib.parse import urlsplit
 
 import requests
 
@@ -18,20 +19,30 @@ USER_AGENT = "quark-auto-save/1.0 (+https://github.com/Cp0204/quark-auto-save)"
 TV_LIMIT = 10
 DONGHUA_LIMIT = 60
 BILIBILI_CALENDAR = "https://api.bilibili.com/pgc/web/timeline/v2?season_type=4&day_before=6&day_after=6"
+BILIBILI_SEASON = "https://api.bilibili.com/pgc/view/web/season?season_id="
 _cache = None
 _expires = 0
 _lock = Lock()
 _aliases = {}
+_bilibili_media = {}
+
+
+def _request_json(url):
+    with requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=(2, 4)) as response:
+        response.raise_for_status()
+        return response.json()
 
 
 def _get_json(url):
-    with requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=(2, 4)) as response:
-        response.raise_for_status()
-        data = response.json()
+    data = _request_json(url)
     if url == BILIBILI_CALENDAR:
         if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(data.get("result"), dict):
             raise ValueError("哔哩哔哩国创周历暂不可用")
         data = data["result"].get("timeline")
+    elif url.startswith(BILIBILI_SEASON):
+        if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(data.get("result"), dict):
+            raise ValueError("哔哩哔哩作品详情暂不可用")
+        data = [data["result"]]
     if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
         raise ValueError("数据格式不是条目列表")
     return data
@@ -62,18 +73,67 @@ def _poster(images):
     return url if isinstance(url, str) and url.startswith(("https://", "http://")) else ""
 
 
+def _title_key(title):
+    return "".join(char.casefold() for char in unicodedata.normalize("NFKC", title) if char.isalnum())
+
+
+def _bilibili_catalog_id(url):
+    try:
+        parsed = urlsplit(url if isinstance(url, str) else "")
+        if parsed.scheme not in ("http", "https") or parsed.hostname not in ("bilibili.com", "www.bilibili.com"):
+            return None
+        match = re.fullmatch(r"/bangumi/(?:media/(md)|play/(ss))(\d+)/?", parsed.path)
+        return ("media" if match[1] else "season", int(match[3])) if match else None
+    except ValueError:
+        return None
+
+
+def _prefer_official_bilibili(days, warnings):
+    pairs = []
+    for day in days:
+        official = [item for item in day["donghua"] if item["source"] == "Bilibili" and not item.get("stale")]
+        for item in day["donghua"]:
+            if item["source"] != "TVmaze":
+                continue
+            identity = _bilibili_catalog_id(item.get("official_site"))
+            if not identity:
+                continue
+            for candidate in official:
+                if _title_key(item.get("series_title", item["title"])) == _title_key(candidate["title"]):
+                    pairs.append((day["date"], item["id"], int(candidate["id"].split(":")[1]), identity))
+    now = monotonic()
+    needed = list(dict.fromkeys(season for _, _, season, identity in pairs if identity[0] == "media"
+                               and _bilibili_media.get(season, (None, 0))[1] <= now))[:12]
+    details, errors = _fetch_many({season: BILIBILI_SEASON + str(season) for season in needed})
+    for season in needed:
+        entries = details.get(season) or [{}]
+        data = entries[0]
+        media = data.get("media_id") if data.get("season_id") == season else None
+        valid = isinstance(media, int) and not isinstance(media, bool) and media > 0
+        _bilibili_media[season] = (media if valid else None, now + (3600 if valid else 300))
+    if errors:
+        warnings.append("部分哔哩哔哩作品身份暂无法核对，已保留 TVmaze 对应条目")
+    duplicates = set()
+    for day, key, season, identity in pairs:
+        media, expires = _bilibili_media.get(season, (None, 0))
+        if identity == ("season", season) or identity[0] == "media" and expires > now and media == identity[1]:
+            duplicates.add((day, key))
+    for day in days:
+        day["donghua"] = [item for item in day["donghua"] if (day["date"], item["id"]) not in duplicates]
+    return any(identity[0] == "media" and _bilibili_media.get(season, (None, 0))[0] is None
+               for _, _, season, identity in pairs)
+
+
 def get_search_aliases(entry):
-    """Fetch Bangumi's aliases only when a user subscribes, not for every card."""
+    """Fetch trusted names on subscription, including the same-named source book."""
     known = entry.get("search_aliases")
-    aliases = [entry.get("search_title"), entry.get("title"), *(known if isinstance(known, list) else [])]
+    aliases = [entry.get("search_title") or entry.get("title"), entry.get("title"), *(known if isinstance(known, list) else [])]
     key = str(entry.get("id", ""))
     if re.fullmatch(r"bangumi:\d+", key):
         try:
-            with requests.get(f"https://api.bgm.tv/v0/subjects/{key.split(':')[1]}",
-                              headers={"User-Agent": USER_AGENT}, timeout=(2, 4)) as response:
-                response.raise_for_status()
-                data = response.json()
-            if isinstance(data, dict):
+            subject_id = int(key.split(":")[1])
+            data = _request_json(f"https://api.bgm.tv/v0/subjects/{subject_id}")
+            if isinstance(data, dict) and data.get("id") == subject_id and data.get("type") == 2:
                 aliases.extend((data.get("name_cn"), data.get("name")))
                 for field in data.get("infobox", []) if isinstance(data.get("infobox"), list) else []:
                     if not isinstance(field, dict) or field.get("key") not in ("别名", "中文名"):
@@ -83,6 +143,18 @@ def get_search_aliases(entry):
                         aliases.extend(item.get("v") for item in value if isinstance(item, dict))
                     else:
                         aliases.append(value)
+                original_name = data.get("name")
+                if isinstance(original_name, str) and original_name.strip():
+                    related = _get_json(f"https://api.bgm.tv/v0/subjects/{subject_id}/subjects")
+                    book_names = [item.get("name_cn") for item in related[:50]
+                                  if item.get("type") == 1 and item.get("relation") in ("书籍", "原作")
+                                  and isinstance(item.get("name"), str)
+                                  and unicodedata.normalize("NFKC", item["name"]).strip()
+                                  == unicodedata.normalize("NFKC", original_name).strip()
+                                  and isinstance(item.get("name_cn"), str)
+                                  and re.search(r"[\u4e00-\u9fff]", item["name_cn"])]
+                    # Put alternate Chinese titles before romanized names in the bounded search.
+                    aliases[1:1] = book_names[:3]
         except (requests.RequestException, ValueError) as exc:
             logging.warning("Bangumi aliases unavailable for %s: %s", key, exc)
     return list(dict.fromkeys(value.strip() for value in aliases
@@ -230,6 +302,7 @@ def _tv_items(results, days, warnings):
                 day[category].append({
                     "id": f"tvmaze:{key}:s{season if season is not None else 'unknown'}",
                     "title": search_title, "search_title": search_title,
+                    "series_title": title, "official_site": show.get("officialSite"),
                     "search_aliases": [name + suffix for name in _aliases.get(key, [])] if category == "donghua" else [],
                     "source": "TVmaze", "source_url": f"https://www.tvmaze.com/shows/{key}",
                     "poster": _poster(show.get("image")), "heat": _number(show.get("weight")),
@@ -285,12 +358,12 @@ def get_calendar(config=None):
                             stale_used = True
             if stale_used:
                 warnings.append("失败的来源保留本周上次成功数据，已标注缓存；排期可能已变更")
+        identity_pending = _prefer_official_bilibili(days, warnings)
         for day in days:
             # Prefer the official Bilibili entry when both sources name the same series.
             unique = {}
             for item in sorted(day["donghua"], key=lambda entry: (bool(entry.get("stale")), entry["source"] != "Bilibili")):
-                name = "".join(char.casefold() for char in unicodedata.normalize("NFKC", item["title"])
-                               if char.isalnum())
+                name = _title_key(item["title"])
                 unique.setdefault(name, item)
             day["donghua"] = sorted(unique.values(), key=lambda item: (item["source"] != "TVmaze", -item["heat"], item["title"]))
             for category in ("anime", "tv"):
@@ -303,5 +376,5 @@ def get_calendar(config=None):
                       f"电视剧：TVmaze 中国播出数据，本周热度前 {TV_LIMIT} 部，按实际集日期归日、按 TVmaze 热度排序。",
                       "热度口径按条目标注，按来源分组、组内热度降序；不同来源数值不直接比较。TVmaze 数据按 CC BY-SA 4.0 使用。"],
         }
-        _expires = monotonic() + (300 if errors else 3600)
+        _expires = monotonic() + (300 if errors or identity_pending else 3600)
         return deepcopy(_cache)

@@ -36,7 +36,8 @@ def main():
     web.search_resources = lambda *args, **kwargs: {
         "success": False, "data": [], "message": "PanSou: 搜索源暂时不可用", "errors": []}
     web.Quark.find_valid_resource = lambda self, task, config: (
-        {"success": False, "code": "no_match", "error": "未找到可验证的视频资源"}
+        {"success": False, "code": "no_match", "error": "未找到可验证的视频资源",
+         "queries": ["失败番剧", "Test Anime"], "source_errors": [{"source": "网页搜索", "message": "请求超时"}]}
         if "失败番剧" in task["taskname"] else
         {"success": True, "candidate": {"shareurl": "https://pan.quark.cn/s/abc123", "stoken": "NEVER_SAVE"}})
     web.reload_tasks = lambda: True
@@ -91,6 +92,9 @@ def main():
                 page.get_by_role("button", name="周三", exact=True).click()
                 page.get_by_role("button", name="一键订阅并转存").click()
                 page.get_by_role("alert").filter(has_text="《失败番剧》：未找到可验证的视频资源").wait_for()
+                page.get_by_text("查看搜索详情", exact=True).click()
+                assert page.get_by_text("已尝试关键词：失败番剧、Test Anime", exact=True).is_visible()
+                assert page.get_by_text("网页搜索：请求超时", exact=True).is_visible()
                 assert len(web.Config.read_json(web.CONFIG_PATH)["tasklist"]) == 2
                 page.get_by_role("button", name="周二", exact=True).click()
                 assert page.get_by_text("当天暂无已收录的更新", exact=False).first.is_visible()
