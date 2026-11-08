@@ -11,6 +11,10 @@ on:
         description: 用于核对的准确片名、季数
         required: true
         default: 大理寺日志 第3季
+      alias:
+        description: 目录来源已确认的别名（可留空）
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -29,4 +33,5 @@ jobs:
         env:
           SEARCH_QUERY: ${{ inputs.query }}
           VERIFY_TITLE: ${{ inputs.title }}
-        run: python scripts/probe_web_search.py "$SEARCH_QUERY" --title "$VERIFY_TITLE"
+          VERIFY_ALIAS: ${{ inputs.alias }}
+        run: python scripts/probe_web_search.py "$SEARCH_QUERY" --title "$VERIFY_TITLE" --alias "$VERIFY_ALIAS"

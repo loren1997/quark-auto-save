@@ -252,6 +252,35 @@ class AutoRepairTests(unittest.TestCase):
         self.assertIn("需要人工验证", result["error"])
         self.assertFalse(result["search_complete"])
 
+    def test_web_diagnostic_categories_and_engine_survive_subscription_response(self):
+        for message, expected in (
+            ("网页域名解析失败", "DNS 域名解析失败"),
+            ("网页地址解析到了非公网 IP，已拒绝访问", "地址解析为非公网 IP，已拒绝访问"),
+            ("网页请求失败 (ProxyError)", "代理连接失败"),
+            ("网页请求失败 (InvalidProxyURL)", "代理配置无效"),
+            ("网页请求失败 (SSLError)", "TLS 或证书连接失败"),
+            ("TLS 证书验证失败", "TLS 或证书连接失败"),
+            ("网页搜索已达到本次时间预算", "达到本次查询时间预算"),
+            ("Bing 未返回 RSS，可能需要验证或服务不可用", "响应格式异常"),
+        ):
+            self.web_search.return_value = {"success": False, "data": [],
+                                           "errors": [{"source": "网页搜索 Bing", "message": message}]}
+            with self.subTest(message=message), self.search([]):
+                result = self.account.find_valid_resource(self.task, {})
+            self.assertEqual(result["source_errors"], [{"source": "网页搜索 Bing", "message": expected}])
+            self.assertIn("网页搜索 Bing：" + expected, result["error"])
+            self.assertFalse(result["search_complete"])
+
+    def test_distinct_engine_failures_are_not_collapsed_in_subscription(self):
+        errors = [{"source": "网页搜索 DuckDuckGo", "message": "HTTP 403"},
+                  {"source": "网页搜索 Bing", "message": "DNS 域名解析失败"}]
+        self.web_search.return_value = {"success": False, "data": [], "errors": errors}
+        with self.search([]):
+            result = self.account.find_valid_resource(self.task, {})
+        self.assertEqual(result["source_errors"], errors)
+        self.assertIn("DuckDuckGo：HTTP 403", result["error"])
+        self.assertIn("Bing：DNS 域名解析失败", result["error"])
+
     def test_index_time_budget_still_runs_web_fallback_and_reports_incomplete_search(self):
         with patch("resource_search.search_resources", return_value={"success": True, "data": []}) as index, patch.object(qas.time, "monotonic", side_effect=[0, 1, 61]):
             result = self.account.find_valid_resource(self.task, {})

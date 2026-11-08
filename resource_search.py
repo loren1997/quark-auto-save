@@ -15,6 +15,43 @@ DEFAULT_PANSOU_SERVER = "https://so.252035.xyz"
 MAX_PANSOU_SERVERS = 3
 
 
+def search_error_reason(message):
+    """Only fixed diagnostic categories may leave a transport exception."""
+    message = str(message)
+    status = re.search(r"HTTP\s*(\d{3})", message, re.I)
+    if status:
+        return f"HTTP {status.group(1)}"
+    for pattern, reason in (
+        (r"非公网", "地址解析为非公网 IP，已拒绝访问"),
+        (r"域名解析|\bdns\b|NameResolution|gaierror", "DNS 域名解析失败"),
+        (r"InvalidProxyURL|代理配置", "代理配置无效"),
+        (r"proxy|代理", "代理连接失败"),
+        (r"\bssl|\btls|certificate|证书", "TLS 或证书连接失败"),
+        (r"验证码|人工验证|captcha|challenge", "需要人工验证"),
+        (r"timeout|超时", "请求超时"),
+        (r"MiB|大小|读取(?:上限|限制)", "网页超过读取限制"),
+        (r"时间预算|时间上限", "达到本次查询时间预算"),
+        (r"json|rss|格式|不是文本网页|decode", "响应格式异常"),
+        (r"重定向", "网页重定向超过上限"),
+        (r"仅允许无账号的公网|网页地址不符合访问规则", "网页地址不符合访问规则"),
+        (r"connect|连接|网络", "网络连接失败"),
+    ):
+        if re.search(pattern, message, re.I):
+            return reason
+    return "查询失败"
+
+
+def _web_errors(messages):
+    errors = []
+    for message in messages:
+        match = re.match(r"^(Bing|DuckDuckGo)(\s+落地页)?:\s*(.*)$", str(message), re.S)
+        source = "网页搜索" + (f" {match[1]}{match[2] or ''}" if match else "")
+        error = {"source": source, "message": search_error_reason(match[3] if match else message)}
+        if error not in errors:
+            errors.append(error)
+    return errors
+
+
 def _enabled(source):
     return str(source.get("enable", True)).lower() == "true"
 
@@ -51,12 +88,14 @@ def search_web_resources(query, config, refresh=False):
     client = WebSearch()
     try:
         entries = client.search(query.strip(), refresh=refresh)
-        errors = [{"source": "网页搜索", "message": str(error)} for error in client.errors]
+        errors = _web_errors(client.errors)
         return {"success": True, "data": entries, "errors": errors,
-                "message": "；".join(error["message"] for error in errors)}
+                "message": "；".join(f"{error['source']}：{error['message']}" for error in errors)}
     except (SearchError, ValueError) as error:
-        return {"success": False, "data": [], "errors": [{"source": "网页搜索", "message": str(error)}],
-                "message": str(error)}
+        messages = client.errors if isinstance(client.errors, list) and client.errors else [error]
+        errors = _web_errors(messages)
+        return {"success": False, "data": [], "errors": errors,
+                "message": "；".join(f"{item['source']}：{item['message']}" for item in errors)}
     finally:
         client.session.close()
 
@@ -119,9 +158,7 @@ def search_resources(query, config, refresh=False, include_web=True):
         label, server, token = job
         if label == "网页搜索":
             response = search_web_resources(query, config, refresh=refresh)
-            if not response["success"]:
-                raise SearchError(response["message"])
-            return response["data"], response["errors"]
+            return response["data"], response["errors"], response["success"]
         client = CloudSaver(server) if label == "CloudSaver" else PanSou(server, token=token)
         try:
             if label == "CloudSaver":
@@ -129,8 +166,8 @@ def search_resources(query, config, refresh=False, include_web=True):
                 response = client.auto_login_search(query)
                 if not response.get("success"):
                     raise SearchError(response.get("message", "搜索失败"))
-                return client.clean_search_results(response.get("data", [])), []
-            return client.search(query, refresh=refresh, **selection), []
+                return client.clean_search_results(response.get("data", [])), [], True
+            return client.search(query, refresh=refresh, **selection), [], True
         finally:
             client.session.close()
 
@@ -138,8 +175,8 @@ def search_resources(query, config, refresh=False, include_web=True):
         futures = [(job[0], executor.submit(search_source, job)) for job in jobs]
         for label, future in futures:
             try:
-                entries, warnings = future.result()
-                successful += 1
+                entries, warnings, source_ok = future.result()
+                successful += bool(source_ok)
                 errors.extend(warnings)
                 results.extend({**item, "source": item.get("source") or label} if label == "网页搜索"
                                else {**item, "source": label} for item in entries)

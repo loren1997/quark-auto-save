@@ -125,6 +125,15 @@ def _resource_candidate_parts(expected, candidate):
     return other_name, other_seasons, other_years
 
 
+def _resource_video_title(filename):
+    """识别视频发布标签；不猜测被替换的片名字词，也不删除片名自带的数字。"""
+    title = unicodedata.normalize("NFKC", re.sub(r"\.[^.]+$", "", filename))
+    title = re.sub(r"^\s*[\[【]\s*(?:0?[1-9]|1[0-2])月(?:新番)?\s*[\]】]\s*", "", title)
+    title = re.sub(r"\s*[\[【](?:完全无修版|无修版|未删减版|无删减版|修正版)[\]】]\s*$", "", title)
+    # shortcut: bare episode numbers need zero padding; ambiguous sequel numbers stay intact.
+    return re.sub(r"(?:\s+|\s*[-_]\s*)0\d{1,2}\s*$", "", title).strip()
+
+
 def _resource_search_queries(title, aliases):
     queries, seen = [], set()
 
@@ -1081,7 +1090,7 @@ class Quark:
             traceback.print_exc()
 
     def find_valid_resource(self, task, config):
-        from resource_search import search_resources, search_web_resources
+        from resource_search import search_resources, search_web_resources, search_error_reason
 
         title = task.get("taskname", "").strip()
         if not title:
@@ -1101,14 +1110,7 @@ class Quark:
 
         def record_error(source, message):
             source = source if isinstance(source, str) and re.fullmatch(r"[\w -]{1,40}", source) else "搜索源"
-            message = str(message)
-            status = re.search(r"HTTP\s*(\d{3})", message, re.I)
-            reason = (f"HTTP {status.group(1)}" if status else "请求超时" if re.search(r"timeout|超时", message, re.I)
-                      else "需要人工验证" if re.search(r"验证码|人工验证|captcha|challenge", message, re.I)
-                      else "响应格式异常" if re.search(r"json|格式", message, re.I)
-                      else "网络连接失败" if re.search(r"connect|网络", message, re.I)
-                      else "查询失败")
-            error = {"source": source, "message": reason}
+            error = {"source": source, "message": search_error_reason(message)}
             if error not in source_errors:
                 source_errors.append(error)
 
@@ -1292,7 +1294,8 @@ class Quark:
                                and item.get("obj_category", "video") == "video"]
                 if task.get("resource_type") in ("anime", "tv") and not video_files:
                     continue
-                evidence = [re.sub(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", "", name, flags=re.I) for name in evidence]
+                video_names = {item["file_name"] for item in video_files}
+                evidence = [_resource_video_title(value) if value in video_names else value for value in evidence]
                 if any(other_name in names | {""} and (
                     (other_seasons and not _resource_seasons_match(seasons, other_seasons, years))
                     or (years and other_years and years != other_years)
@@ -1318,6 +1321,16 @@ class Quark:
                     resource_titles_match(base_title, value, aliases=aliases)
                     for value in directory_evidence
                 ))
+                # The actual named video and its enclosing directory can supply title and year separately.
+                path_years = set().union(*(_resource_title_parts(value)[2] for value in directory_evidence))
+                matched_videos = [
+                    resource_titles_match(title, _resource_video_title(item["file_name"]), allow_missing_year=True, aliases=aliases)
+                    for item in video_files
+                ]
+                consistent_videos = all(matched or numbered_episodes[index] or re.fullmatch(
+                    r"\d{1,3}", _resource_video_title(video_files[index]["file_name"])
+                ) for index, matched in enumerate(matched_videos))
+                combined = combined or bool(years and path_years == years and any(matched_videos) and consistent_videos)
                 if not exact and not combined:
                     continue
                 if selected_fid:

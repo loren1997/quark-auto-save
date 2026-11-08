@@ -6,7 +6,7 @@
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3) 中的 `quark-auto-save-nas-docker-v3.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.1 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.1) 中的 `quark-auto-save-nas-docker-v3.1.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -76,7 +76,7 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 热门订阅会使用目录来源的别名，包括 Bangumi 中原名相同且明确关联为原作书籍的中文译名。最多保留 8 个别名，先查询不带年份的不同名称，再补充季号写法与基础片名；索引阶段最多 12 个关键词并设有时间预算，连续两次所有源失败会提前进入网页补搜。网页补搜最多 2 个名称。查询时去掉年份或季数不代表取消验证约束。
 
-同一实际目录的片名与视频的 `S03E09` 等季号可联合验证。多季合集中有唯一且明确匹配的目标季目录时，订阅会指向该子目录；不会把其他季一起加入。目录中混入冲突季数、旧电影或仅有不完整片名时仍拒绝自动订阅。报错可展开“查看搜索详情”，了解已尝试关键词及来源故障；部分源不可用不会被表述成全网没有资源。
+同一实际目录的片名与视频的 `S03E09` 等季号可联合验证。多季合集中有唯一且明确匹配的目标季目录时，订阅会指向该子目录；不会把其他季一起加入。目录中混入冲突季数、旧电影或仅有不完整片名时仍拒绝自动订阅。视频名中的月份标签、已知版本标签和独立的零补齐集数会被识别；不会猜测被替换的片名字词。具名视频与其父目录可分别提供可信别名和年份，缺少年份或存在冲突时仍拒绝。报错可展开“查看搜索详情”，了解已尝试关键词及来源故障；部分源不可用不会被表述成全网没有资源。
 
 查询数量、页面大小和并发均有限制。时间预算用于停止后续查询，操作系统 DNS 解析和远端缓慢发送响应头仍可能延长实际等待时间。
 
@@ -117,16 +117,16 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从 V1/V2 更新至 V3：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从 V1/V2/V3 更新至 V3.1：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.1/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.1-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"
@@ -160,6 +160,7 @@ GitHub Actions 会先跑 Python 3.11/3.13 测试，再构建 amd64/arm64 镜像�
 - 无法搜索：查看页面源错误和 `docker compose logs --tail=100 pansou`；确认地址为 `http://pansou:8888`。公共 `https://so.252035.xyz` 可作备用，但没有稳定性保证。
 - 动漫源超时：页面会显示降级。如果你有自己的网络代理，可在 Compose 的服务 `environment` 中配置标准 `HTTPS_PROXY`，同时设置 `NO_PROXY: localhost,127.0.0.1,pansou`；不要关闭 TLS 校验。无需代理也能查看可达来源。
 - “未找到匹配的有效资源”：日历有片名不代表网络上存在可用的夸克分享；在任务列表检查名称、季数、年份，手动选择正确分享。
+- 网页搜索会分别显示 Bing、DuckDuckGo 及落地页的 DNS、TLS、代理、验证码、超时等错误；只有真实代理故障才需要检查代理设置。NAS 能正常搜到候选而验证失败时，应核对实际文件名称和目录年份。
 - “配置已被更新”：任务自动换源或另一页面写入了新配置。刷新后重新编辑，避免把新订阅或修复结果覆盖掉。
 - 订阅已创建但没转存：查看手动运行日志、Cookie 是否有效、目标网盘空间；在任务列表运行该任务重试。
 - NAS 没有本地文件：先看网盘是否已转存，再检查 Aria2 的连接、密钥、容器目录映射和该任务 `auto_download` 选项。

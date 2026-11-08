@@ -9,6 +9,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.sdk.websearch import WebSearch
+from app.sdk.common import SearchError
 from quark_auto_save import Quark
 
 
@@ -16,17 +17,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("query", help="公开网页搜索词")
     parser.add_argument("--title", help="待验证的准确片名，可含季数、年份")
+    parser.add_argument("--alias", action="append", default=[], help="目录来源已确认的别名，可重复指定")
     args = parser.parse_args()
     client = WebSearch()
     started = time.monotonic()
     try:
-        candidates = client.search(args.query, refresh=True)
+        try:
+            candidates = client.search(args.query, refresh=True)
+        except SearchError as error:
+            print(json.dumps({"query": args.query, "seconds": round(time.monotonic() - started, 2),
+                              "candidates": 0, "errors": client.errors or [str(error)],
+                              "proxy_configured": bool(client.session.proxies)}, ensure_ascii=False), flush=True)
+            return 2
         print(json.dumps({"query": args.query, "seconds": round(time.monotonic() - started, 2),
                           "candidates": len(candidates), "errors": client.errors,
+                          "proxy_configured": bool(client.session.proxies),
                           "pages": list(dict.fromkeys(item["page_url"] for item in candidates))}, ensure_ascii=False), flush=True)
         result = Quark()._find_verified_resource(
             {"taskname": args.title or args.query, "resource_type": "anime"},
-            candidates, set(), [], max_checked=3, verify_index_title=False,
+            candidates, set(), [alias.strip() for alias in args.alias[:8] if alias.strip()],
+            max_checked=3, verify_index_title=False,
         )
         print(json.dumps({"verified": result["success"], "error": result["error"],
                           "title": (result.get("candidate") or {}).get("taskname"),

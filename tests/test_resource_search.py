@@ -287,8 +287,60 @@ class WebAggregationTests(unittest.TestCase):
         web.return_value.search.side_effect = SearchError("搜索引擎要求验证码")
         result = search_web_resources("作品", {})
         self.assertFalse(result["success"])
-        self.assertIn("验证码", result["errors"][0]["message"])
+        self.assertEqual(result["errors"][0]["message"], "需要人工验证")
         web.return_value.session.close.assert_called_once()
+
+    @patch("resource_search.WebSearch")
+    def test_all_engine_failures_remain_separate_in_web_and_aggregate_results(self, web):
+        web.return_value.errors = ["DuckDuckGo: 网页域名解析失败", "Bing: 网页请求失败 (ProxyError)"]
+        web.return_value.search.side_effect = SearchError("；".join(web.return_value.errors))
+        expected = [{"source": "网页搜索 DuckDuckGo", "message": "DNS 域名解析失败"},
+                    {"source": "网页搜索 Bing", "message": "代理连接失败"}]
+        result = search_web_resources("作品", {})
+        self.assertFalse(result["success"])
+        self.assertEqual(result["errors"], expected)
+        result = aggregate_search_resources("作品", {"source": {"pansou": {"enable": False}}})
+        self.assertFalse(result["success"])
+        self.assertEqual(result["errors"], expected)
+
+    @patch("resource_search.WebSearch")
+    def test_landing_page_diagnostics_keep_engine_without_exposing_error_secrets(self, web):
+        web.return_value.search.return_value = []
+        web.return_value.errors = ["Bing 落地页: 网页地址解析到了非公网 IP，已拒绝访问",
+                                   "DuckDuckGo: InternalError https://user:password@example.com/?token=SECRET",
+                                   "https://secret.example?password=SECRET: unexpected"]
+        result = search_web_resources("作品", {})
+        self.assertEqual(result["errors"], [
+            {"source": "网页搜索 Bing 落地页", "message": "地址解析为非公网 IP，已拒绝访问"},
+            {"source": "网页搜索 DuckDuckGo", "message": "查询失败"},
+            {"source": "网页搜索", "message": "查询失败"},
+        ])
+        self.assertNotIn("SECRET", str(result))
+        self.assertNotIn("password", str(result))
+
+    @patch("resource_search.WebSearch")
+    def test_web_diagnostic_categories_are_specific_safe_and_stable(self, web):
+        cases = [
+            ("网页域名解析失败", "DNS 域名解析失败"),
+            ("网页请求失败 (InvalidProxyURL)", "代理配置无效"),
+            ("网页请求失败 (SSLError): certificate verify failed", "TLS 或证书连接失败"),
+            ("TLS 证书验证失败", "TLS 或证书连接失败"),
+            ("DuckDuckGo 要求人工验证", "需要人工验证"),
+            ("网页请求失败 (ReadTimeoutError)", "请求超时"),
+            ("网页搜索已达到本次时间预算", "达到本次查询时间预算"),
+            ("Bing 未返回 RSS，可能需要验证或服务不可用", "响应格式异常"),
+            ("网页 HTTP 403", "HTTP 403"),
+            ("网页超过 1 MiB 读取上限", "网页超过读取限制"),
+            ("仅允许无账号的公网 HTTP(S) 网页地址", "网页地址不符合访问规则"),
+        ]
+        web.return_value.search.return_value = []
+        for message, expected in cases:
+            with self.subTest(message=message):
+                web.return_value.errors = ["Bing: " + message]
+                result = search_web_resources("作品", {})
+                self.assertEqual(result["errors"], [{"source": "网页搜索 Bing", "message": expected}])
+                web.return_value.errors = ["Bing: " + expected]
+                self.assertEqual(search_web_resources("作品", {})["errors"][0]["message"], expected)
 
     @patch("resource_search.WebSearch")
     @patch("resource_search.PanSou")
