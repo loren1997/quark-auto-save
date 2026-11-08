@@ -222,10 +222,28 @@ def update():
         current = Config.read_json(CONFIG_PATH)
         if payload.get("config_revision") and payload["config_revision"] != config_revision(current):
             return jsonify(success=False, message="配置已被任务或其他页面更新，请刷新后重新编辑，避免覆盖自动换源结果"), 409
-        config_data = current
+        updated = deepcopy(current)
         for key, value in payload.items():
             if key in allowed_keys:
-                config_data[key] = value
+                updated[key] = value
+        if "discovery" in payload:
+            auto_download = updated["discovery"].get("auto_download", False)
+            if auto_download and not aria2_download_configured(updated):
+                return jsonify(success=False, message="请先启用并配置 Aria2 插件的地址、密钥和下载目录"), 400
+            for task in updated.get("tasklist", []):
+                if not task.get("resource_id"):
+                    continue
+                addition = task.setdefault("addition", {})
+                aria2 = addition.setdefault("aria2", {})
+                was_enabled = aria2.get("auto_download", False)
+                aria2["auto_download"] = auto_download
+                if auto_download:
+                    aria2["download_subdir"] = True
+                    if not was_enabled:
+                        aria2["download_existing"] = True
+                else:
+                    aria2.pop("download_existing", None)
+        config_data = updated
         Config.write_json(CONFIG_PATH, config_data)
     # 重新加载任务
     if reload_tasks():
@@ -330,12 +348,8 @@ def subscribe_discovery():
     if not valid_discovery_path(base):
         return jsonify(success=False, message="热门订阅保存路径必须是以 / 开头的夸克网盘目录"), 400
     auto_download = settings.get("auto_download", False)
-    if auto_download:
-        plugins = current.get("plugins") or {}
-        aria2 = plugins.get("aria2") if isinstance(plugins, dict) else None
-        if ("-aria2" in PLUGIN_FLAGS.split(",") or not isinstance(aria2, dict)
-                or not all(aria2.get(key) for key in ("host_port", "secret", "dir"))):
-            return jsonify(success=False, message="请先启用并配置 Aria2 插件的地址、密钥和下载目录"), 400
+    if auto_download and not aria2_download_configured(current):
+        return jsonify(success=False, message="请先启用并配置 Aria2 插件的地址、密钥和下载目录"), 400
     cookies = current.get("cookie") or []
     cookie = cookies[0] if isinstance(cookies, list) and cookies else cookies
     if not isinstance(cookie, str) or not cookie.strip() or cookie.startswith("Your "):
@@ -369,6 +383,13 @@ def subscribe_discovery():
         config_data.setdefault("tasklist", []).append(task)
         Config.write_json(CONFIG_PATH, config_data)
     return jsonify(success=True, existing=False, data=task, message="订阅已保存，正在开始转存")
+
+
+def aria2_download_configured(config):
+    plugins = config.get("plugins") or {}
+    aria2 = plugins.get("aria2") if isinstance(plugins, dict) else None
+    return ("-aria2" not in PLUGIN_FLAGS.split(",") and isinstance(aria2, dict)
+            and all(aria2.get(key) for key in ("host_port", "secret", "dir")))
 
 
 def valid_discovery_path(path):

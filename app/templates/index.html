@@ -116,7 +116,7 @@
             </div>
             <div class="form-check my-3">
               <input id="discovery-download" type="checkbox" class="form-check-input" v-model="formData.discovery.auto_download">
-              <label for="discovery-download" class="form-check-label">热门订阅同时通过 Aria2 下载到 NAS（需先配置下方 Aria2 插件）</label>
+              <label for="discovery-download" class="form-check-label">热门订阅通过 Aria2 下载到 NAS（需先配置下方 Aria2 插件；保存后同步已有热门任务，首次启用会补交已转存文件）</label>
             </div>
 
             <div class="row title" title="通知推送，支持多个渠道，见Wiki">
@@ -1004,10 +1004,10 @@
           }
         },
         saveConfig() {
-          axios.post('/update', this.formData)
-            .then(response => {
+          return axios.post('/update', this.formData)
+            .then(async response => {
               if (response.data.success) {
-                this.$set(this.formData, 'config_revision', response.data.config_revision);
+                await this.fetchData();
                 this.configModified = false;
                 this.$nextTick(() => { this.configModified = false; });
                 this.showToast(response.data.message, 'success');

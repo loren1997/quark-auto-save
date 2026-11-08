@@ -21,6 +21,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Install Aria2 for the real download integration test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends aria2
       - run: python -m pip install -r requirements.txt
       - run: python -m unittest discover -s tests -v
 

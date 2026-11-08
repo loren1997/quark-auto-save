@@ -294,6 +294,86 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertNotIn("fake-rpc-secret", response.get_data(as_text=True))
         self.assertEqual(self.saved_config()["tasklist"][0], response.json["data"])
 
+    def test_update_enables_existing_popular_tasks_and_preserves_other_settings(self):
+        for previous_global in (False, True):
+            with self.subTest(previous_global=previous_global):
+                self.config["discovery"]["auto_download"] = previous_global
+                self.config["tasklist"] = [
+                    {"resource_id": "bangumi:42", "addition": {"aria2": {
+                        "auto_download": False, "download_subdir": False,
+                        "save_path": "动漫", "pause": True,
+                    }, "other": {"enabled": True}}},
+                    {"resource_id": "bilibili:43"},
+                    {"taskname": "手动任务", "addition": {"aria2": {"auto_download": False}}},
+                ]
+                self.write_config()
+                response = self.client.post("/update", json={
+                    "discovery": {"savepath": "/追更", "auto_download": True},
+                    "plugins": {"aria2": {"host_port": "192.168.66.33:6800",
+                                           "secret": "fake-secret", "dir": "/Downloads"}},
+                })
+                self.assertTrue(response.json["success"])
+                tasks = self.saved_config()["tasklist"]
+                self.assertEqual(tasks[0]["addition"], {"aria2": {
+                    "auto_download": True, "download_subdir": True,
+                    "download_existing": True, "save_path": "动漫", "pause": True,
+                }, "other": {"enabled": True}})
+                self.assertEqual(tasks[1]["addition"]["aria2"], {
+                    "auto_download": True, "download_subdir": True, "download_existing": True,
+                })
+                self.assertEqual(tasks[2], self.config["tasklist"][2])
+                # The next UI fetch must contain the updated flags used by manual runs.
+                self.assertEqual(self.client.get("/data").json["data"]["tasklist"], tasks)
+
+    def test_saving_enabled_download_does_not_repeat_completed_backfill(self):
+        self.config["discovery"]["auto_download"] = True
+        self.config["plugins"] = {"aria2": {
+            "host_port": "192.168.66.33:6800", "secret": "fake-secret", "dir": "/Downloads",
+        }}
+        self.config["tasklist"] = [
+            {"resource_id": "bangumi:42", "addition": {"aria2": {"auto_download": True}}},
+            {"resource_id": "bilibili:43", "addition": {"aria2": {
+                "auto_download": True, "download_existing": True,
+            }}},
+        ]
+        self.write_config()
+        response = self.client.post("/update", json={"discovery": self.config["discovery"]})
+        self.assertTrue(response.json["success"])
+        tasks = self.saved_config()["tasklist"]
+        self.assertNotIn("download_existing", tasks[0]["addition"]["aria2"])
+        self.assertTrue(tasks[1]["addition"]["aria2"]["download_existing"])
+
+    def test_disabling_popular_download_cancels_pending_backfill(self):
+        self.config["discovery"]["auto_download"] = True
+        self.config["tasklist"] = [{"resource_id": "bangumi:42", "addition": {"aria2": {
+            "auto_download": True, "download_existing": True, "download_subdir": True,
+            "save_path": "动漫", "pause": True,
+        }}}]
+        self.write_config()
+        response = self.client.post("/update", json={
+            "discovery": {"savepath": "/追更", "auto_download": False},
+        })
+        self.assertTrue(response.json["success"])
+        self.assertEqual(self.saved_config()["tasklist"][0]["addition"]["aria2"], {
+            "auto_download": False, "download_subdir": True, "save_path": "动漫", "pause": True,
+        })
+
+    def test_update_requires_aria2_configuration_before_enabling_download(self):
+        complete = {"host_port": "192.168.66.33:6800", "secret": "fake-secret", "dir": "/Downloads"}
+        for aria2, flags in (({}, ""), ({"host_port": complete["host_port"]}, ""),
+                             ({"host_port": complete["host_port"], "secret": complete["secret"]}, ""),
+                             (complete, "-aria2")):
+            with self.subTest(aria2=aria2, flags=flags), patch.object(web, "PLUGIN_FLAGS", flags):
+                response = self.client.post("/update", json={
+                    "discovery": {"savepath": "/新目录", "auto_download": True},
+                    "plugins": {"aria2": aria2},
+                })
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("Aria2", response.json["message"])
+                self.assertEqual(self.saved_config(), self.config)
+                self.assertEqual(web.config_data, self.config)
+        self.reload.assert_not_called()
+
     def test_subscribe_preserves_concurrent_config_changes(self):
         other = {"taskname": "另外一部", "shareurl": "https://pan.quark.cn/s/other", "savepath": "/其它"}
 

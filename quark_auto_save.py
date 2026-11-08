@@ -134,6 +134,65 @@ def _resource_video_title(filename):
     return re.sub(r"(?:\s+|\s*[-_]\s*)0\d{1,2}\s*$", "", title).strip()
 
 
+def _resource_episode_number(task, filename):
+    """只识别单作品目录中的明确集号，不用重命名规则里的任意数字兜底。"""
+    if not re.search(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", filename, re.I):
+        return None
+    title = task.get("taskname", "")
+    name, seasons, years = _resource_title_parts(title)
+    season = next(iter(seasons)) if len(seasons) == 1 else (1 if not seasons and years else None)
+    if not name or not season:
+        return None
+    stem = unicodedata.normalize("NFKC", filename.rsplit(".", 1)[0]).strip()
+    stem = re.sub(r"^\s*[\[【]\s*(?:0?[1-9]|1[0-2])月(?:新番)?\s*[\]】]\s*", "", stem)
+    stem = re.sub(r"\s*[\[【](?:完全无修版|无修版|未删减版|无删减版|修正版)[\]】]\s*$", "", stem)
+    stem = re.sub(r"(?:[ ._-]+|\s*[\[【(])(?:2160p|1080p|720p|4k)[\]】)]?\s*$", "", stem, flags=re.I)
+    prefix, number = "", None
+    match = re.fullmatch(r"(.*?)s(\d{1,2})e(\d{1,3})", stem, re.I)
+    if match:
+        if int(match[2]) != season:
+            return None
+        prefix, number = match[1], int(match[3])
+    else:
+        match = re.fullmatch(r"(.*?)(?:第\s*(\d{1,3})\s*[集话]|(?:ep?|episode)[ ._-]*(\d{1,3}))", stem, re.I)
+        if match:
+            prefix, number = match[1], int(match[2] or match[3])
+        elif re.fullmatch(r"\d{1,3}", stem):
+            number = int(stem)
+        elif match := re.fullmatch(r"(.+?)(?:\s+|[._-])0(\d{1,2})", stem):
+            prefix, number = match[1], int(match[2])
+    if number is None or number < 1:
+        return None
+    if re.search(r"s\d{1,2}e\d|\be(?:p)?\d|第\s*\d+\s*[集话]", prefix, re.I):
+        return None
+    other_name, other_seasons, other_years = _resource_title_parts(prefix)
+    names = {name} | {_resource_title_parts(alias)[0] for alias in task.get("search_aliases", []) if isinstance(alias, str)}
+    names |= {first + second for first in names for second in names if first != second}
+    if (other_name and other_name not in names) or (other_seasons and other_seasons != {season}) or (years and other_years and years != other_years):
+        return None
+    return number
+
+
+def _episode_repair_files(task, files, required_episodes):
+    mr = MagicRename(CONFIG_DATA.get("magic_regex", {}))
+    mr.set_taskname(task["taskname"])
+    pattern, replace = mr.magic_regex_conv(task.get("pattern", ""), task.get("replace", ""))
+    selected, numbers = {}, set()
+    for item in files:
+        if item.get("dir") or item.get("obj_category", "video") != "video":
+            continue
+        filename = item.get("file_name", "")
+        episode = _resource_episode_number(task, filename)
+        if episode not in required_episodes or episode in numbers or not re.search(pattern, filename):
+            continue
+        renamed = mr.sub(pattern, replace, filename)
+        if _resource_episode_number(task, renamed) != episode:
+            continue
+        selected[item["fid"]] = episode
+        numbers.add(episode)
+    return selected
+
+
 def _resource_search_queries(title, aliases):
     queries, seen = [], set()
 
@@ -285,7 +344,7 @@ class Config:
         )]
         if len(matches) != 1:
             return False
-        fields = ("shareurl", "shareurl_ban", "startfid", "repair_history", "addition", "replace")
+        fields = ("shareurl", "shareurl_ban", "startfid", "repair_history", "addition", "replace", "aria2_pending", "aria2_pending_dirs")
         Config._merge_changes(matches[0], {key: original[key] for key in fields if key in original},
                              {key: updated[key] for key in fields if key in updated})
         return True
@@ -1089,7 +1148,7 @@ class Quark:
             print(f"❌ 转存测试失败: {str(e)}")
             traceback.print_exc()
 
-    def find_valid_resource(self, task, config):
+    def find_valid_resource(self, task, config, required_episodes=None):
         from resource_search import search_resources, search_web_resources, search_error_reason
 
         title = task.get("taskname", "").strip()
@@ -1181,7 +1240,7 @@ class Quark:
             try:
                 result = self._find_verified_resource(task, search_candidates(words, web), seen, aliases,
                                                       visited=visited, max_checked=3 if web else 5,
-                                                      verify_index_title=not web)
+                                                      verify_index_title=not web, required_episodes=required_episodes)
             except (requests.RequestException, ValueError, TypeError) as exc:
                 print(f"资源搜索异常：{type(exc).__name__}")
                 result = {"success": False, "candidate": None, "code": "unavailable",
@@ -1203,7 +1262,7 @@ class Quark:
         return result
 
     def _find_verified_resource(self, task, candidates, seen, aliases, visited=None,
-                                max_checked=5, verify_index_title=True):
+                                max_checked=5, verify_index_title=True, required_episodes=None):
         title = task["taskname"]
         checked, found_results = 0, False
         limited = False
@@ -1249,6 +1308,7 @@ class Quark:
                 if isinstance(share, dict) and isinstance(share.get("title"), str):
                     directory_evidence.append(share["title"])
                 selected_fid, ambiguous = None, False
+                verified_pdir_fid = pdir_fid
                 base_title = re.sub(_RESOURCE_SEASON_PATTERN, " ", title, flags=re.I)
                 # Follow one verified path; sibling seasons are neither evidence nor a save target.
                 for _ in range(3):
@@ -1282,6 +1342,7 @@ class Quark:
                             break
                         selected_fid = folder["fid"]
                     directory_evidence.append(folder["file_name"])
+                    verified_pdir_fid = folder["fid"]
                     detail = self.get_detail(pwd_id, stoken, folder["fid"], max_pages=1)
                     files = (detail.get("data") or {}).get("list", [])
                     if detail.get("code") != 0 or not files:
@@ -1333,12 +1394,19 @@ class Quark:
                 combined = combined or bool(years and path_years == years and any(matched_videos) and consistent_videos)
                 if not exact and not combined:
                     continue
+                episode_fids = None
+                if required_episodes is not None:
+                    episode_fids = _episode_repair_files(task, video_files, required_episodes)
+                    if not episode_fids:
+                        continue
+                    pdir_fid = verified_pdir_fid
                 if selected_fid:
-                    pdir_fid = selected_fid
+                    pdir_fid = verified_pdir_fid if required_episodes is not None else selected_fid
                     shareurl = urllib.parse.urlunsplit(parsed._replace(fragment=f"/list/share/{selected_fid}"))
                 return {"success": True, "candidate": {
                     **candidate, "shareurl": shareurl, "pwd_id": pwd_id, "passcode": passcode,
                     "pdir_fid": pdir_fid, "stoken": stoken,
+                    **({"episode_fids": episode_fids} if episode_fids is not None else {}),
                 }, "error": ""}
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 print(f"候选分享验证失败：{type(exc).__name__}")
@@ -1370,6 +1438,77 @@ class Quark:
         }])[-10:]
         add_notify(f"🔄《{task['taskname']}》已自动换源：{old_id} → {candidate['pwd_id']}；保留转存规则")
         return candidate
+
+    def repair_episode_gaps(self, task, tree):
+        if (not task.get("resource_id") or task.get("resource_type") not in ("anime", "tv")
+                or not task.get("auto_repair", CONFIG_DATA.get("auto_repair", True))
+                or task.get("shareurl_ban") or tree.root is None):
+            return
+        mr = MagicRename(CONFIG_DATA.get("magic_regex", {}))
+        _, replace = mr.magic_regex_conv(task.get("pattern", ""), task.get("replace", ""))
+        if (task.get("startfid") or task.get("update_subdir_resave_mode")
+                or re.search(r"\{I+\}", replace) or _resource_episode_number(task, "01.mkv") is None):
+            print("缺集检查已跳过：订阅边界、重新编号或季数无法安全确认")
+            return
+        try:
+            savepath = re.sub(r"/{2,}", "/", f"/{task['savepath']}")
+            target_fid = self.savepath_fid.get(savepath)
+            if not target_fid:
+                return
+            response = self.ls_dir(target_fid)
+            files = (response.get("data") or {}).get("list")
+            if response.get("code") != 0 or not isinstance(files, list):
+                print("缺集检查暂不可用：无法读取保存目录，下次运行重试")
+                return
+            folders = [item for item in files if item.get("dir")]
+            if len(folders) > 3:
+                print("缺集检查已跳过：保存目录子目录较多，请先确认同一季的目录")
+                return
+            for folder in folders:
+                children = self.ls_dir(folder["fid"])
+                child_list = (children.get("data") or {}).get("list")
+                if children.get("code") != 0 or child_list != [] or (children.get("metadata") or {}).get("_total", 0):
+                    print("缺集检查已跳过：子目录非空或读取失败，请先确认同一季的目录")
+                    return
+            names = [item.get("file_name", "") for item in files
+                     if re.search(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", item.get("file_name", ""), re.I)]
+            names += [node.data.get("file_name", "") for node in tree.all_nodes()
+                      if node.data and not node.data.get("is_dir")]
+            episodes = {_resource_episode_number(task, filename) for filename in names}
+            if None in episodes:
+                print("缺集检查已跳过：存在无法可靠识别集号的视频，不推测缺集")
+                return
+            if len(episodes) < 2:
+                return
+            missing = set(range(min(episodes), max(episodes) + 1)) - episodes
+            if not missing:
+                return
+            print(f"🔎《{task['taskname']}》检测到中间缺集 {sorted(missing)[:20]}，查找其他同作品同季分享")
+            result = self.find_valid_resource(task, CONFIG_DATA, required_episodes=missing)
+            if not result["success"]:
+                print(f"补集未完成：{result['error']}；原订阅和已有文件保留")
+                return
+            candidate = result["candidate"]
+            supplement = self.dir_check_and_save(
+                dict(task), candidate["pwd_id"], candidate["stoken"], candidate["pdir_fid"],
+                allowed_episode_fids=candidate["episode_fids"],
+            )
+            saved = set()
+            for node in supplement.all_nodes():
+                if node.identifier == supplement.root or not node.data or node.data.get("is_dir"):
+                    continue
+                episode = _resource_episode_number(task, node.data.get("file_name", ""))
+                if episode in missing:
+                    tree.create_node(node.tag, f"episode-repair:{candidate['pwd_id']}:{node.identifier}",
+                                     parent=tree.root, data=node.data)
+                    saved.add(episode)
+            if saved:
+                print(f"补集转存成功：{sorted(saved)}；保留原订阅继续追更")
+            remaining = missing - saved
+            if remaining:
+                print(f"仍有中间缺集 {sorted(remaining)[:20]}；本次补搜结束，下次运行再检查")
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            print(f"补集暂未完成（{type(exc).__name__}）；保留原订阅和已有文件")
 
     def do_save_task(self, task):
         # Recheck historical bans: older versions also banned temporary login errors.
@@ -1407,6 +1546,7 @@ class Quark:
                 updated_tree = self.dir_check_and_save(
                     task, replacement["pwd_id"], replacement["stoken"], replacement["pdir_fid"]
                 )
+        self.repair_episode_gaps(task, updated_tree)
         if updated_tree.size(1) > 0:
             self.do_rename(updated_tree)
             print()
@@ -1416,7 +1556,7 @@ class Quark:
             print(f"任务结束：没有新的转存任务")
             return False
 
-    def dir_check_and_save(self, task, pwd_id, stoken, pdir_fid="", subdir_path=""):
+    def dir_check_and_save(self, task, pwd_id, stoken, pdir_fid="", subdir_path="", allowed_episode_fids=None):
         tree = Tree()
         # 获取分享文件列表
         detail = self.get_detail(pwd_id, stoken, pdir_fid)
@@ -1448,6 +1588,12 @@ class Quark:
                 print(f"读取分享子目录失败：{detail.get('message', '服务暂不可用')}；下次重试")
                 return tree
             share_file_list = detail["data"].get("list", [])
+
+        if allowed_episode_fids is not None:
+            verified = _episode_repair_files(task, share_file_list, set(allowed_episode_fids.values()))
+            share_file_list = [item for item in share_file_list
+                               if item.get("fid") in verified
+                               and verified[item["fid"]] == allowed_episode_fids.get(item["fid"])]
 
         # 获取目标目录文件列表
         savepath = re.sub(r"/{2,}", "/", f"/{task['savepath']}{subdir_path}")
@@ -1780,10 +1926,19 @@ def do_save(account, tasklist=[]):
                 task.get("addition", {}), task_plugins_config
             )
             # 调用插件
-            if is_new_tree:
+            aria2_config = task["addition"].get("aria2", {})
+            retry_download = aria2_config.get("auto_download") and (
+                aria2_config.get("download_existing") or task.get("aria2_pending") or task.get("aria2_pending_dirs")
+            )
+            if is_new_tree or retry_download:
                 print(f"🧩 调用插件")
+                if aria2_config.get("auto_download") and "aria2" not in plugins:
+                    print("Aria2下载: 插件未加载，请检查全局 Aria2 配置和 PLUGIN_FLAGS；下次运行将补交")
+                    aria2_config["download_existing"] = True
                 for plugin_name, plugin in plugins.items():
-                    if plugin.is_active and hasattr(plugin, "run"):
+                    if hasattr(plugin, "run") and (
+                        plugin_name == "aria2" or (is_new_tree and plugin.is_active)
+                    ):
                         task = (
                             plugin.run(task, account=account, tree=is_new_tree) or task
                         )

@@ -6,7 +6,7 @@
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.1 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.1) 中的 `quark-auto-save-nas-docker-v3.1.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.2 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.2) 中的 `quark-auto-save-nas-docker-v3.2.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -84,6 +84,10 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 开启“删除子目录后重存”的任务不会自动换源，以免新来源触发已有删除规则。单任务可在 JSON 配置中设置 `auto_repair: false` 禁用换源。
 
+热门订阅运行时还会检查明确集号之间的缺口，例如 `01、03、04、05、05.mkv` 去重后缺第 2 集；从其他通过同作品、同季、已知年份验证的分享中仅补入缺号，再交给下载插件，保留原订阅继续追更。每轮只进行一次有界补搜，未补齐会打印剩余缺号并在下次运行重试。不会根据文件数量推断集数，也不猜测首集之前或最新集之后是否还缺集。
+
+自动补集目前限单季、可可靠解析集号的热门任务；使用起始文件、重新编号、删除重存、混合季目录或无法识别文件名时跳过。最多检查 3 个空子目录；非空子目录需先确认季别，不自动跨目录补集。无法找到包含缺号的有效分享时会保留原状并说明原因，不表示资源已完整。关闭“分享失效时自动搜索并替换”也会关闭自动补集。
+
 ## 4. 热门追更
 
 左侧“热门追更”按周一到周日显示，分国漫、动漫、电视剧，默认打开国漫。一键订阅先搜索并验证资源，再保存任务并立即调用转存，之后按系统定时规则持续追更。重复点击或来源切换时会检查已有订阅。若浏览器在创建订阅后关闭，已保存的任务仍会在下一次定时运行时执行。
@@ -108,8 +112,11 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 1. 系统配置 → 插件 → aria2，填写 `host_port`（如 `http://NAS局域网IP:6800`）、`secret` 和 `dir`。
 2. `dir` 是 **Aria2 进程看到的下载目录**。Aria2 在容器内运行时，需先将 NAS 下载文件夹挂载到该容器，例如 `/downloads`，这里填写 `/downloads`。
-3. 开启“热门订阅同时通过 Aria2 下载到 NAS”并保存。
-4. 此后新建的热门订阅会在转存成功后把新增文件提交给 Aria2，含子目录。已有订阅需要在任务插件选项中启用 `aria2.auto_download`、`download_subdir`。
+3. 开启“热门订阅通过 Aria2 下载到 NAS”并保存。仅填写 RPC 连接参数不会启用下载。
+4. 保存后，新旧热门订阅都会启用下载；刚启用的旧任务会在下一次运行时补交保存目录中的文件。到“任务列表”运行原任务即可，无需删除文件或重新订阅。
+5. 日志出现 `Aria2已提交` 和 `GID` 表示下载器已受理；实际进度、完成情况和磁盘路径在 Aria2 查看。RPC 未连接、任务未开启、请求被拒绝会分别提示。
+
+无法提交的文件及未扫描成功的子目录会保留到下次运行重试，即使没有新转存也会重试；不保存临时下载直链或 Cookie。普通手动任务仍使用自己的 `addition.aria2` 设置：开启 `auto_download`，需要子目录时开启 `download_subdir`；要补交历史文件，可将 `download_existing` 设为 `true`，完成扫描后自动关闭。显式再次补交会重新提交目录中的所有文件，适用于此前尚未下载的任务。
 
 这里不内置第二套下载器；Aria2 负责下载队列、磁盘空间和重试。夸克 Cookie、账号权限和下载直链可用性会影响实际下载。系统中“通知测试”按钮包含上游的转存/清理测试；建议验收自己的独立测试目录。
 
@@ -117,16 +124,16 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从 V1/V2/V3 更新至 V3.1：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.2：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.1/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.2/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.1-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.2-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"
