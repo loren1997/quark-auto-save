@@ -59,3 +59,20 @@ jobs:
           build-args: |
             BUILD_SHA=${{ github.sha }}
             BUILD_TAG=${{ github.ref_name }}
+      - name: Verify container startup on both architectures
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+        run: |
+          smoke_container=
+          trap 'if [ -n "$smoke_container" ]; then docker logs "$smoke_container"; docker rm -f "$smoke_container"; fi' EXIT
+          for platform in linux/amd64 linux/arm64; do
+            smoke_container=$(docker run --detach --platform "$platform" \
+              --publish 127.0.0.1:5005:5005 \
+              --env WEBUI_PASSWORD=ci-smoke-only \
+              "$IMAGE_REPOSITORY:sha-${GITHUB_SHA:0:7}")
+            curl --fail --silent --show-error --retry 20 --retry-connrefused \
+              --retry-delay 2 --retry-max-time 45 http://127.0.0.1:5005/login > /dev/null
+            docker logs "$smoke_container"
+            docker rm -f "$smoke_container"
+            smoke_container=
+          done

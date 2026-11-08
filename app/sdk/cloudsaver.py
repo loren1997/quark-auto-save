@@ -1,6 +1,6 @@
 import re
 import requests
-from .common import iso_to_cst, normalize_share_url
+from .common import extract_share_urls, iso_to_cst, normalize_share_url
 
 
 class CloudSaver:
@@ -123,49 +123,48 @@ class CloudSaver:
         pattern_title = r"(名称|标题)[：:]?(.*)"
         pattern_content = r"(描述|简介)[：:]?(.*)(链接|标签)"
         clean_results = []
-        link_array = []
+        link_array = set()
         for channel in search_results:
             if not isinstance(channel, dict):
                 continue
-            for item in channel.get("list") or []:
+            items = channel.get("list") or []
+            for item in items if isinstance(items, list) else []:
                 if not isinstance(item, dict):
                     continue
-                cloud_links = item.get("cloudLinks") or []
-                for link in cloud_links:
+                title = str(item.get("title") or "")
+                if match := re.search(pattern_title, title, re.DOTALL):
+                    title = match.group(2)
+                title = title.replace("&amp;", "&").strip()
+                content = str(item.get("content") or "")
+                text_urls = extract_share_urls(title + "\n" + content)
+                urls = []
+                structured = item.get("cloudLinks") or []
+                structured = structured if isinstance(structured, list) else []
+                count = sum(isinstance(link, dict) and link.get("cloudType") == "quark" for link in structured)
+                context = content if not text_urls and count == 1 else ""
+                for link in structured:
                     if isinstance(link, dict) and link.get("cloudType") == "quark":
-                        # 清洗标题
-                        title = str(item.get("title") or "")
-                        if match := re.search(pattern_title, title, re.DOTALL):
-                            title = match.group(2)
-                        title = title.replace("&amp;", "&").strip()
-                        # 清洗内容
-                        content = str(item.get("content") or "")
-                        url = normalize_share_url(link.get("link"), link.get("password") or link.get("code"), content)
-                        if not url:
-                            continue
-                        if match := re.search(pattern_content, content, re.DOTALL):
-                            content = match.group(2)
-                        content = content.replace('<mark class="highlight">', "")
-                        content = content.replace("</mark>", "")
-                        content = content.strip()
-                        # 统一发布时间格式
-                        pubdate = item.get("pubDate", "")
-                        if pubdate:
-                            pubdate = iso_to_cst(pubdate)
-                        # 链接去重
-                        if url not in link_array:
-                            link_array.append(url)
-                            clean_results.append(
-                                {
-                                    "shareurl": url,
-                                    "taskname": title,
-                                    "content": content,
-                                    "datetime": pubdate,
-                                    "tags": item.get("tags", []),
-                                    "channel": item.get("channelId", ""),
-                                    "source": "CloudSaver"
-                                }
-                            )
+                        url = normalize_share_url(link.get("link"), link.get("password") or link.get("code"), context)
+                        if url and url not in urls:
+                            urls.append(url)
+                urls.extend(url for url in text_urls if url not in urls)
+                if match := re.search(pattern_content, content, re.DOTALL):
+                    content = match.group(2)
+                content = content.replace('<mark class="highlight">', "").replace("</mark>", "").strip()
+                pubdate = iso_to_cst(item["pubDate"]) if item.get("pubDate") else ""
+                for url in urls:
+                    if url in link_array:
+                        continue
+                    link_array.add(url)
+                    clean_results.append({
+                        "shareurl": url,
+                        "taskname": title,
+                        "content": content,
+                        "datetime": pubdate,
+                        "tags": item.get("tags", []),
+                        "channel": item.get("channelId") or channel.get("channelId") or "",
+                        "source": "CloudSaver",
+                    })
         return clean_results
 
 

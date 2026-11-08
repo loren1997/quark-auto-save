@@ -13,6 +13,7 @@ services:
       WEBUI_USERNAME: ${WEBUI_USERNAME:-admin}
       WEBUI_PASSWORD: ${WEBUI_PASSWORD:?请在 .env 中设置管理密码}
       PANSOU_SERVER: http://pansou:8888
+      PANSOU_FALLBACK_SERVERS: https://so.252035.xyz
     depends_on:
       - pansou
     logging:
@@ -26,6 +27,8 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
+      ENABLED_PLUGINS: labi,zhizhen,shandian,duoduo,muou
+      CHANNELS: tgsearchers7,Quark_Movies,Q_dongman,guoman4K,leoziyuan,kuakedongman
     volumes:
       - pansou-data:/app/data
       - pansou-logs:/app/logs

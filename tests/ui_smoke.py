@@ -22,15 +22,23 @@ def main():
     item = {"id": "bangumi:123", "title": "测试动漫", "search_title": "测试动漫",
             "year": "2026", "source": "Bangumi", "source_url": "https://bgm.tv/subject/123",
             "poster": "", "heat": 100, "heat_label": "Bangumi 在看人数", "schedule_note": "周播表"}
+    donghua = dict(item, id="bilibili:123", title="国漫周更测试", search_title="国漫周更测试",
+                   source="Bilibili", heat_label="Bilibili 追番人数")
+    failed_item = dict(item, id="bangumi:456", title="失败番剧", search_title="失败番剧")
     calendar = {"week_start": "2026-11-02", "week_end": "2026-11-08", "cached": True,
                 "warnings": [], "notes": ["测试周播表"], "days": [
                     {"weekday": day, "label": f"星期{day}", "date": f"2026-11-{day + 1:02}",
-                     "anime": [item] if day == 1 else [], "tv": []} for day in range(1, 8)]}
+                      "donghua": [donghua] if day == 1 else [],
+                      "anime": [item] if day == 1 else [failed_item] if day == 3 else [],
+                      "tv": []} for day in range(1, 8)]}
     web.get_calendar = lambda: calendar
+    web.get_search_aliases = lambda entry: []
     web.search_resources = lambda *args, **kwargs: {
         "success": False, "data": [], "message": "PanSou: 搜索源暂时不可用", "errors": []}
-    web.Quark.find_valid_resource = lambda *args: {
-        "success": True, "candidate": {"shareurl": "https://pan.quark.cn/s/abc123", "stoken": "NEVER_SAVE"}}
+    web.Quark.find_valid_resource = lambda self, task, config: (
+        {"success": False, "code": "no_match", "error": "未找到可验证的视频资源"}
+        if "失败番剧" in task["taskname"] else
+        {"success": True, "candidate": {"shareurl": "https://pan.quark.cn/s/abc123", "stoken": "NEVER_SAVE"}})
     web.reload_tasks = lambda: True
     web.task_plugins_config_default = {}
 
@@ -63,6 +71,9 @@ def main():
                 page.locator('button[type="submit"]').click()
                 page.get_by_role("link", name="热门追更").click()
                 page.get_by_role("button", name="周一", exact=True).click()
+                page.get_by_role("heading", name="1. 国漫周更测试").wait_for()
+                page.get_by_text("Bilibili · 1 部", exact=False).wait_for()
+                page.get_by_role("button", name="动漫", exact=True).click()
                 page.get_by_role("heading", name="1. 测试动漫").wait_for()
                 assert page.get_by_role("group", name="更新星期").get_by_role("button").count() == 7
                 page.screenshot(path=str(output / "discovery-desktop.png"), full_page=True)
@@ -77,6 +88,10 @@ def main():
                 page.locator("#logModal .close").click()
                 page.get_by_role("button", name="已订阅", exact=True).wait_for()
                 assert page.get_by_role("button", name="已订阅", exact=True).is_disabled()
+                page.get_by_role("button", name="周三", exact=True).click()
+                page.get_by_role("button", name="一键订阅并转存").click()
+                page.get_by_role("alert").filter(has_text="《失败番剧》：未找到可验证的视频资源").wait_for()
+                assert len(web.Config.read_json(web.CONFIG_PATH)["tasklist"]) == 2
                 page.get_by_role("button", name="周二", exact=True).click()
                 assert page.get_by_text("当天暂无已收录的更新", exact=False).first.is_visible()
                 page.set_viewport_size({"width": 390, "height": 844})
@@ -90,7 +105,7 @@ def main():
                 page.get_by_text("PanSou: 搜索源暂时不可用", exact=True).wait_for()
                 assert not errors, errors
                 browser.close()
-            print("UI smoke passed: login, seven days, subscribe/run, dedup, mobile, search errors; no JS errors")
+            print("UI smoke passed: login, donghua/source groups, seven days, subscribe/run, dedup, mobile, contextual search errors; no JS errors")
         finally:
             server.shutdown()
             worker.join(timeout=5)

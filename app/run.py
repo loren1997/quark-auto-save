@@ -15,7 +15,7 @@ from flask import (
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sdk.discovery import get_calendar
+from sdk.discovery import get_calendar, get_search_aliases
 from copy import deepcopy
 from datetime import timedelta
 import subprocess
@@ -312,8 +312,9 @@ def subscribe_discovery():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
         return jsonify(success=False, message="缺少资源 ID"), 400
-    entry = next((dict(item, resource_type=kind) for day in get_calendar()["days"]
-                  for kind in ("anime", "tv") for item in day[kind]
+    entry = next((dict(item, resource_type="anime" if kind == "donghua" else kind)
+                  for day in get_calendar()["days"]
+                  for kind in ("donghua", "anime", "tv") for item in day.get(kind, [])
                   if item["id"] == payload["id"]), None)
     if entry is None:
         return jsonify(success=False, message="该资源不在本周列表中，请刷新后重试"), 404
@@ -340,9 +341,13 @@ def subscribe_discovery():
     if not isinstance(cookie, str) or not cookie.strip() or cookie.startswith("Your "):
         return jsonify(success=False, message="请先在系统配置中保存有效的夸克 Cookie"), 400
     task = {"taskname": title, "resource_type": entry["resource_type"]}
+    aliases = get_search_aliases(entry)
+    if aliases:
+        task["search_aliases"] = aliases
     result = Quark(cookie).find_valid_resource(task, current)
     if not result.get("success") or not result.get("candidate"):
-        return jsonify(success=False, message=result.get("error") or "未找到可验证的匹配资源，请在任务列表手动搜索"), 422
+        return jsonify(success=False, code=result.get("code", "no_match"),
+                       message=result.get("error") or "未找到可验证的匹配资源，请在任务列表手动搜索"), 422
     safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")[:180]
     task.update({
         "shareurl": result["candidate"]["shareurl"],

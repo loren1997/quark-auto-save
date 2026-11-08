@@ -292,9 +292,22 @@
             </div>
 
             <div class="form-group row ml-3">
-              <label class="col-sm-2 col-form-label">备用搜索源</label>
+              <label class="col-sm-2 col-form-label">聚合搜索源</label>
               <div class="col-sm-10">
-                <textarea v-model="formData.source.pansou.fallback_servers" class="form-control" rows="2" placeholder="可选，每行一个 PanSou 地址，主源失败或无结果时依次尝试"></textarea>
+                <textarea v-model="formData.source.pansou.fallback_servers" class="form-control" rows="2" placeholder="可选，每行一个 PanSou 地址；与主源一起查询、合并去重，最多共 3 个服务器"></textarea>
+              </div>
+            </div>
+            <div class="form-group row ml-3">
+              <label class="col-sm-2 col-form-label">搜索频道</label>
+              <div class="col-sm-10">
+                <input v-model="formData.source.pansou.channels" class="form-control" placeholder="可选，频道 ID 用逗号分隔；留空使用服务器配置的全部频道">
+              </div>
+            </div>
+            <div class="form-group row ml-3">
+              <label class="col-sm-2 col-form-label">搜索插件</label>
+              <div class="col-sm-10">
+                <input v-model="formData.source.pansou.plugins" class="form-control" placeholder="可选，插件名用逗号分隔；留空使用服务器启用的插件">
+                <small class="text-muted">频道、网站索引和 CloudSaver 的结果会合并，并自动提取文本中的夸克分享链接。插件需先在 PanSou 服务中启用；部署环境还可通过 PANSOU_FALLBACK_SERVERS 补充聚合源。</small>
               </div>
             </div>
             <div class="form-group row ml-3">
@@ -321,14 +334,17 @@
               <button v-for="(day, i) in weekdays" :key="i" type="button" class="btn" :class="discoveryDay === i + 1 ? 'btn-primary' : 'btn-outline-primary'" :aria-pressed="discoveryDay === i + 1" @click="discoveryDay = i + 1">{{ day }}</button>
             </div>
             <div class="btn-group ml-2" role="group" aria-label="资源类型">
+              <button type="button" class="btn" :class="discoveryKind === 'donghua' ? 'btn-dark' : 'btn-outline-dark'" @click="discoveryKind = 'donghua'">国漫</button>
               <button type="button" class="btn" :class="discoveryKind === 'anime' ? 'btn-dark' : 'btn-outline-dark'" @click="discoveryKind = 'anime'">动漫</button>
               <button type="button" class="btn" :class="discoveryKind === 'tv' ? 'btn-dark' : 'btn-outline-dark'" @click="discoveryKind = 'tv'">电视剧</button>
             </div>
             <div v-for="day in calendar.days" :key="day.weekday" v-show="day.weekday === discoveryDay">
               <h3 class="h5 my-3">{{ day.label }} · {{ day.date }}</h3>
-              <p v-if="!discoveryLoading && !day[discoveryKind].length" class="text-muted">当天暂无已收录的更新；可到任务列表按名称搜索。</p>
-              <div class="row">
-                <div v-for="(item, rank) in day[discoveryKind]" :key="item.id" class="col-xl-4 col-lg-6 mb-3">
+              <p v-if="!discoveryLoading && !(day[discoveryKind] || []).length" class="text-muted">当天暂无已收录的更新；可到任务列表按名称搜索。</p>
+              <div v-for="group in discoveryGroups(day)" :key="group.source">
+                <h4 v-if="discoveryKind === 'donghua'" class="h6 text-muted">{{ group.source }} · {{ group.items.length }} 部 · 按本来源热度排序</h4>
+                <div class="row">
+                <div v-for="(item, rank) in group.items" :key="item.id" class="col-xl-4 col-lg-6 mb-3">
                   <article class="card h-100">
                     <div class="card-body d-flex">
                       <img v-if="item.poster" :src="item.poster" alt="" loading="lazy" referrerpolicy="no-referrer" style="width:72px;height:100px;object-fit:cover" class="mr-3 rounded">
@@ -344,9 +360,10 @@
                     </div>
                   </article>
                 </div>
+                </div>
               </div>
             </div>
-            <p class="small text-muted">剧集数据来自 <a href="https://www.tvmaze.com/api" target="_blank" rel="noopener noreferrer">TVmaze</a>，按 <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener noreferrer">CC BY-SA</a> 使用。动漫数据来自 <a href="https://bgm.tv" target="_blank" rel="noopener noreferrer">Bangumi</a>。</p>
+            <p class="small text-muted">剧集数据来自 <a href="https://www.tvmaze.com/api" target="_blank" rel="noopener noreferrer">TVmaze</a>，按 <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener noreferrer">CC BY-SA</a> 使用。动漫数据来自 <a href="https://bgm.tv" target="_blank" rel="noopener noreferrer">Bangumi</a>，国创周历来自 <a href="https://www.bilibili.com/guochuang/timeline/" target="_blank" rel="noopener noreferrer">Bilibili</a>。</p>
           </section>
 
           <div v-if="activeTab === 'tasklist'">
@@ -734,7 +751,7 @@
         discoveryLoading: false,
         discoveryError: '',
         discoveryDay: new Date(Date.now() + 8 * 3600000).getUTCDay() || 7,
-        discoveryKind: 'anime',
+        discoveryKind: 'donghua',
         subscribing: '',
         newTask: {
           taskname: "",
@@ -842,6 +859,15 @@
           const title = item.search_title + (item.year ? ` (${item.year})` : '');
           return this.formData.tasklist.some(task => task.resource_id === item.id || task.taskname === title);
         },
+        discoveryGroups(day) {
+          const groups = [];
+          for (const item of day[this.discoveryKind] || []) {
+            let group = groups.find(group => group.source === item.source);
+            if (!group) groups.push(group = { source: item.source, items: [] });
+            group.items.push(item);
+          }
+          return groups;
+        },
         async subscribeDiscovery(item) {
           if (this.configModified) {
             this.showToast('请先保存当前配置，再订阅资源', 'warning');
@@ -859,7 +885,7 @@
               if (index >= 0) await this.runScriptNow(index);
             }
           } catch (error) {
-            this.discoveryError = error.response?.data?.message || error.message || '订阅失败，请重试';
+            this.discoveryError = `《${item.title}》：` + (error.response?.data?.message || error.message || '订阅失败，请重试');
           } finally {
             this.subscribing = '';
           }
@@ -921,6 +947,10 @@
               if (config_data.source.pansou.enable === undefined) config_data.source.pansou.enable = true;
               if (Array.isArray(config_data.source.pansou.fallback_servers)) {
                 config_data.source.pansou.fallback_servers = config_data.source.pansou.fallback_servers.join('\n');
+              }
+              for (const key of ['channels', 'plugins']) {
+                if (Array.isArray(config_data.source.pansou[key])) config_data.source.pansou[key] = config_data.source.pansou[key].join(',');
+                else if (!config_data.source.pansou[key]) config_data.source.pansou[key] = '';
               }
               if (!config_data.source.net) {
                 config_data.source.net = {

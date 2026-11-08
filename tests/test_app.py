@@ -39,6 +39,7 @@ class AppIntegrationTests(unittest.TestCase):
         self.patch("scheduler")
         self.reload = self.patch("reload_tasks", return_value=True)
         self.get_calendar = self.patch("get_calendar", return_value=self.calendar)
+        self.get_search_aliases = self.patch("get_search_aliases", return_value=[])
         find_patcher = patch.object(web.Quark, "find_valid_resource", return_value=self.candidate)
         self.find = find_patcher.start()
         self.addCleanup(find_patcher.stop)
@@ -225,6 +226,25 @@ class AppIntegrationTests(unittest.TestCase):
         self.find.return_value = {"success": True, "candidate": None, "error": ""}
         self.assertEqual(self.subscribe().status_code, 422)
         self.assertEqual(self.saved_config()["tasklist"], [])
+
+    def test_donghua_subscription_keeps_source_aliases_for_repair(self):
+        entry = dict(self.entry, id="bilibili:123", title="国漫测试", search_title="国漫测试", year="")
+        self.calendar["days"][0]["donghua"] = [entry]
+        self.get_search_aliases.return_value = ["国漫测试官方别名"]
+        response = self.subscribe("bilibili:123")
+        self.assertTrue(response.json["success"])
+        task = self.saved_config()["tasklist"][0]
+        self.assertEqual(task["resource_type"], "anime")
+        self.assertEqual(task["search_aliases"], ["国漫测试官方别名"])
+        self.assertEqual(self.find.call_args.args[0]["search_aliases"], task["search_aliases"])
+
+    def test_subscription_failure_returns_reason_without_saving(self):
+        self.find.return_value = {"success": False, "candidate": None,
+                                  "error": "搜索源暂不可用", "code": "unavailable"}
+        response = self.subscribe()
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json["code"], "unavailable")
+        self.assertEqual(self.saved_config(), self.config)
 
     def test_new_subscription_inherits_disabled_global_auto_repair(self):
         self.config["auto_repair"] = False

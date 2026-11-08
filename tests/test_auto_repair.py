@@ -77,6 +77,121 @@ class AutoRepairTests(unittest.TestCase):
         self.assertFalse(qas.resource_titles_match("庆余年", "庆余年幕后 (2019) 4K 高码 全46集"))
         self.assertFalse(qas.resource_titles_match("庆余年 第二季", "庆余年 第一季 (2019) 4K 高码 全46集"))
 
+    def test_catalogue_aliases_validate_bilingual_releases_without_accepting_unknown_suffixes(self):
+        title = "学生会也有洞！ (2026)"
+        aliases = ["生徒会にも穴はある!", "脑洞学生会"]
+        for name in ("学生会也有洞! 生徒会にも穴はある! (2026)",
+                     "#动漫🗄 学生会也有洞！ 生徒会にも穴はある! (2026) [1080P] [内封简繁] [更至5集]",
+                     "学生会也有洞! (2026) 更至第5集 1080P · SDR · 350MB/集 内嵌繁中",
+                     "脑洞学生会 (2026)"):
+            with self.subTest(name=name):
+                self.assertTrue(qas.resource_titles_match(title, name, aliases=aliases))
+        for name in ("学生会也有洞幕后 (2026)", "学生会也有洞 漫画 (2026)",
+                     "学生会也有洞 另一部作品 (2026)", "脑洞学生会 (2025)",
+                     "脑洞学生会 第二季 (2026)"):
+            with self.subTest(name=name):
+                self.assertFalse(qas.resource_titles_match(title, name, aliases=aliases))
+
+    def test_search_retries_without_year_and_punctuation_then_verifies_bilingual_video(self):
+        self.task.update(taskname="学生会也有洞！ (2026)", resource_type="anime",
+                         search_aliases=["生徒会にも穴はある!", "脑洞学生会"])
+        title = "学生会也有洞！ 生徒会にも穴はある! (2026)"
+        folder = {"code": 0, "data": {"share": {"title": title}, "list": [
+            {"fid": "folder", "dir": True, "file_name": title},
+        ]}}
+        videos = {"code": 0, "data": {"list": [
+            {"fid": "video", "dir": False, "file_name": "Even.the.Student.Council.Has.Its.Holes.S01E05.mkv"},
+        ]}}
+        with patch("resource_search.search_resources", side_effect=[
+            {"success": True, "data": []},
+            {"success": True, "data": [self.candidate(title=title)]},
+        ]) as search, patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[folder, videos]):
+            result = self.account.find_valid_resource(self.task, {})
+        self.assertTrue(result["success"])
+        self.assertEqual([call.args[0] for call in search.call_args_list], [self.task["taskname"], "学生会也有洞"])
+
+    def test_alias_query_preserves_original_year_and_season_requirements(self):
+        self.task["search_aliases"] = ["Test Show"]
+        wrong = self.candidate(title="Test Show 第二季 (2023)")
+        right = self.candidate(title="Test Show 第二季 (2024)")
+        with patch("resource_search.search_resources", side_effect=[
+            {"success": True, "data": []}, {"success": True, "data": []},
+            {"success": True, "data": [wrong, right]},
+        ]) as search, patch.object(self.account, "get_stoken", return_value=TOKEN) as token, patch.object(self.account, "get_detail", return_value=FILES):
+            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+        self.assertEqual(search.call_args.args[0], "Test Show")
+        token.assert_called_once()
+
+    def test_first_season_english_alias_does_not_turn_valid_video_into_conflict(self):
+        english = "Even the Student Council Has Its Holes"
+        self.task.update(taskname="学生会也有洞！ (2026)", resource_type="anime",
+                         search_aliases=["生徒会にも穴はある!", english])
+        for season, accepted in ((1, True), (2, False)):
+            detail = {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [
+                {"fid": "video", "dir": False, "file_name": f"{english}.S0{season}E05.mkv"},
+            ]}}
+            with self.subTest(season=season), self.search([self.candidate()]), \
+                    patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                    patch.object(self.account, "get_detail", return_value=detail):
+                self.assertEqual(self.account.find_valid_resource(self.task, {})["success"], accepted)
+        self.assertTrue(qas.resource_titles_match(self.task["taskname"], "学生会也有洞 S01 (2026)"))
+        self.assertFalse(qas.resource_titles_match(self.task["taskname"], "学生会也有洞 S02 (2026)"))
+        self.assertFalse(qas.resource_titles_match(self.task["taskname"], "学生会也有洞 S01 (2025)"))
+
+    def test_failed_query_still_tries_name_without_year(self):
+        with patch("resource_search.search_resources", side_effect=[
+            {"success": False, "data": [], "message": "query rejected"},
+            {"success": True, "data": [self.candidate()]},
+        ]) as search, patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", return_value=FILES):
+            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertEqual(search.call_count, 2)
+
+    def test_failed_directory_does_not_hide_another_directory_in_same_share(self):
+        first, second = self.candidate(), self.candidate()
+        first["shareurl"] += "#/list/share/" + "a" * 32
+        second["shareurl"] += "#/list/share/" + "b" * 32
+        wrong = copy.deepcopy(FILES)
+        wrong["data"]["share"]["title"] = "测试剧 第二季 (2023)"
+        with self.search([first, second]), patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", side_effect=[wrong, FILES]) as detail:
+            result = self.account.find_valid_resource(self.task, {})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["candidate"]["shareurl"], second["shareurl"])
+        self.assertEqual(detail.call_count, 2)
+
+    def test_nested_single_folder_video_wrapper_is_verified(self):
+        self.task["resource_type"] = "anime"
+        folders = [{"code": 0, "data": {"list": [
+            {"fid": f"folder{index}", "dir": True, "file_name": self.task["taskname"]},
+        ]}} for index in range(2)]
+        with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=folders + [FILES]) as detail:
+            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+        self.assertEqual(detail.call_count, 3)
+
+    def test_recursive_wrappers_remain_bounded_and_cannot_hide_wrong_season(self):
+        self.task.update(resource_type="anime", search_aliases=["Test Show"])
+        folder = {"code": 0, "data": {"list": [
+            {"fid": "folder", "dir": True, "file_name": self.task["taskname"]},
+        ]}}
+        with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=folder) as detail:
+            self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+        self.assertEqual(detail.call_count, 4)
+        wrong_folder = copy.deepcopy(folder)
+        wrong_folder["data"]["list"][0]["file_name"] = "Test Show 第三季 (2024)"
+        with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[folder, wrong_folder, FILES]):
+            self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+
+    def test_search_failures_are_distinct_from_no_results_and_unverified_matches(self):
+        for payload, code in (({"success": False, "data": []}, "unavailable"),
+                              ({"success": True, "data": []}, "no_results"),
+                              ({"success": True, "data": [self.candidate(title="另一部剧")]}, "no_match")):
+            with self.subTest(code=code), patch("resource_search.search_resources", return_value=payload):
+                result = self.account.find_valid_resource(self.task, {})
+            self.assertFalse(result["success"])
+            self.assertEqual(result["code"], code)
+            self.assertNotIn("保留原订阅", result["error"])
+
     def test_search_skips_old_wrong_season_and_non_quark_candidates(self):
         evil = self.candidate("evil")
         evil["shareurl"] = "https://pan.quark.cn.evil.example/s/evil"

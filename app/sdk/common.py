@@ -34,6 +34,23 @@ def normalize_share_url(value, password="", context=""):
         return ""
 
 
+def extract_share_urls(text):
+    """从公开搜索结果正文提取链接；提取码只关联其后、下一链接前的短文本。"""
+    if not isinstance(text, str):
+        return []
+    text = html.unescape(text[:100000])
+    pattern = r"https?://pan\.quark\.cn/s/[A-Za-z0-9]+(?:/[A-Za-z0-9/_-]*)?(?:\?[A-Za-z0-9%_=&.-]+)?(?:#[A-Za-z0-9/_?=&%-]+)?"
+    matches = list(re.finditer(pattern, text))[:50]
+    urls = []
+    for match in matches:
+        following = text[match.end():match.end() + 120]
+        following = re.split(r"https?://", following, maxsplit=1)[0]
+        url = normalize_share_url(match.group(), context=following)
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
 def iso_to_cst(iso_time_str: str) -> str:
     """将 ISO 格式的时间字符串转换为 CST(China Standard Time) 时间并格式化为 %Y-%m-%d %H:%M:%S 格式
 

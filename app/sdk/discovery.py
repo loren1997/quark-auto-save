@@ -2,12 +2,13 @@
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from threading import Lock
 from time import monotonic
 import logging
 import re
+import unicodedata
 
 import requests
 
@@ -15,6 +16,8 @@ import requests
 CHINA_TZ = timezone(timedelta(hours=8))
 USER_AGENT = "quark-auto-save/1.0 (+https://github.com/Cp0204/quark-auto-save)"
 TV_LIMIT = 10
+DONGHUA_LIMIT = 60
+BILIBILI_CALENDAR = "https://api.bilibili.com/pgc/web/timeline/v2?season_type=4&day_before=6&day_after=6"
 _cache = None
 _expires = 0
 _lock = Lock()
@@ -25,6 +28,10 @@ def _get_json(url):
     with requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=(2, 4)) as response:
         response.raise_for_status()
         data = response.json()
+    if url == BILIBILI_CALENDAR:
+        if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(data.get("result"), dict):
+            raise ValueError("哔哩哔哩国创周历暂不可用")
+        data = data["result"].get("timeline")
     if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
         raise ValueError("数据格式不是条目列表")
     return data
@@ -55,7 +62,34 @@ def _poster(images):
     return url if isinstance(url, str) and url.startswith(("https://", "http://")) else ""
 
 
-def _anime_items(groups, days):
+def get_search_aliases(entry):
+    """Fetch Bangumi's aliases only when a user subscribes, not for every card."""
+    known = entry.get("search_aliases")
+    aliases = [entry.get("search_title"), entry.get("title"), *(known if isinstance(known, list) else [])]
+    key = str(entry.get("id", ""))
+    if re.fullmatch(r"bangumi:\d+", key):
+        try:
+            with requests.get(f"https://api.bgm.tv/v0/subjects/{key.split(':')[1]}",
+                              headers={"User-Agent": USER_AGENT}, timeout=(2, 4)) as response:
+                response.raise_for_status()
+                data = response.json()
+            if isinstance(data, dict):
+                aliases.extend((data.get("name_cn"), data.get("name")))
+                for field in data.get("infobox", []) if isinstance(data.get("infobox"), list) else []:
+                    if not isinstance(field, dict) or field.get("key") not in ("别名", "中文名"):
+                        continue
+                    value = field.get("value")
+                    if isinstance(value, list):
+                        aliases.extend(item.get("v") for item in value if isinstance(item, dict))
+                    else:
+                        aliases.append(value)
+        except (requests.RequestException, ValueError) as exc:
+            logging.warning("Bangumi aliases unavailable for %s: %s", key, exc)
+    return list(dict.fromkeys(value.strip() for value in aliases
+                              if isinstance(value, str) and value.strip() and len(value) <= 200))[:8]
+
+
+def _anime_items(groups, days, today):
     for group in groups:
         if not isinstance(group, dict) or not isinstance(group.get("weekday"), dict):
             continue
@@ -70,6 +104,12 @@ def _anime_items(groups, days):
             title = item.get("name_cn") or item.get("name")
             if not isinstance(subject_id, int) or not isinstance(title, str) or not title.strip():
                 continue
+            air_date = str(item.get("air_date") or "")
+            try:
+                if date.fromisoformat(air_date) > today:
+                    continue
+            except ValueError:
+                pass
             key = f"bangumi:{subject_id}"
             if key in seen:
                 continue
@@ -77,6 +117,7 @@ def _anime_items(groups, days):
             collection, rating = item.get("collection") or {}, item.get("rating") or {}
             days[weekday - 1]["anime"].append({
                 "id": key, "title": title, "search_title": title,
+                "search_aliases": [name for name in (item.get("name_cn"), item.get("name")) if isinstance(name, str) and name],
                 "source": "Bangumi", "source_url": f"https://bgm.tv/subject/{subject_id}",
                 "poster": _poster(item.get("images")),
                 "heat": _number(collection.get("doing")) if isinstance(collection, dict) else 0,
@@ -87,16 +128,54 @@ def _anime_items(groups, days):
             })
 
 
-def _tv_items(results, days, warnings, fallback_anime=False):
+def _bilibili_items(groups, days):
+    days_by_date = {day["date"]: day for day in days}
+    for group in groups:
+        timestamp = group.get("date_ts")
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            continue
+        try:
+            day = days_by_date.get(datetime.fromtimestamp(timestamp, CHINA_TZ).date().isoformat())
+        except (OverflowError, OSError, ValueError):
+            continue
+        if day is None or not isinstance(group.get("episodes"), list):
+            continue
+        for entry in group["episodes"]:
+            if not isinstance(entry, dict):
+                continue
+            title, season = entry.get("title"), entry.get("season_id")
+            if not isinstance(title, str) or not title.strip() or not isinstance(season, int) or isinstance(season, bool):
+                continue
+            follows = str(entry.get("follows") or "")
+            match = re.fullmatch(r"([\d.]+)(万|亿)?(?:系列)?追番", follows)
+            try:
+                heat = float(match[1]) * {None: 1, "万": 10000, "亿": 100000000}[match[2]] if match else 0
+            except ValueError:
+                heat = 0
+            delay = entry.get("delay_reason") if entry.get("delay") else ""
+            status = f"延期：{delay or '以官方通知为准'}" if entry.get("delay") else (
+                "已发布" if entry.get("published") == 1 else "已排期，尚未发布")
+            day["donghua"].append({
+                "id": f"bilibili:{season}", "title": title.strip(), "search_title": title.strip(),
+                "source": "Bilibili", "source_url": f"https://www.bilibili.com/bangumi/play/ss{season}",
+                "poster": _poster({"medium": entry.get("cover")}), "heat": _number(heat),
+                "heat_label": "哔哩哔哩系列追番人数" if "系列" in follows else "哔哩哔哩追番人数",
+                "rating": 0, "year": "", "airdate": day["date"],
+                "schedule_note": f"{entry.get('pub_time') or ''} {entry.get('pub_index') or ''}；{status}；哔哩哔哩国创官方排期",
+            })
+
+
+def _tv_items(results, days, warnings):
     shows, episodes = {}, {}
     day_dates = {day["date"] for day in days}
     for key, entries in results.items():
-        if key == "anime":
+        if key in ("anime", "bilibili"):
             continue
         for entry in entries:
             if not isinstance(entry, dict) or not isinstance(entry.get("airdate"), str) or entry["airdate"] not in day_dates:
                 continue
-            show = entry.get("show")
+            embedded = entry.get("_embedded")
+            show = entry.get("show") or (embedded.get("show") if isinstance(embedded, dict) else None)
             if not isinstance(show, dict) or show.get("type") not in ("Scripted", "Animation"):
                 continue
             show_id, title = show.get("id"), show.get("name")
@@ -110,9 +189,12 @@ def _tv_items(results, days, warnings, fallback_anime=False):
     # shortcut: show the week's top 10 dramas; add pagination if a full catalogue is needed.
     popular = sorted((key for key in shows if shows[key]["type"] == "Scripted"),
                      key=lambda key: (-_number(shows[key].get("weight")), key))[:TV_LIMIT]
-    if fallback_anime:
-        popular += sorted((key for key in shows if shows[key]["type"] == "Animation"),
-                          key=lambda key: (-_number(shows[key].get("weight")), key))[:TV_LIMIT]
+    animations = sorted((key for key in shows if shows[key]["type"] == "Animation"
+                         and shows[key].get("language") in (None, "Chinese", "Mandarin", "Cantonese")),
+                        key=lambda key: (-_number(shows[key].get("weight")), key))
+    popular += animations[:DONGHUA_LIMIT]
+    if len(animations) > DONGHUA_LIMIT:
+        warnings.append(f"国漫 TVmaze 来源本周超过 {DONGHUA_LIMIT} 部，已展示热度最高的 {DONGHUA_LIMIT} 部")
     aliases, failures = _fetch_many({
         key: f"https://api.tvmaze.com/shows/{key}/akas" for key in popular if key not in _aliases
     })
@@ -122,10 +204,10 @@ def _tv_items(results, days, warnings, fallback_anime=False):
                    and re.search(r"[\u4e00-\u9fff]", item["name"])
                    and (not item.get("country") or
                         isinstance(item["country"], dict) and item["country"].get("code") == "CN")]
-        _aliases[key] = chinese[0] if chinese else shows[key]["name"]
+        _aliases[key] = list(dict.fromkeys(chinese)) if chinese else [shows[key]["name"]]
     if failures:
         warnings.append(f"{len(failures)} 部作品的中文别名暂不可用，已保留原名")
-    untranslated = sum(not re.search(r"[\u4e00-\u9fff]", _aliases.get(key, shows[key]["name"])) for key in popular)
+    untranslated = sum(not re.search(r"[\u4e00-\u9fff]", _aliases.get(key, [shows[key]["name"]])[0]) for key in popular)
     if untranslated:
         warnings.append(f"{untranslated} 部作品尚无可用中文名，显示原名；搜索资源时可修改关键词")
     for day in days:
@@ -134,30 +216,34 @@ def _tv_items(results, days, warnings, fallback_anime=False):
             if not aired:
                 continue
             show = shows[key]
-            title = _aliases.get(key, show["name"])
+            title = _aliases.get(key, [show["name"]])[0]
             rating = show.get("rating") or {}
-            category = "anime" if show["type"] == "Animation" else "tv"
+            category = "donghua" if show["type"] == "Animation" else "tv"
             for season in sorted({value[0] for value in aired}, key=lambda value: value or 0):
                 numbers = sorted({number for current, number in aired if current == season}, key=lambda value: value or 0)
-                search_title = f"{title} 第{season}季" if season and season > 1 else title
+                # Only year-numbered seasons are unsuitable for Chinese season matching.
+                numbered_season = season and season > 1 and (category == "tv" or season < 1900)
+                suffix = f" 第{season}季" if numbered_season else ""
+                search_title = title + suffix
                 season_label = f"第{season}季" if season is not None else "季数未标注"
                 episode_label = "、".join(str(number) for number in numbers if number is not None)
                 day[category].append({
                     "id": f"tvmaze:{key}:s{season if season is not None else 'unknown'}",
                     "title": search_title, "search_title": search_title,
+                    "search_aliases": [name + suffix for name in _aliases.get(key, [])] if category == "donghua" else [],
                     "source": "TVmaze", "source_url": f"https://www.tvmaze.com/shows/{key}",
                     "poster": _poster(show.get("image")), "heat": _number(show.get("weight")),
                     "heat_label": "TVmaze 热度（0–100）",
                     "rating": _number(rating.get("average")) if isinstance(rating, dict) else 0,
-                    "year": str(show.get("premiered") or "")[:4] if season == 1 else "",
+                    "year": str(show.get("premiered") or "")[:4] if category == "tv" and season == 1 else "",
                     "airdate": day["date"],
                     "episodes": [{"season": season, "number": number} for number in numbers],
-                    "schedule_note": f"{season_label} 第{episode_label or '?'}集；TVmaze 中国播出排期，不代表网盘资源已更新",
+                    "schedule_note": f"TVmaze {season_label} 第{episode_label or '?'}集；中国播出排期，不代表网盘资源已更新",
                 })
 
 
 def get_calendar(config=None):
-    """Return this Shanghai week's TV episodes and Bangumi's current weekly timetable."""
+    """Return current-week Chinese releases and Bangumi's weekly timetable."""
     global _cache, _expires
     now = datetime.now(CHINA_TZ)
     monday = now.date() - timedelta(days=now.weekday())
@@ -168,41 +254,54 @@ def get_calendar(config=None):
             cached["cached"] = True
             return cached
         days = [{"weekday": index + 1, "label": f"星期{label}",
-                 "date": (monday + timedelta(days=index)).isoformat(), "anime": [], "tv": []}
+                 "date": (monday + timedelta(days=index)).isoformat(), "anime": [], "donghua": [], "tv": []}
                 for index, label in enumerate("一二三四五六日")]
         urls = {day["date"]: f"https://api.tvmaze.com/schedule?country=CN&date={day['date']}" for day in days}
+        urls.update({f"web:{day['date']}": f"https://api.tvmaze.com/schedule/web?country=CN&date={day['date']}" for day in days})
         urls["anime"] = "https://api.bgm.tv/calendar"
+        urls["bilibili"] = BILIBILI_CALENDAR
         results, errors = _fetch_many(urls)
-        warnings = [f"{'Bangumi 周播表' if key == 'anime' else 'TVmaze ' + key} 获取失败：{error}"
+        source_names = {"anime": "Bangumi 周播表", "bilibili": "哔哩哔哩国创周历"}
+        warnings = [f"{source_names.get(key, 'TVmaze ' + key)} 获取失败：{error}"
                     for key, error in sorted(errors.items())]
         old = _cache if _cache and _cache["week_start"] == week_start else None
-        cached_bangumi = old and any(item["source"] == "Bangumi" for day in old["days"] for item in day["anime"])
-        fallback_anime = "anime" in errors and not cached_bangumi
-        _anime_items(results.get("anime", []), days)
-        _tv_items(results, days, warnings, fallback_anime)
-        if fallback_anime:
-            warnings.append("Bangumi 暂不可用，动漫已降级为 TVmaze 中国播出动画前 10；按 TVmaze 热度排序，覆盖范围不含完整日番周播表")
+        _anime_items(results.get("anime", []), days, now.date())
+        _bilibili_items(results.get("bilibili", []), days)
+        _tv_items(results, days, warnings)
         if old:
             stale_used = False
             for day, previous in zip(days, old["days"]):
-                for category, key in (("anime", "anime"), ("tv", day["date"])):
-                    if key in errors and previous[category] and not day[category]:
-                        day[category] = deepcopy(previous[category])
-                        stale_used = True
-                        for item in day[category]:
+                failed_sources = {source for source, failed in (
+                    ("Bangumi", "anime" in errors), ("Bilibili", "bilibili" in errors),
+                    ("TVmaze", day["date"] in errors or f"web:{day['date']}" in errors)) if failed}
+                for category in ("anime", "donghua", "tv"):
+                    seen = {item["id"] for item in day[category]}
+                    for item in previous.get(category, []):
+                        if item["source"] in failed_sources and item["id"] not in seen:
+                            item = deepcopy(item)
                             item["stale"] = True
+                            day[category].append(item)
+                            seen.add(item["id"])
+                            stale_used = True
             if stale_used:
                 warnings.append("失败的来源保留本周上次成功数据，已标注缓存；排期可能已变更")
         for day in days:
+            # Prefer the official Bilibili entry when both sources name the same series.
+            unique = {}
+            for item in sorted(day["donghua"], key=lambda entry: (bool(entry.get("stale")), entry["source"] != "Bilibili")):
+                name = "".join(char.casefold() for char in unicodedata.normalize("NFKC", item["title"])
+                               if char.isalnum())
+                unique.setdefault(name, item)
+            day["donghua"] = sorted(unique.values(), key=lambda item: (item["source"] != "TVmaze", -item["heat"], item["title"]))
             for category in ("anime", "tv"):
                 day[category].sort(key=lambda item: (-item["heat"], item["title"]))
         _cache = {
             "week_start": week_start, "week_end": days[-1]["date"], "timezone": "Asia/Shanghai",
             "updated_at": now.isoformat(), "cached": False, "days": days, "warnings": warnings,
-            "notes": ["动漫：TVmaze 中国播出动画，本周热度前 10；按 TVmaze 热度排序。" if fallback_anime else
-                      "动漫：Bangumi 当季周播表，不保证本周每一部都更新；按在看人数排序。",
+            "notes": ["动漫：Bangumi 当季周播表，已排除首播日期在未来的作品；不保证本周每一部都更新。",
+                      "国漫：哔哩哔哩官方国创日历与 TVmaze 中国网络/电视播出排期，按本周真实日期归日；覆盖范围以来源收录为准。",
                       f"电视剧：TVmaze 中国播出数据，本周热度前 {TV_LIMIT} 部，按实际集日期归日、按 TVmaze 热度排序。",
-                      "热度口径按条目标注，各分类独立排序。TVmaze 数据按 CC BY-SA 4.0 使用。"],
+                      "热度口径按条目标注，按来源分组、组内热度降序；不同来源数值不直接比较。TVmaze 数据按 CC BY-SA 4.0 使用。"],
         }
         _expires = monotonic() + (300 if errors else 3600)
         return deepcopy(_cache)
