@@ -39,6 +39,11 @@
     "websearch": {
       "enable": true
     },
+    "channelsearch": {
+      "enable": true,
+      "telegram_channels": ["Q_dongman", "guoman4K", "kuakedongman"],
+      "qq_channels": ["pd26778899"]
+    },
     "pansou": {
       "enable": true,
       "server": "https://so.252035.xyz",

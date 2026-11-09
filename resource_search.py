@@ -29,6 +29,8 @@ def search_error_reason(message):
         (r"proxy|代理", "代理连接失败"),
         (r"\bssl|\btls|certificate|证书", "TLS 或证书连接失败"),
         (r"验证码|人工验证|captcha|challenge", "需要人工验证"),
+        (r"频道配置|频道列表", "频道配置无效"),
+        (r"未返回公开消息|未返回公开帖子", "频道未返回可匿名读取的公开内容"),
         (r"timeout|超时", "请求超时"),
         (r"MiB|大小|读取(?:上限|限制)", "网页超过读取限制"),
         (r"时间预算|时间上限", "达到本次查询时间预算"),
@@ -45,8 +47,8 @@ def search_error_reason(message):
 def _web_errors(messages):
     errors = []
     for message in messages:
-        match = re.match(r"^(Bing|DuckDuckGo|Google|Sogou|Meijusou)(\s+落地页)?:\s*(.*)$", str(message), re.S)
-        source = "网页搜索" + (f" {match[1]}{match[2] or ''}" if match else "")
+        match = re.match(r"^(Bing|DuckDuckGo|Google|Sogou|Meijusou|Telegram @[A-Za-z][A-Za-z0-9_]{3,31}|腾讯频道 pd\d{5,20})(\s+落地页)?:\s*(.*)$", str(message), re.S)
+        source = ("频道索引" if match and match[1].startswith(("Telegram @", "腾讯频道 ")) else "网页搜索") + (f" {match[1]}{match[2] or ''}" if match else "")
         error = {"source": source, "message": search_error_reason(match[3] if match else message)}
         if error not in errors:
             errors.append(error)
@@ -81,15 +83,17 @@ def _selection(value, label):
 
 def search_web_resources(query, config, refresh=False, failed_engines=None):
     """自动订阅在网盘索引未找到可验证资源时，单独查询公开网页。"""
-    source = (config.get("source") or {}).get("websearch") or {}
-    if not _enabled(source):
+    sources = config.get("source") or {}
+    source = sources.get("websearch") or {}
+    channels = sources.get("channelsearch") or {}
+    if not _enabled(source) and not _enabled(channels):
         return {"success": True, "data": [], "errors": [], "message": ""}
     if not isinstance(query, str) or not query.strip() or len(query) > 200:
         return {"success": False, "data": [], "errors": [], "message": "搜索词必须是 200 字以内的文本"}
     client = WebSearch()
     try:
         options = {"failed_engines": failed_engines} if failed_engines is not None else {}
-        entries = client.search(query.strip(), refresh=refresh, **options)
+        entries = client.search(query.strip(), refresh=refresh, channel_config=channels, include_engines=_enabled(source), **options)
         errors = _web_errors(client.errors)
         return {"success": True, "data": entries, "errors": errors,
                 "message": "；".join(f"{error['source']}：{error['message']}" for error in errors)}
@@ -155,7 +159,7 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
             jobs.append(("CloudSaver", _server_url(cs["server"]), ""))
         except (SearchError, ValueError) as error:
             errors.append({"source": "CloudSaver", "message": str(error)})
-    if include_web and _enabled(sources.get("websearch") or {}):
+    if include_web and (_enabled(sources.get("websearch") or {}) or _enabled(sources.get("channelsearch") or {})):
         jobs.append(("网页搜索", "", ""))
 
     def search_source(job):

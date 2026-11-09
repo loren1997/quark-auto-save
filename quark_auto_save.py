@@ -402,6 +402,16 @@ class Config:
     def resource_history_path(config_path):
         return os.path.splitext(os.path.abspath(config_path))[0] + ".resources.json"
 
+    def existing_subscription(tasks, resource_id, title):
+        return next((task for task in tasks if task.get("resource_id") == resource_id
+                     or (resource_titles_match(title, task.get("taskname", ""))
+                         and resource_titles_match(task.get("taskname", ""), title))), None)
+
+    def pending_summary(record):
+        task = record["task"]
+        return {"resource_id": task["resource_id"], "taskname": task["taskname"],
+                **{key: record.get(key, "") for key in ("created_at", "last_attempt_at", "last_error")}}
+
     def resource_history(path):
         if not path or not os.path.exists(path):
             return []
@@ -1427,7 +1437,7 @@ class Quark:
         interrupted = False
 
         def record_error(source, message):
-            source = source if isinstance(source, str) and re.fullmatch(r"[\w -]{1,40}", source) else "搜索源"
+            source = source if isinstance(source, str) and re.fullmatch(r"[\w @-]{1,40}", source) else "搜索源"
             error = {"source": source, "message": search_error_reason(message)}
             if error not in source_errors:
                 source_errors.append(error)
@@ -1627,8 +1637,6 @@ class Quark:
                             break
                         selected_fid = folder["fid"]
                     else:
-                        if len(seasons) != 1:
-                            break
                         parent_named = any(resource_titles_match(base_title, value, allow_missing_year=True, aliases=aliases)
                                            or resource_titles_match(title, value, allow_missing_year=True, aliases=aliases)
                                            for value in directory_evidence)
@@ -1638,7 +1646,7 @@ class Quark:
                                 continue
                             child_name, child_seasons, child_years = _resource_candidate_parts(title, item["file_name"])
                             if resource_titles_match(title, item["file_name"], allow_missing_year=True, aliases=aliases) or (
-                                parent_named and not child_name and child_seasons == seasons
+                                len(seasons) == 1 and parent_named and not child_name and child_seasons == seasons
                                 and (not years or not child_years or child_years == years)
                             ):
                                 matching.append(item)
@@ -1697,6 +1705,8 @@ class Quark:
                 ))
                 # The actual named video and its enclosing directory can supply title and year separately.
                 path_years = set().union(*(_resource_title_parts(value)[2] for value in directory_evidence))
+                if selected_fid and years and path_years and path_years != years:
+                    continue
                 matched_videos = [
                     resource_titles_match(title, _resource_video_title(item["file_name"]), allow_missing_year=True, aliases=aliases)
                     for item in video_files
@@ -1706,7 +1716,13 @@ class Quark:
                 consistent_videos = all(matched or numbered_episodes[index] or re.fullmatch(
                     r"\d{1,3}", _resource_video_title(video_files[index]["file_name"])
                 ) for index, matched in enumerate(matched_videos))
-                combined = combined or bool(years and path_years == years and any(matched_videos) and consistent_videos)
+                # 季度合集的年份与唯一选中作品目录共同约束数字集名，不能借用同级视频。
+                named_directory = selected_fid and any(
+                    resource_titles_match(title, value, allow_missing_year=True, aliases=aliases)
+                    for value in directory_evidence
+                )
+                combined = combined or bool(years and path_years == years and consistent_videos
+                                            and (any(matched_videos) or named_directory))
                 supplement_without_year = False
                 if (not exact and not combined and required_episodes and len(years) == 1
                         and seasons in (set(), {1}) and task.get("resource_id")
@@ -1726,9 +1742,8 @@ class Quark:
                     supplement_without_year = repair_context["primary_verified"]
                 if not exact and not combined and not supplement_without_year:
                     continue
-                history_url = (urllib.parse.urlunsplit(parsed._replace(fragment=f"/list/share/{selected_fid}"))
-                               if selected_fid else shareurl)
-                Config.remember_resources(self.resource_history_path, [{"taskname": title, "shareurl": history_url,
+                # 历史保留验证入口，复查时才能重新取得祖先年份与作品目录；任务仍限定所选子目录。
+                Config.remember_resources(self.resource_history_path, [{"taskname": title, "shareurl": shareurl,
                                                                        "search_aliases": aliases}])
                 episode_fids = None
                 if required_episodes is not None:
@@ -2240,6 +2255,68 @@ def do_sign(account):
     print()
 
 
+def retry_pending_subscriptions(account, config_path):
+    """Only verified pending intents become transfer tasks; cancellation wins over search results."""
+    promoted = []
+    records = Config.read_json(config_path).get("pending_subscriptions", [])
+    if len(records) > 3:
+        print(f"待查找订阅共 {len(records)} 部，本轮先重试最久未查找的 3 部，其余保留到下次定时运行")
+    for snapshot in sorted(records, key=lambda item: item.get("last_attempt_at", ""))[:3]:
+        with Config.locked(config_path):
+            current = Config.read_json(config_path)
+            records = current.get("pending_subscriptions", [])
+            pending = next((item for item in records if item["id"] == snapshot["id"]), None)
+            if pending is None:
+                continue
+            task = deepcopy(pending["task"])
+            if Config.existing_subscription(current.get("tasklist", []), task["resource_id"], task["taskname"]):
+                current["pending_subscriptions"] = [item for item in records if item["id"] != pending["id"]]
+                Config.write_json(config_path, current)
+                continue
+            pending["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
+            aria2 = current.get("plugins", {}).get("aria2", {})
+            if task.get("addition", {}).get("aria2", {}).get("auto_download") and (
+                    "-aria2" in os.getenv("PLUGIN_FLAGS", "").split(",")
+                    or not isinstance(aria2, dict) or not all(aria2.get(key) for key in ("host_port", "secret", "dir"))):
+                pending["last_error"] = "Aria2 配置不完整，待查找订阅已保留，请修复下载配置"
+                Config.write_json(config_path, current)
+                print(f"《{task['taskname']}》{pending['last_error']}")
+                continue
+            Config.write_json(config_path, current)
+        report_progress("search", task=task["taskname"], source="自动重试待查找订阅")
+        print(f"🔎《{task['taskname']}》继续自动查找可验证的资源")
+        try:
+            result = account.find_valid_resource(task, current)
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            result = {"success": False, "error": f"本轮搜索异常（{type(exc).__name__}）"}
+        with Config.locked(config_path):
+            latest = Config.read_json(config_path)
+            records = latest.get("pending_subscriptions", [])
+            pending = next((item for item in records if item["id"] == snapshot["id"]), None)
+            if pending is None:
+                print(f"《{task['taskname']}》待查找订阅已取消，本次结果已丢弃")
+                continue
+            candidate = result.get("candidate") or {}
+            if not result.get("success") or not candidate.get("shareurl"):
+                pending["last_error"] = "尚未找到经视频文件验证的匹配资源，将在下次定时运行继续查找"
+                Config.write_json(config_path, latest)
+                print(f"《{task['taskname']}》自动订阅未完成：{result.get('error') or pending['last_error']}")
+                print("待查找订阅已保留，下次定时运行继续自动搜索")
+                continue
+            if not Config.existing_subscription(latest.get("tasklist", []), task["resource_id"], task["taskname"]):
+                task = deepcopy(pending["task"])
+                task["shareurl"] = candidate["shareurl"]
+                if candidate.get("search_aliases"):
+                    task["search_aliases"] = candidate["search_aliases"]
+                latest.setdefault("tasklist", []).append(task)
+                promoted.append(task)
+            latest["pending_subscriptions"] = [item for item in records if item["id"] != snapshot["id"]]
+            Config.write_json(config_path, latest)
+            Config.remember_resources(Config.resource_history_path(config_path), [task])
+            print(f"《{task['taskname']}》已验证资源并保存订阅，将继续转存")
+    return promoted
+
+
 def do_save(account, tasklist=[]):
     print(f"🧩 载入插件")
     plugins, CONFIG_DATA["plugins"], task_plugins_config = Config.load_plugins(
@@ -2432,7 +2509,17 @@ def main():
             for original, updated in zip(originals, tasklist_from_env):
                 Config.merge_task_state(CONFIG_DATA, original, updated)
         else:
-            do_save(accounts[0], CONFIG_DATA.get("tasklist", []))
+            retry_pending_subscriptions(accounts[0], config_path)
+            with Config.locked(config_path):
+                CONFIG_DATA = Config.read_json(config_path)
+                original_config = deepcopy(CONFIG_DATA)
+                Config.breaking_change_update(CONFIG_DATA)
+            latest_cookies = Config.get_cookies(CONFIG_DATA.get("cookie")) or []
+            if (latest_cookies and isinstance(latest_cookies[0], str)
+                    and latest_cookies[0].strip() == cookies[0].strip()):
+                do_save(accounts[0], CONFIG_DATA.get("tasklist", []))
+            else:
+                print("运行期间 Cookie 已修改，本轮停止转存，下次运行将重新验证账号")
         print()
     # 通知
     if NOTIFYS:

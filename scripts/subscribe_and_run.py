@@ -38,6 +38,9 @@ def main():
                 print(f"来源：{error.get('source', '')}；{error.get('message', '')}", flush=True)
         if result.get("queries"):
             print("已查询关键词：" + "、".join(str(value) for value in result["queries"]), flush=True)
+        if result.get("pending"):
+            print("已保留待查找订阅；将在现有定时规则执行时继续自动搜索，验证成功后按已保存的转存及下载设置执行", flush=True)
+            return 75
         return 1
     task = dict(result["data"])
     task.pop("runweek", None)

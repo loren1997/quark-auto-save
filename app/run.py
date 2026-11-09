@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sdk.discovery import get_calendar, get_search_aliases
 from sdk.common import normalize_share_url
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta
 import requests
 import hashlib
 import logging
@@ -27,6 +27,7 @@ import sys
 import os
 import re
 import threading
+import uuid
 
 from run_manager import RunManager, validate_payload
 
@@ -237,7 +238,7 @@ def update():
             auto_download = updated["discovery"].get("auto_download", False)
             if auto_download and not aria2_download_configured(updated):
                 return jsonify(success=False, message="请先启用并配置 Aria2 插件的地址、密钥和下载目录"), 400
-            for task in updated.get("tasklist", []):
+            for task in updated.get("tasklist", []) + [item["task"] for item in updated.get("pending_subscriptions", [])]:
                 if not task.get("resource_id"):
                     continue
                 addition = task.setdefault("addition", {})
@@ -369,6 +370,31 @@ def subscribe_discovery():
     return subscribe_discovery_payload(request.get_json(silent=True))
 
 
+@app.route("/api/discovery/pending")
+def pending_discovery():
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    current = Config.read_json(CONFIG_PATH)
+    return jsonify(success=True, data=[Config.pending_summary(item)
+                                      for item in current.get("pending_subscriptions", [])])
+
+
+@app.route("/api/discovery/pending/<path:resource_id>", methods=["DELETE"])
+def cancel_pending_discovery(resource_id):
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    if not re.fullmatch(r"[\w:-]{1,120}", resource_id):
+        return jsonify(success=False, message="资源 ID 不正确"), 400
+    with Config.locked(CONFIG_PATH):
+        current = Config.read_json(CONFIG_PATH)
+        before = current.get("pending_subscriptions", [])
+        after = [item for item in before if item["task"]["resource_id"] != resource_id]
+        if len(after) != len(before):
+            current["pending_subscriptions"] = after
+            Config.write_json(CONFIG_PATH, current)
+    return jsonify(success=True, removed=len(after) != len(before))
+
+
 def subscribe_discovery_payload(payload):
     global config_data
     if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
@@ -379,13 +405,18 @@ def subscribe_discovery_payload(payload):
         shareurl = normalize_share_url(value) if isinstance(value, str) and len(value) <= 2000 else ""
         if not shareurl:
             return jsonify(success=False, message="请粘贴有效的夸克分享链接，可包含提取码"), 400
+    current = Config.read_json(CONFIG_PATH)
+    pending = next((item for item in current.get("pending_subscriptions", [])
+                    if item["task"]["resource_id"] == payload["id"]), None)
+    if pending and shareurl is None:
+        return jsonify(success=False, pending=True, existing=True, data=Config.pending_summary(pending),
+                       message="已保留自动查找订阅，将在现有定时规则执行时继续查找资源"), 202
     entry = next((dict(item, resource_type="anime" if kind == "donghua" else kind)
                   for day in get_calendar()["days"]
                   for kind in ("donghua", "anime", "tv") for item in day.get(kind, [])
                   if item["id"] == payload["id"]), None)
     if entry is None:
         return jsonify(success=False, message="该资源不在本周列表中，请刷新后重试"), 404
-    current = Config.read_json(CONFIG_PATH)
     title = entry["search_title"]
     if re.fullmatch(r"\d{4}", str(entry.get("year", ""))):
         title += f" ({entry['year']})"
@@ -410,35 +441,57 @@ def subscribe_discovery_payload(payload):
     aliases = get_search_aliases(entry)
     if aliases:
         task["search_aliases"] = aliases
+    task.update({
+        "savepath": base, "pattern": MEDIA_PATTERN, "replace": "", "update_subdir": ".*",
+        "resource_id": entry["id"], "runweek": list(range(1, 8)),
+        "addition": deepcopy(task_plugins_config_default),
+    })
+    apply_media_rename_defaults(task)
+    task["addition"].setdefault("aria2", {})["save_path"] = base.strip("/")
+    if auto_download:
+        task["addition"].setdefault("aria2", {}).update(auto_download=True, download_subdir=True)
     account = Quark(cookie)
     account.resource_history_path = Config.resource_history_path(CONFIG_PATH)
     result = (account.verify_resource_link(task, shareurl) if shareurl is not None
               else account.find_valid_resource(task, current))
     if not result.get("success") or not result.get("candidate"):
+        if shareurl is None and not result.get("success"):
+            with Config.locked(CONFIG_PATH):
+                config_data = Config.read_json(CONFIG_PATH)
+                existing = existing_subscription(config_data.get("tasklist", []), entry["id"], title)
+                if existing:
+                    return jsonify(success=True, existing=True, data=existing, message="已经订阅")
+                records = config_data.setdefault("pending_subscriptions", [])
+                pending = next((item for item in records if item["task"]["resource_id"] == entry["id"]), None)
+                if pending is None:
+                    timestamp = datetime.now().isoformat(timespec="seconds")
+                    pending = {"id": uuid.uuid4().hex, "task": task, "created_at": timestamp,
+                               "last_attempt_at": timestamp, "last_error": "尚未找到经视频文件验证的匹配资源"}
+                    records.append(pending)
+                    Config.write_json(CONFIG_PATH, config_data)
+            return jsonify(success=False, pending=True, data=Config.pending_summary(pending),
+                           code=result.get("code", "no_match"), queries=result.get("queries", []),
+                           source_errors=result.get("source_errors", []),
+                           search_complete=result.get("search_complete", False),
+                           message=result.get("error") or "尚未找到经视频文件验证的匹配资源"), 202
         return jsonify(success=False, code=result.get("code", "no_match"),
                        queries=result.get("queries", []), source_errors=result.get("source_errors", []),
                        search_complete=result.get("search_complete", False),
                        message=result.get("error") or "未找到可验证的匹配资源，请在任务列表手动搜索"), 422
-    task.update({
-        "shareurl": result["candidate"]["shareurl"],
-        "savepath": base,
-        "pattern": MEDIA_PATTERN,
-        "replace": "", "update_subdir": ".*",
-        "resource_id": entry["id"], "runweek": list(range(1, 8)),
-        "addition": deepcopy(task_plugins_config_default),
-    })
+    task["shareurl"] = result["candidate"]["shareurl"]
     if result["candidate"].get("search_aliases"):
         task["search_aliases"] = result["candidate"]["search_aliases"]
-    apply_media_rename_defaults(task)
-    task["addition"].setdefault("aria2", {})["save_path"] = base.strip("/")
-    if auto_download:
-        task["addition"].setdefault("aria2", {}).update(auto_download=True, download_subdir=True)
     with Config.locked(CONFIG_PATH):
         config_data = Config.read_json(CONFIG_PATH)
+        if pending and not any(item["id"] == pending["id"] for item in config_data.get("pending_subscriptions", [])):
+            return jsonify(success=False, message="待查找订阅已取消，本次结果不会重新创建任务"), 409
         existing = existing_subscription(config_data.get("tasklist", []), entry["id"], title)
         if existing:
             return jsonify(success=True, existing=True, data=existing, message="已经订阅")
         config_data.setdefault("tasklist", []).append(task)
+        if "pending_subscriptions" in config_data:
+            config_data["pending_subscriptions"] = [item for item in config_data["pending_subscriptions"]
+                                                     if item["task"]["resource_id"] != entry["id"]]
         Config.write_json(CONFIG_PATH, config_data)
         Config.remember_resources(account.resource_history_path, [task])
     return jsonify(success=True, existing=False, data=task, message="订阅已保存，正在开始转存")
@@ -458,9 +511,7 @@ def valid_discovery_path(path):
 
 
 def existing_subscription(tasks, resource_id, title):
-    return next((task for task in tasks if task.get("resource_id") == resource_id
-                 or (resource_titles_match(title, task.get("taskname", ""))
-                     and resource_titles_match(task.get("taskname", ""), title))), None)
+    return Config.existing_subscription(tasks, resource_id, title)
 
 @app.route("/get_share_detail", methods=["POST"])
 def get_share_detail():
@@ -765,6 +816,9 @@ def init():
         source.setdefault("pansou", {"enable": True, "server": "https://so.252035.xyz"})
         source.setdefault("cloudsaver", {"enable": False, "server": "", "username": "", "password": ""})
         source.setdefault("websearch", {"enable": True})
+        source.setdefault("channelsearch", {"enable": True,
+                                            "telegram_channels": ["Q_dongman", "guoman4K", "kuakedongman"],
+                                            "qq_channels": ["pd26778899"]})
         if new_config and os.getenv("PANSOU_SERVER"):
             source["pansou"]["server"] = os.environ["PANSOU_SERVER"]
 
@@ -785,6 +839,7 @@ def init():
 
 if __name__ == "__main__":
     init()
+    get_run_manager()
     reload_tasks()
     logging.info(">>> 启动Web服务")
     logging.info(f"运行在: http://{HOST}:{PORT}")

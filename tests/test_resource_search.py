@@ -321,11 +321,11 @@ class WebAggregationTests(unittest.TestCase):
         web.return_value.search.return_value = [entry()]
         web.return_value.errors = []
         self.assertTrue(search_web_resources(" 作品 ", {}, failed_engines=failed_engines)["success"])
-        web.return_value.search.assert_called_once_with("作品", refresh=False, failed_engines=failed_engines)
+        web.return_value.search.assert_called_once_with("作品", refresh=False, channel_config={}, include_engines=True, failed_engines=failed_engines)
         self.assertIs(web.return_value.search.call_args.kwargs["failed_engines"], failed_engines)
         web.return_value.search.reset_mock()
         search_web_resources("作品", {})
-        web.return_value.search.assert_called_once_with("作品", refresh=False)
+        web.return_value.search.assert_called_once_with("作品", refresh=False, channel_config={}, include_engines=True)
 
     @patch("resource_search.WebSearch")
     def test_web_search_defaults_on_and_preserves_partial_engine_failure(self, web):
@@ -339,10 +339,28 @@ class WebAggregationTests(unittest.TestCase):
         web.return_value.session.close.assert_called_once()
 
     @patch("resource_search.WebSearch")
-    def test_disabled_web_never_contacts_engines(self, web):
-        result = search_web_resources("作品", {"source": {"websearch": {"enable": False}}})
+    def test_disabled_web_and_channels_never_contact_public_sources(self, web):
+        result = search_web_resources("作品", {"source": {"websearch": {"enable": False}, "channelsearch": {"enable": False}}})
         self.assertEqual(result["data"], [])
         web.assert_not_called()
+
+    @patch("resource_search.WebSearch")
+    def test_channel_source_can_run_with_general_web_engines_disabled(self, web):
+        web.return_value.search.return_value = [entry()]
+        web.return_value.errors = []
+        channels = {"telegram_channels": ["Anime_Test"], "qq_channels": []}
+        result = search_web_resources("作品", {"source": {"websearch": {"enable": False}, "channelsearch": channels}})
+        self.assertTrue(result["data"])
+        web.return_value.search.assert_called_once_with("作品", refresh=False, channel_config=channels, include_engines=False)
+
+    @patch("resource_search.WebSearch")
+    def test_channel_diagnostics_preserve_source_without_secret_details(self, web):
+        web.return_value.search.return_value = []
+        web.return_value.errors = ["Telegram @Anime_Test: 网页 HTTP 429 token=SECRET", "腾讯频道 pd26778899: 频道页面要求人工验证或浏览器验证"]
+        result = search_web_resources("作品", {})
+        self.assertEqual(result["errors"], [{"source": "频道索引 Telegram @Anime_Test", "message": "HTTP 429"},
+                                            {"source": "频道索引 腾讯频道 pd26778899", "message": "需要人工验证"}])
+        self.assertNotIn("SECRET", str(result))
 
     @patch("resource_search.WebSearch")
     def test_web_failure_remains_a_source_error(self, web):

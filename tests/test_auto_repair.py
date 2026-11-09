@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -406,6 +407,81 @@ class AutoRepairTests(unittest.TestCase):
         with patch.object(self.account, "find_valid_resource", return_value=result):
             self.account.repair_share(self.task)
         self.assertEqual(self.task["shareurl"], expected)
+
+    def test_quarter_collection_selects_only_named_work_and_combines_actual_year(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.account.resource_history_path = os.path.join(directory.name, "resources.json")
+        self.task.update(taskname="目标动画 (2026)", search_aliases=["目标动画别名"],
+                         resource_type="anime", resource_id="bangumi:123",
+                         pattern=r".*\.(mp4|mkv)$", replace="{TASKNAME} S01E{EXX}.{EXT}")
+        wrapper, selected = "a" * 32, "b" * 32
+        root = {"code": 0, "data": {"share": {"title": "2026年10月番合集"}, "list": [
+            {"fid": wrapper, "dir": True, "file_name": "2026年10月番合集"},
+        ]}}
+        collection = {"code": 0, "data": {"list": [
+            {"fid": selected, "dir": True, "file_name": "目标动画别名"},
+            {"fid": "c" * 32, "dir": True, "file_name": "另一部动画"},
+            {"fid": "unrelated02", "dir": False, "file_name": "02.mp4"},
+        ]}}
+        videos = {"code": 0, "data": {"list": [
+            {"fid": f"episode{number}", "dir": False, "file_name": f"{number:02d}.mp4"}
+            for number in range(1, 6)
+        ]}}
+        for required in (None, {2}):
+            with self.subTest(required=required), patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                    patch.object(self.account, "get_detail", side_effect=[root, collection, videos]) as detail:
+                result = self.account._find_verified_resource(
+                    self.task, [self.candidate()], set(), self.task["search_aliases"], required_episodes=required,
+                )
+            self.assertTrue(result["success"], result)
+            self.assertEqual([str(call.args[2]) for call in detail.call_args_list], ["0", wrapper, selected])
+            self.assertEqual(result["candidate"]["pdir_fid"], selected)
+            self.assertTrue(result["candidate"]["shareurl"].endswith("#/list/share/" + selected))
+            if required:
+                self.assertEqual(result["candidate"]["episode_fids"], {"episode2": 2})
+            self.assertEqual(qas.Config.resource_history(self.account.resource_history_path)[0]["shareurl"],
+                             self.candidate()["shareurl"])
+            restarted = qas.Quark()
+            restarted.resource_history_path = self.account.resource_history_path
+            deleted_task = {key: value for key, value in self.task.items() if key not in ("shareurl", "search_aliases")}
+            with patch.object(restarted, "get_stoken", return_value=TOKEN), \
+                    patch.object(restarted, "get_detail", side_effect=[root, collection, videos]) as detail, \
+                    patch("resource_search.search_resources", side_effect=AssertionError("no live search needed")):
+                recovered = restarted.find_valid_resource(deleted_task, {}, required_episodes=required)
+            self.assertTrue(recovered["success"], recovered)
+            self.assertEqual(recovered["candidate"]["pdir_fid"], selected)
+            self.assertEqual([str(call.args[2]) for call in detail.call_args_list], ["0", wrapper, selected])
+            if required:
+                self.assertEqual(recovered["candidate"]["episode_fids"], {"episode2": 2})
+
+    def test_quarter_collection_rejects_ambiguous_or_conflicting_context(self):
+        self.task.update(taskname="目标动画 (2026)", search_aliases=["目标动画别名"], resource_type="anime")
+        cases = (
+            ("2026年10月番合集", ["目标动画", "目标动画别名"], "02.mp4"),
+            ("2026年10月番合集", ["另一部动画", "未命名"], "02.mp4"),
+            ("2025年10月番合集", ["目标动画", "另一部动画"], "02.mp4"),
+            ("2025年10月番合集", ["目标动画 (2026)", "另一部动画"], "02.mp4"),
+            ("新番合集", ["目标动画", "另一部动画"], "02.mp4"),
+            ("2026年10月番合集", ["目标动画 第二季", "另一部动画"], "02.mp4"),
+            ("2026年10月番合集", ["目标动画", "另一部动画"], "S02E02.mp4"),
+            ("2026年10月番合集", ["目标动画", "另一部动画"], "目标动画 (2025) 02.mp4"),
+            ("2026年10月番合集", ["目标动画", "另一部动画"], "另一部动画 02.mp4"),
+        )
+        for parent, names, filename in cases:
+            root = {"code": 0, "data": {"share": {"title": parent}, "list": [
+                {"fid": str(index + 1) * 32, "dir": True, "file_name": name}
+                for index, name in enumerate(names)
+            ] + [{"fid": "unrelated02", "dir": False, "file_name": "02.mp4"}]}}
+            videos = {"code": 0, "data": {"list": [
+                {"fid": "episode", "dir": False, "file_name": filename},
+            ]}}
+            with self.subTest(parent=parent, names=names, video=filename), \
+                    patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                    patch.object(self.account, "get_detail", side_effect=[root, videos]) as detail:
+                result = self.account._find_verified_resource(self.task, [self.candidate()], set(), self.task["search_aliases"])
+            self.assertFalse(result["success"], result)
+            self.assertLessEqual(detail.call_count, 2)
 
     def test_release_group_collection_scopes_one_directory_without_mixing_works(self):
         group_ids = ["a" * 32, "b" * 32]

@@ -220,12 +220,16 @@ class AppIntegrationTests(unittest.TestCase):
                 self.assertIn("Cookie", response.json["message"])
         self.find.assert_not_called()
 
-    def test_no_valid_candidate_keeps_config_untouched(self):
+    def test_no_valid_candidate_keeps_intent_out_of_transfer_tasks(self):
         self.find.return_value = {"success": False, "candidate": None, "error": "没有匹配的有效分享"}
         response = self.subscribe()
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.json["pending"])
         self.assertEqual(response.json["message"], "没有匹配的有效分享")
-        self.assertEqual(self.saved_config(), self.config)
+        saved = self.saved_config()
+        self.assertEqual(saved["tasklist"], [])
+        self.assertEqual(len(saved["pending_subscriptions"]), 1)
+        self.assertNotIn("shareurl", saved["pending_subscriptions"][0]["task"])
 
     def test_direct_subscription_rejects_invalid_links_without_network_or_writing(self):
         for value in (None, [], "", "not a link", "http://127.0.0.1/s/abc123",
@@ -507,18 +511,109 @@ class AppIntegrationTests(unittest.TestCase):
                 self.assertTrue(response.json["success"])
                 self.assertEqual(response.json["data"]["list"][0]["file_name_re"], filename)
 
-    def test_subscription_failure_returns_reason_without_saving(self):
+    def test_subscription_failure_returns_reason_and_saves_retry_intent(self):
         self.find.return_value = {"success": False, "candidate": None,
                                   "error": "搜索源暂不可用", "code": "unavailable",
                                   "queries": ["测试动漫", "Test Anime"], "search_complete": False,
                                   "source_errors": [{"source": "网页搜索", "message": "请求超时"}]}
         response = self.subscribe()
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json["code"], "unavailable")
         self.assertEqual(response.json["queries"], ["测试动漫", "Test Anime"])
         self.assertFalse(response.json["search_complete"])
         self.assertEqual(response.json["source_errors"][0]["message"], "请求超时")
-        self.assertEqual(self.saved_config(), self.config)
+        saved = self.saved_config()
+        self.assertEqual(saved["tasklist"], [])
+        self.assertEqual(saved["pending_subscriptions"][0]["task"]["resource_id"], self.entry["id"])
+        for value in ("fake-cookie", "never-persist-this-token", "stoken", "passcode"):
+            self.assertNotIn(value, str(saved["pending_subscriptions"]))
+
+    def test_pending_subscription_survives_calendar_change_and_duplicate_click(self):
+        self.find.return_value = {"success": False, "error": "请求超时", "code": "unavailable"}
+        self.get_search_aliases.return_value = ["可信作品别名"]
+        first = self.subscribe()
+        original = self.saved_config()["pending_subscriptions"]
+        self.assertEqual(original[0]["task"]["search_aliases"], ["可信作品别名"])
+        self.get_calendar.side_effect = AssertionError("已保存的待查找订阅不应重新依赖周历")
+        second = self.subscribe()
+        self.assertEqual(second.status_code, 202)
+        self.assertTrue(second.json["existing"])
+        self.assertTrue(second.json["pending"])
+        self.assertEqual(self.saved_config()["pending_subscriptions"], original)
+        self.assertEqual(first.json["data"]["resource_id"], second.json["data"]["resource_id"])
+        self.find.assert_called_once()
+
+    def test_pending_endpoints_require_login_and_cancel_by_id(self):
+        self.find.return_value = {"success": False, "error": "暂无匹配资源"}
+        self.subscribe()
+        anonymous = web.app.test_client()
+        self.assertEqual(anonymous.get("/api/discovery/pending").status_code, 401)
+        self.assertEqual(anonymous.delete("/api/discovery/pending/bangumi:42").status_code, 401)
+        listed = self.client.get("/api/discovery/pending").json["data"]
+        self.assertEqual([item["resource_id"] for item in listed], ["bangumi:42"])
+        self.assertNotIn("task", listed[0])
+        self.assertTrue(self.client.delete("/api/discovery/pending/bangumi:42").json["removed"])
+        self.assertFalse(self.client.delete("/api/discovery/pending/bangumi:42").json["removed"])
+        self.assertEqual(self.saved_config()["pending_subscriptions"], [])
+        self.assertEqual(self.saved_config()["tasklist"], [])
+
+    def test_pending_templates_cannot_be_inserted_via_update(self):
+        response = self.client.post("/update", json={"pending_subscriptions": [{"task": {"taskname": "伪造"}}]})
+        self.assertTrue(response.json["success"])
+        self.assertNotIn("pending_subscriptions", self.saved_config())
+
+    def test_channel_search_defaults_are_added_without_enabling_disabled_source(self):
+        with patch.object(web.Config, "load_plugins", return_value=({}, {}, {})):
+            web.init()
+            defaults = self.saved_config()["source"]["channelsearch"]
+            self.assertTrue(defaults["enable"])
+            self.assertEqual(defaults["telegram_channels"], ["Q_dongman", "guoman4K", "kuakedongman"])
+            self.assertEqual(defaults["qq_channels"], ["pd26778899"])
+            current = self.saved_config()
+            current["source"]["channelsearch"] = {"enable": False, "telegram_channels": ["my_channel"]}
+            web.Config.write_json(self.config_path, current)
+            web.init()
+        self.assertEqual(self.saved_config()["source"]["channelsearch"], {"enable": False, "telegram_channels": ["my_channel"]})
+
+    def test_download_setting_change_reaches_pending_subscription(self):
+        self.config["plugins"] = {"aria2": {"host_port": "192.0.2.1:6800", "secret": "private-rpc", "dir": "/downloads"}}
+        self.config["discovery"]["auto_download"] = True
+        self.write_config()
+        self.find.return_value = {"success": False, "error": "请求超时"}
+        self.subscribe()
+        self.assertTrue(self.saved_config()["pending_subscriptions"][0]["task"]["addition"]["aria2"]["auto_download"])
+        self.assertTrue(self.client.post("/update", json={"discovery": {
+            "savepath": "/cartoon", "auto_download": False}}).json["success"])
+        self.assertFalse(self.saved_config()["pending_subscriptions"][0]["task"]["addition"]["aria2"]["auto_download"])
+
+    def test_direct_share_can_replace_pending_intent_only_after_validation(self):
+        self.find.return_value = {"success": False, "error": "请求超时"}
+        self.subscribe()
+        pending = self.saved_config()["pending_subscriptions"]
+        with patch.object(web.Quark, "verify_resource_link", return_value={"success": False, "error": "作品不匹配"}):
+            failed = self.client.post("/api/discovery/subscribe", json={
+                "id": self.entry["id"], "shareurl": "https://pan.quark.cn/s/manual"})
+        self.assertEqual(failed.status_code, 422)
+        self.assertEqual(self.saved_config()["pending_subscriptions"], pending)
+        with patch.object(web.Quark, "verify_resource_link", return_value=self.candidate):
+            success = self.client.post("/api/discovery/subscribe", json={
+                "id": self.entry["id"], "shareurl": "https://pan.quark.cn/s/manual"})
+        self.assertTrue(success.json["success"])
+        self.assertEqual(self.saved_config()["pending_subscriptions"], [])
+        self.assertEqual(len(self.saved_config()["tasklist"]), 1)
+
+    def test_cancelling_pending_during_manual_verification_does_not_recreate_it(self):
+        self.find.return_value = {"success": False, "error": "请求超时"}
+        self.subscribe()
+        def complete(*_args):
+            self.client.delete("/api/discovery/pending/bangumi:42")
+            return self.candidate
+        with patch.object(web.Quark, "verify_resource_link", side_effect=complete):
+            response = self.client.post("/api/discovery/subscribe", json={
+                "id": self.entry["id"], "shareurl": "https://pan.quark.cn/s/manual"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.saved_config()["pending_subscriptions"], [])
+        self.assertEqual(self.saved_config()["tasklist"], [])
 
     def test_new_subscription_inherits_disabled_global_auto_repair(self):
         self.config["auto_repair"] = False

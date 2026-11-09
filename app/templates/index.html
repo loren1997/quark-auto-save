@@ -81,6 +81,7 @@
 
           <div v-if="backgroundRun && activeTab !== 'runs'" class="alert alert-info mt-3" role="status">
             后台运行：{{ backgroundRun.task || '准备任务' }} · {{ runStageLabel(backgroundRun) }}
+            <span v-if="queuedRuns.length"> · {{ queuedRuns.length }} 部排队中</span>
             <button type="button" class="btn btn-sm btn-outline-primary ml-2" @click="openRun(backgroundRun.id)">查看日志</button>
           </div>
           <div v-if="runNotice && activeTab !== 'runs'" class="alert alert-secondary mt-3" role="status">
@@ -95,6 +96,23 @@
               <div class="col-auto"><button type="button" class="btn btn-outline-primary" :disabled="runsLoading" @click="refreshRuns()">刷新日志</button></div>
             </div>
             <p class="text-muted">任务在后台执行，关闭页面不会中断。这里记录手动、订阅和定时运行；显示的下载阶段表示提交给下载器，实际进度请在 Aria2 查看。</p>
+            <div v-if="queuedRuns.length" class="card mb-3">
+              <div class="card-body">
+                <h5>订阅队列（{{ queuedRuns.length }}）</h5>
+                <ol class="mb-0 pl-3"><li v-for="run in queuedRuns" :key="run.id"><button type="button" class="btn btn-link text-left" @click="selectRun(run.id)">{{ run.task }} · 等待前一部完成</button></li></ol>
+              </div>
+            </div>
+            <div v-if="pendingSubscriptions.length" class="card mb-3">
+              <div class="card-body">
+                <h5>等待自动查找（{{ pendingSubscriptions.length }}）</h5>
+                <p class="text-muted small">暂未找到可验证资源，按现有定时规则继续搜索；找到后自动转存并提交下载。</p>
+                <div v-for="item in pendingSubscriptions" :key="item.resource_id" class="border-top py-2">
+                  <strong>{{ item.taskname }}</strong>
+                  <button type="button" class="btn btn-sm btn-outline-secondary ml-2" @click="cancelPendingSubscription(item)">取消查找</button>
+                  <div class="text-muted small">{{ item.last_error }}</div>
+                </div>
+              </div>
+            </div>
             <div v-if="runsError" class="alert alert-warning" role="alert">{{ runsError }}</div>
             <p v-if="!runs.length && !runsLoading" class="text-muted">暂无运行记录，启动任务后会自动显示。</p>
             <div v-if="runs.length" class="form-group">
@@ -378,6 +396,17 @@
                 <small class="text-muted d-block">查询公开资源站及搜狗、Google、Bing、DuckDuckGo，并读取结果网页中的夸克链接。一键订阅、失效换源和缺集补全都会检查分享中的真实视频文件。需要 NAS 能访问相应网站，验证码或网络故障会记录在运行日志中。</small>
               </div>
             </div>
+            <div class="form-group row ml-3">
+              <label class="col-sm-2 col-form-label" for="channelsearch-enabled">公开频道索引</label>
+              <div class="col-sm-10">
+                <label><input id="channelsearch-enabled" type="checkbox" v-model="formData.source.channelsearch.enable"> 搜索 Telegram、腾讯公开频道</label>
+                <label class="d-block" for="telegram-channels">Telegram 频道名</label>
+                <textarea id="telegram-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.telegram_channels" placeholder="Q_dongman, guoman4K, kuakedongman"></textarea>
+                <label class="d-block mt-2" for="qq-channels">腾讯频道 ID</label>
+                <textarea id="qq-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.qq_channels" placeholder="pd26778899"></textarea>
+                <small class="text-muted d-block">多个频道用逗号或换行分隔。Telegram 查询公开消息；腾讯频道读取可访问的公开帖子，覆盖范围受页面限制。登录限制、验证码或连接失败会记录在日志中。</small>
+              </div>
+            </div>
 
           </div>
 
@@ -437,7 +466,7 @@
                       </div>
                     </div>
                     <div class="card-footer bg-white">
-                      <button type="button" class="btn btn-primary btn-block" :disabled="!!subscribing || !!backgroundRun || isSubscribed(item)" @click="subscribeDiscovery(item)">{{ isSubscribed(item) ? '已订阅' : backgroundRun && backgroundRun.discovery_id === item.id ? '后台查找并订阅中…' : subscribing === item.id ? '正在启动…' : '一键订阅并转存' }}</button>
+                      <button type="button" class="btn btn-primary btn-block" :disabled="!!subscribing || isSubscribed(item) || !!discoveryRun(item) || isPendingSubscription(item)" @click="subscribeDiscovery(item)">{{ isSubscribed(item) ? '已订阅' : discoveryRun(item) ? runStatusLabel(discoveryRun(item).status) : isPendingSubscription(item) ? '等待自动查找' : subscribing === item.id ? '正在加入…' : backgroundRun ? '加入订阅队列' : '一键订阅并转存' }}</button>
                     </div>
                   </article>
                 </div>
@@ -795,6 +824,7 @@
           magic_regex: {},
           source: {
             websearch: { enable: true },
+            channelsearch: { enable: true, telegram_channels: 'Q_dongman,guoman4K,kuakedongman', qq_channels: 'pd26778899' },
             net: {
               enable: ""
             },
@@ -831,6 +861,7 @@
           runweek: [1, 2, 3, 4, 5, 6, 7]
         },
         runs: [],
+        pendingSubscriptions: [],
         selectedRunId: '',
         runDetail: null,
         runCursor: 0,
@@ -876,7 +907,10 @@
       },
       computed: {
         backgroundRun() {
-          return this.runs.find(run => this.isRunActive(run));
+          return this.runs.find(run => run.status === 'running') || this.queuedRuns[0];
+        },
+        queuedRuns() {
+          return this.runs.filter(run => run.status === 'queued').slice().sort((a, b) => a.created_at.localeCompare(b.created_at));
         },
       },
       filters: {
@@ -947,6 +981,20 @@
           const title = item.search_title + (item.year ? ` (${item.year})` : '');
           return this.formData.tasklist.some(task => task.resource_id === item.id || task.taskname === title);
         },
+        discoveryRun(item) {
+          return this.runs.find(run => run.discovery_id === item.id && this.isRunActive(run));
+        },
+        isPendingSubscription(item) {
+          return this.pendingSubscriptions.some(pending => pending.resource_id === item.id);
+        },
+        async cancelPendingSubscription(item) {
+          try {
+            await axios.delete(`/api/discovery/pending/${encodeURIComponent(item.resource_id)}`);
+            this.pendingSubscriptions = this.pendingSubscriptions.filter(pending => pending.resource_id !== item.resource_id);
+          } catch (error) {
+            this.showToast(error.response?.data?.message || '取消查找失败，请重试', 'warning');
+          }
+        },
         discoveryGroups(day) {
           const groups = [];
           for (const item of day[this.discoveryKind] || []) {
@@ -986,12 +1034,13 @@
           return run && ['queued', 'running'].includes(run.status);
         },
         runStatusLabel(status) {
-          return {queued: '等待运行', running: '运行中', succeeded: '运行结束', failed: '运行失败', interrupted: '已中断'}[status] || status;
+          return {queued: '排队中', running: '运行中', waiting: '等待自动查找', succeeded: '运行结束', failed: '运行失败', interrupted: '已中断'}[status] || status;
         },
         runTriggerLabel(trigger) {
           return {manual: '手动运行', scheduled: '定时运行', discovery: '热门订阅'}[trigger] || '运行';
         },
         runStageLabel(run) {
+          if (run.status === 'queued') return '排队中，等待前一项完成';
           if (!this.isRunActive(run)) return this.runStatusLabel(run.status);
           return {start: '准备任务', signin: '检查账号与签到', task: '处理任务', search: '搜索资源', verify: '验证分享与视频', gap: '检查缺失集数', transfer: '转存媒体文件', rename: '按规则更名', download: '提交下载任务', finish: '保存运行结果'}[run.stage] || '等待任务输出';
         },
@@ -1034,8 +1083,9 @@
           this.runsLoading = true;
           const revision = this.runsRevision;
           try {
-            const response = await axios.get('/api/runs');
+            const [response, pending] = await Promise.all([axios.get('/api/runs'), axios.get('/api/discovery/pending')]);
             if (revision !== this.runsRevision) return;
+            if (pending.data.success) this.pendingSubscriptions = pending.data.data;
             if (!response.data.success) throw new Error(response.data.message || '读取运行记录失败');
             const previous = new Map(this.runs.map(run => [run.id, run.status]));
             this.runs = response.data.data;
@@ -1116,6 +1166,12 @@
                 config_data.source = {};
               }
               if (!config_data.source.websearch) config_data.source.websearch = { enable: true };
+              if (!config_data.source.channelsearch) config_data.source.channelsearch = { enable: true, telegram_channels: ['Q_dongman', 'guoman4K', 'kuakedongman'], qq_channels: ['pd26778899'] };
+              if (config_data.source.channelsearch.enable === undefined) config_data.source.channelsearch.enable = true;
+              for (const key of ['telegram_channels', 'qq_channels']) {
+                if (config_data.source.channelsearch[key] === undefined) config_data.source.channelsearch[key] = key === 'telegram_channels' ? ['Q_dongman', 'guoman4K', 'kuakedongman'] : ['pd26778899'];
+                if (Array.isArray(config_data.source.channelsearch[key])) config_data.source.channelsearch[key] = config_data.source.channelsearch[key].join('\n');
+              }
               if (!config_data.source.cloudsaver) {
                 config_data.source.cloudsaver = {
                   server: "",

@@ -2,11 +2,15 @@
 
 本版在原项目基础上维护，保留上游许可证和插件。默认工作方式是：NAS 上运行订阅服务，定时将夸克分享转存到自己的夸克网盘。需要 NAS 本地文件时，可启用已有 Aria2 插件。
 
+V3.8 可以连续点击多部作品加入订阅队列，依次在后台执行，同一作品重复点击会去重。未执行的队列随配置保存在 NAS，服务重启后继续；正在执行的任务若中断，会在日志标记。首次查询未找到可验证资源的作品会进入“运行日志 → 等待自动查找”，按现有定时规则重试；每轮优先检查最久未尝试的 3 部，其余留到后续轮次。找到后自动转存并按原下载设置提交 Aria2，也可以取消继续查找。
+
+“系统配置 → 资源搜索 → 公开频道索引”可以分别填写 Telegram 频道名与腾讯频道 ID，逗号或换行分隔，每类最多 6 个。默认 Telegram 为 `Q_dongman,guoman4K,kuakedongman`，腾讯为 `pd26778899`。Telegram 查询公开消息预览；腾讯只读取可访问的当前公开帖子列表，并非腾讯频道全站或全部历史搜索。各频道只读一页，与网页来源共享有界时间和并发，不会登录、执行脚本或绕过验证。网络防护可能使部分渠道不可用，日志会明确显示。
+
 ## 1. 用 Docker Compose 安装
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.7 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.7) 中的 `quark-auto-save-nas-docker-v3.7.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.8 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.8) 中的 `quark-auto-save-nas-docker-v3.8.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -158,16 +162,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.7：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.8：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.7/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.8/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.7-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.8-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"

@@ -101,6 +101,8 @@ class RunManager:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.condition = threading.Condition(threading.RLock())
         self.records, self.processes, self.owned = {}, {}, set()
+        self.queue_thread = None
+        self.closed = False
         gate = self._take_gate()
         try:
             for path in sorted(self.directory.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -111,9 +113,11 @@ class RunManager:
                         continue
                     record = json.loads(path.read_text(encoding="utf-8"))
                     if (record.get("id") != path.stem or not isinstance(record.get("logs"), list)
-                            or record.get("status") not in ACTIVE | {"succeeded", "failed", "interrupted"}):
+                            or record.get("status") not in ACTIVE | {"succeeded", "failed", "interrupted", "waiting"}):
                         continue
-                    if record.get("status") in ACTIVE and gate is not None:
+                    resumable = (record.get("status") == "queued"
+                                 and "discovery_id" in validate_payload(record.get("payload", {})))
+                    if record.get("status") in ACTIVE and gate is not None and not resumable:
                         record.update(status="interrupted", finished_at=now(), error="服务已重启，上次运行已中断")
                         self._persist(record)
                     self.records[record["id"]] = record
@@ -123,21 +127,22 @@ class RunManager:
         finally:
             self._release_gate(gate)
         atexit.register(self.close)
+        with self.condition:
+            self._ensure_queue_worker()
 
-    def _take_gate(self):
-        stream = open(self.directory / ".active.lock", "a+b")
+    def _take_gate(self, filename=".active.lock", blocking=False):
+        stream = open(self.directory / filename, "a+b")
         try:
             if os.name == "nt":
                 import msvcrt
-                stream.seek(0)
-                if not stream.read(1):
+                if not os.fstat(stream.fileno()).st_size:
                     stream.write(b"0")
                     stream.flush()
                 stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             return stream
         except OSError:
             stream.close()
@@ -187,7 +192,7 @@ class RunManager:
                     continue
                 current = json.loads(path.read_text(encoding="utf-8"))
                 if (current.get("id") == run_id and isinstance(current.get("logs"), list)
-                        and current.get("status") in ACTIVE | {"succeeded", "failed", "interrupted"}):
+                        and current.get("status") in ACTIVE | {"succeeded", "failed", "interrupted", "waiting"}):
                     self.records[run_id] = current
             except (OSError, ValueError, TypeError):
                 logging.warning("无法刷新另一进程的运行记录")
@@ -213,6 +218,8 @@ class RunManager:
         payload = validate_payload(payload)
         with self.condition:
             self._refresh_other_runs()
+            if "discovery_id" in payload:
+                return self._enqueue_subscription(payload, trigger)
             active = next((record for record in self.records.values() if record["status"] in ACTIVE), None)
             if active:
                 return False, self._summary(active)
@@ -252,6 +259,92 @@ class RunManager:
                 finally:
                     self._release_gate(gate)
                 raise
+
+    def _enqueue_subscription(self, payload, trigger):
+        # 入队只锁短暂写入，不能等正在搜索或转存的长任务结束。
+        gate = self._take_gate(".queue.lock", blocking=True)
+        if gate is None:
+            raise ValueError("订阅队列暂忙，请稍后重试")
+        record = None
+        try:
+            self._refresh_other_runs()
+            duplicate = next((item for item in self.records.values()
+                              if item["status"] in ACTIVE
+                              and item.get("discovery_id") == payload["discovery_id"]), None)
+            if duplicate:
+                return True, self._summary(duplicate)
+            if sum(item["status"] in ACTIVE for item in self.records.values()) >= MAX_RUNS:
+                raise ValueError("订阅队列已满，请等待当前作品处理完成后再添加")
+            record = {"id": uuid.uuid4().hex, "status": "queued", "trigger": trigger,
+                      "task": payload["discovery_id"], "stage": "start", "source": "", "query": "",
+                      "discovery_id": payload["discovery_id"], "created_at": now(),
+                      "started_at": None, "finished_at": None, "error": "", "exit_code": None,
+                      "warning": False, "cursor": 0, "logs": [], "payload": payload}
+            self.records[record["id"]] = record
+            self._persist(record)
+            self._prune()
+            self._ensure_queue_worker()
+            self.condition.notify_all()
+            return True, self._summary(record)
+        except Exception as exc:
+            if record is not None:
+                record.update(status="failed", finished_at=now(), error=f"无法加入订阅队列（{type(exc).__name__}）")
+                record.pop("payload", None)
+                try:
+                    self._persist(record)
+                except OSError:
+                    self.records.pop(record["id"], None)
+                    (self.directory / (record["id"] + ".json")).unlink(missing_ok=True)
+                    logging.error("无法保存订阅入队失败记录")
+            raise
+        finally:
+            self._release_gate(gate)
+
+    def _ensure_queue_worker(self):
+        if (self.closed or (self.queue_thread and self.queue_thread.is_alive())
+                or not any(item["status"] == "queued" and "payload" in item for item in self.records.values())):
+            return
+        self.queue_thread = threading.Thread(target=self._drain_queue, daemon=True, name="qas-subscriptions")
+        self.queue_thread.start()
+
+    def _drain_queue(self):
+        while True:
+            with self.condition:
+                if self.closed:
+                    return
+                self._refresh_other_runs()
+                queued = sorted((item for item in self.records.values()
+                                 if item["status"] == "queued" and "payload" in item), key=lambda item: item["created_at"])
+                if not queued:
+                    self.queue_thread = None
+                    return
+                gate = self._take_gate()
+                if gate is None:
+                    self.condition.wait(timeout=1)
+                    continue
+                # 其他 Web 进程可能刚完成同一队列项；持有运行锁后重新读取。
+                self._refresh_other_runs()
+                record = self.records.get(queued[0]["id"])
+                if not record or record["status"] != "queued":
+                    self._release_gate(gate)
+                    continue
+                try:
+                    payload = validate_payload(record["payload"])
+                    if "discovery_id" not in payload:
+                        raise ValueError("队列只接受热门订阅")
+                    config = json.loads(Path(self.config_path).read_text(encoding="utf-8"))
+                    secrets = secret_values([config, payload])
+                    self.owned.add(record["id"])
+                except (OSError, ValueError, TypeError) as exc:
+                    record.update(status="failed", finished_at=now(), error=f"无法读取排队任务（{type(exc).__name__}）")
+                    try:
+                        self._persist(record)
+                    except OSError:
+                        logging.error("无法保存排队任务失败记录")
+                    finally:
+                        self._release_gate(gate)
+                    continue
+            self._execute(record, payload, secrets, gate)
 
     def _line(self, record, line, secrets):
         with self.condition:
@@ -326,9 +419,12 @@ class RunManager:
                     last_write = time.monotonic()
             code = process.wait()
             with self.condition:
-                record.update(exit_code=code, status="succeeded" if code == 0 and not timed_out.is_set() else "failed")
+                waiting = code == 75 and "discovery_id" in payload and not timed_out.is_set()
+                record.update(exit_code=code, status="waiting" if waiting else "succeeded" if code == 0 and not timed_out.is_set() else "failed")
                 if timed_out.is_set():
                     record["error"] = f"运行超过 {self.timeout} 秒，已终止；下次运行可重试"
+                elif waiting:
+                    record["error"] = "本轮未找到可验证资源；已加入待查找列表，按现有定时规则自动重试"
                 elif code != 0:
                     record["error"] = f"运行失败，退出码 {code}；请查看日志"
         except Exception as exc:
@@ -345,6 +441,7 @@ class RunManager:
                 process.stdout.close()
             with self.condition:
                 record["finished_at"] = now()
+                record.pop("payload", None)
                 self.processes.pop(record["id"], None)
                 self.owned.discard(record["id"])
                 try:
@@ -371,6 +468,10 @@ class RunManager:
 
     def close(self):
         with self.condition:
+            self.closed = True
+            self.condition.notify_all()
             for process in self.processes.values():
                 if process.poll() is None:
                     process.terminate()
+        if self.queue_thread and self.queue_thread.is_alive() and self.queue_thread is not threading.current_thread():
+            self.queue_thread.join(timeout=5)

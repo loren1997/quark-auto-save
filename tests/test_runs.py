@@ -1,10 +1,13 @@
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -56,6 +59,144 @@ class RunFixture(unittest.TestCase):
 
 
 class BackgroundRunTests(RunFixture):
+    @contextlib.contextmanager
+    def subscription_worker(self):
+        original = subprocess.Popen
+        def launch(command, *args, **kwargs):
+            command = list(command)
+            command[2] = str(self.script)
+            return original(command, *args, **kwargs)
+        with patch("run_manager.subprocess.Popen", side_effect=launch):
+            yield
+
+    def test_subscriptions_queue_in_order_while_another_task_runs(self):
+        self.script.write_text(
+            "import os,json,time\n"
+            "print(json.loads(os.environ.get('QAS_RUN_PAYLOAD','{}')).get('discovery_id','manual'))\n"
+            "time.sleep(0.15)\n", encoding="utf-8")
+        manager = self.manager()
+        with self.subscription_worker():
+            _, manual = manager.start({})
+            first = manager.start({"discovery_id": "anime:1"})[1]
+            second = manager.start({"discovery_id": "anime:2"})[1]
+            duplicate = manager.start({"discovery_id": "anime:2"})[1]
+            self.assertEqual(second["id"], duplicate["id"])
+            self.assertEqual(second["status"], "queued")
+            self.assertNotIn("payload", manager.get(second["id"]))
+            last = self.finish(manager, second["id"])
+            middle = manager.get(first["id"])
+            self.assertEqual(last["status"], "succeeded")
+            self.assertGreaterEqual(middle["started_at"], manager.get(manual["id"])["finished_at"])
+            self.assertGreaterEqual(last["started_at"], middle["finished_at"])
+            self.assertEqual(last["logs"][0]["text"], "anime:2")
+
+    def test_pending_search_does_not_block_next_subscription(self):
+        self.script.write_text("import os,json\np=json.loads(os.environ['QAS_RUN_PAYLOAD'])\n"
+                               "raise SystemExit(75 if p['discovery_id']=='anime:1' else 0)\n", encoding="utf-8")
+        manager = self.manager()
+        with self.subscription_worker():
+            first = manager.start({"discovery_id": "anime:1"})[1]
+            second = manager.start({"discovery_id": "anime:2"})[1]
+            self.assertEqual(self.finish(manager, second["id"])["status"], "succeeded")
+            self.assertEqual(manager.get(first["id"])["status"], "waiting")
+
+    def test_queue_preparation_and_log_write_failure_release_gate(self):
+        manager = self.manager()
+        with patch.object(manager, "_ensure_queue_worker"):
+            _, first = manager.start({"discovery_id": "anime:broken"})
+            _, second = manager.start({"discovery_id": "anime:next"})
+        row = manager.records[first["id"]]
+        row["payload"] = {"unexpected": True}
+        manager._persist(row)
+        persist = manager._persist
+        def disk_failure(record):
+            if record["id"] == first["id"] and record["status"] == "failed":
+                raise OSError("disk full")
+            return persist(record)
+        with self.subscription_worker(), patch.object(manager, "_persist", side_effect=disk_failure):
+            with manager.condition:
+                manager._ensure_queue_worker()
+            self.assertEqual(self.finish(manager, second["id"])["status"], "succeeded")
+            self.assertEqual(manager.get(first["id"])["status"], "failed")
+        gate = manager._take_gate()
+        self.assertIsNotNone(gate)
+        manager._release_gate(gate)
+
+    def test_restart_resumes_queued_subscriptions_without_cookie_snapshots(self):
+        manager = self.manager()
+        with patch.object(manager, "_ensure_queue_worker"):
+            _, queued = manager.start({"discovery_id": "anime:resume"})
+        manager.close()
+        persisted = (manager.directory / (queued["id"] + ".json")).read_text(encoding="utf-8")
+        self.assertNotIn("private-cookie", persisted)
+        with self.subscription_worker():
+            restarted = self.manager()
+            self.assertEqual(self.finish(restarted, queued["id"])["status"], "succeeded")
+
+    def test_two_managers_do_not_execute_the_same_queued_subscription_twice(self):
+        self.script.write_text("import time\nprint('once')\ntime.sleep(0.15)\n", encoding="utf-8")
+        first, second = self.manager(), self.manager()
+        with self.subscription_worker():
+            _, row = first.start({"discovery_id": "anime:one"})
+            _, row2 = second.start({"discovery_id": "anime:two"})
+            self.finish(second, row2["id"])
+            self.assertEqual(self.finish(first, row["id"])["logs"], [{"cursor": 1, "text": "once"}])
+            self.assertEqual(second.get(row2["id"])["logs"], [{"cursor": 1, "text": "once"}])
+
+    def test_simultaneous_managers_enqueue_one_record_for_the_same_subscription(self):
+        first, second = self.manager(), self.manager()
+        writing, other_refreshed = threading.Event(), threading.Event()
+        original_persist, original_refresh = first._persist, second._refresh_other_runs
+
+        def delayed_persist(record):
+            writing.set()
+            self.assertTrue(other_refreshed.wait(timeout=3))
+            original_persist(record)
+
+        def refreshed():
+            original_refresh()
+            other_refreshed.set()
+
+        with patch.object(first, "_persist", side_effect=delayed_persist), \
+                patch.object(second, "_refresh_other_runs", side_effect=refreshed), \
+                patch.object(first, "_ensure_queue_worker"), patch.object(second, "_ensure_queue_worker"), \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            one = pool.submit(first.start, {"discovery_id": "anime:same"})
+            self.assertTrue(writing.wait(timeout=3))
+            two = pool.submit(second.start, {"discovery_id": "anime:same"})
+            accepted_one, row_one = one.result(timeout=5)
+            accepted_two, row_two = two.result(timeout=5)
+        self.assertTrue(accepted_one and accepted_two)
+        self.assertEqual(row_one["id"], row_two["id"])
+        self.assertEqual(len(list(first.directory.glob("*.json"))), 1)
+
+    def test_queue_write_failure_does_not_leave_a_dead_subscription_or_hold_the_gate(self):
+        manager, other = self.manager(), self.manager()
+        with patch.object(manager, "_persist", side_effect=OSError("private-password")):
+            with self.assertRaises(OSError):
+                manager.start({"discovery_id": "anime:retry"})
+        self.assertEqual(manager.list(), [])
+        self.assertEqual(list(manager.directory.glob("*.json")), [])
+        with self.subscription_worker():
+            accepted, row = other.start({"discovery_id": "anime:retry"})
+            self.assertTrue(accepted)
+            self.assertEqual(self.finish(other, row["id"])["status"], "succeeded")
+
+    def test_queue_thread_start_failure_is_reported_and_can_be_retried(self):
+        manager, other = self.manager(), self.manager()
+        with patch("run_manager.threading.Thread.start", side_effect=RuntimeError("private-password")):
+            with self.assertRaises(RuntimeError):
+                manager.start({"discovery_id": "anime:retry"})
+        failed = other.list()[0]
+        self.assertEqual(failed["status"], "failed")
+        self.assertIsNotNone(failed["finished_at"])
+        self.assertNotIn("private-password", json.dumps(failed))
+        self.assertNotIn("payload", json.loads((manager.directory / (failed["id"] + ".json")).read_text(encoding="utf-8")))
+        with self.subscription_worker():
+            accepted, row = other.start({"discovery_id": "anime:retry"})
+            self.assertTrue(accepted)
+            self.assertEqual(self.finish(other, row["id"])["status"], "succeeded")
+
     def test_real_subprocess_progress_incremental_output_and_secret_redaction(self):
         self.script.write_text(
             "import json, os, sys, time\n"
@@ -330,7 +471,7 @@ class DiscoveryWorkerTests(RunFixture):
         failure = {"success": False, "error": "查询暂未完成", "source_errors": [{"source": "Google", "message": "需要人工验证"}],
                    "queries": ["测试作品 02"]}
         code, tasks, run, _, output = self.execute(failure)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 75)
         self.assertEqual(tasks, [])
         run.assert_not_called()
         self.assertIn("Google", output)

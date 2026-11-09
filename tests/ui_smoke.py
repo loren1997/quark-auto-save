@@ -73,13 +73,15 @@ def main():
                       stage="search", source="站内搜索 Meijusou", query="测试动漫 第2集",
                       created_at="2026-11-10T01:00:00+08:00", started_at="2026-11-10T01:00:00+08:00",
                       finished_at=None, error="", exit_code=None, discovery_id=payload.get("discovery_id", ""))
+        if "discovery_id" in payload and any(row["status"] == "running" for row in records):
+            record.update(status="queued", started_at=None)
         records.insert(0, record)
         return jsonify(success=True, data=record), 202
 
     def fake_detail(run_id):
         record = next(record for record in records if record["id"] == run_id)
         lines = ["正在查询站内来源", "正在验证候选分享中的第 2 集"]
-        if record["status"] == "failed":
+        if record["status"] in {"failed", "waiting"}:
             lines.append("网页搜索：请求超时；未找到可验证的视频资源，订阅未创建")
         elif record["status"] == "succeeded":
             lines.append("测试转存完成，Aria2 已接收下载任务")
@@ -98,7 +100,7 @@ def main():
             with web.app.app_context():
                 response = web.subscribe_discovery_payload({"id": payload["discovery_id"]})
                 data = (response[0] if isinstance(response, tuple) else response).get_json()
-            record.update(status="succeeded" if data["success"] else "failed", error=data.get("message", "") if not data["success"] else "")
+            record.update(status="succeeded" if data["success"] else "waiting" if data.get("pending") else "failed", error=data.get("message", "") if not data["success"] else "")
         else:
             record["status"] = "succeeded"
         record.update(finished_at="2026-11-10T01:01:00+08:00", exit_code=0 if record["status"] == "succeeded" else 1)
@@ -245,6 +247,27 @@ def main():
                 page.locator('[data-target="#collapse_0"]').click()
                 page.locator('input[name="taskname[]"]').first.fill("测试搜索")
                 page.get_by_text("PanSou: 搜索源暂时不可用", exact=True).wait_for()
+                # A running subscription must not disable other calendar cards.
+                page.reload()
+                page.locator("a.nav-link").filter(has_text="运行日志").click()
+                page.get_by_role("button", name="取消查找", exact=True).click()
+                page.wait_for_function("!app.pendingSubscriptions.length")
+                page.locator("a.nav-link").filter(has_text="热门追更").click()
+                page.get_by_role("button", name="国漫", exact=True).click()
+                page.get_by_role("button", name="周一", exact=True).click()
+                page.get_by_role("button", name="一键订阅并转存").click()
+                page.wait_for_function("app.backgroundRun && !app.runRequestPending")
+                page.get_by_role("button", name="动漫", exact=True).click()
+                page.get_by_role("button", name="周三", exact=True).click()
+                page.get_by_role("button", name="加入订阅队列", exact=True).click()
+                page.wait_for_function("app.queuedRuns.length === 1 && !app.runRequestPending")
+                page.get_by_role("button", name="排队中", exact=True).wait_for()
+                assert page.get_by_role("button", name="排队中", exact=True).is_disabled()
+                page.locator("a.nav-link").filter(has_text="运行日志").click()
+                page.get_by_role("heading", name="订阅队列（1）", exact=True).wait_for()
+                page.reload()
+                page.locator("a.nav-link").filter(has_text="运行日志").click()
+                page.get_by_role("heading", name="订阅队列（1）", exact=True).wait_for()
                 assert not errors, errors
                 browser.close()
             print("UI smoke passed: login, donghua/source groups, seven days, subscribe/run, dedup, mobile, background log, reload/reconnect/history/errors, enable existing Aria2 download/save/refresh/run, contextual search errors; no JS errors")

@@ -135,6 +135,29 @@ class WebSearchTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(SearchError):
                 _search_results("Meijusou", body, "https://meijusou.com/search")
 
+    def test_meijusou_live_empty_page_is_not_a_format_error(self):
+        html = '''<title>搜索「长片名」 · 美剧搜</title><h1>搜索资源</h1>
+            <h2>没有找到相关帖子</h2><p>没有帖子包含「长片名」。试试更短的关键词，或者回首页浏览全部帖子。</p>
+            <aside><a class="truncate" href="/post/other">其他热门资源</a></aside>'''
+        self.assertEqual(_search_results("Meijusou", html, "https://meijusou.com/search?q=long"), [])
+        with self.assertRaises(SearchError):
+            _search_results("Meijusou", '<div id="cf-chl-widget">验证</div>' + html,
+                            "https://meijusou.com/search?q=long")
+
+    @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
+    def test_meijusou_empty_long_title_does_not_disable_alias_query(self, validate):
+        def fetch(url, deadline):
+            if "q=%E9%95%BF%E7%89%87%E5%90%8D" in url:
+                return '<h2>没有找到相关帖子</h2><p>没有帖子包含「长片名」。试试更短的关键词。</p>', url
+            if "/search?" in url:
+                return '<a class="line-clamp-2" href="/post/site">短别名</a>', url
+            return f'<title>短别名</title><p>{URL}</p>', url
+        self.client._fetch = Mock(side_effect=fetch)
+        failed = {"DuckDuckGo", "Bing", "Google", "Sogou"}
+        self.assertEqual(self.client.search("长片名", failed_engines=failed), [])
+        self.assertNotIn("Meijusou", failed)
+        self.assertEqual(self.client.search("短别名", failed_engines=failed)[0]["shareurl"], URL)
+
     @patch("app.sdk.websearch.report_progress")
     @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
     def test_meijusou_public_query_finds_share_when_general_searches_fail(self, validate, progress):

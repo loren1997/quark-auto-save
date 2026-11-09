@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from html import unescape
 from html.parser import HTMLParser
 import ipaddress
+from itertools import zip_longest
 import os
 import re
 import socket
@@ -21,6 +22,7 @@ from urllib3.exceptions import HTTPError as TransportError, NewConnectionError, 
 from urllib3.util.connection import create_connection
 
 from .common import SearchError, extract_share_urls, normalize_share_url
+from .channel_search import channel_queries, channel_results
 from run_progress import report_progress
 
 
@@ -224,7 +226,7 @@ def _search_results(engine, body, url):
                     and not parts.fragment and item["text"] and link not in seen):
                 seen.add(link)
                 results.append({"title": item["text"], "url": link, "snippet": ""})
-        if not results and not re.search(r"\b0\s*条结果", " ".join(page.text)):
+        if not results and not re.search(r"\b0\s*条结果|没有找到相关帖子", " ".join(page.text)):
             raise SearchError("美剧搜页面格式已改变或需要验证")
         return results[:10]
     if engine == "Bing":
@@ -358,14 +360,16 @@ class WebSearch:
                         or isinstance(cause, requests.exceptions.SSLError)):
                     raise
 
-    def search(self, query, refresh=False, failed_engines=None):
+    def search(self, query, refresh=False, failed_engines=None, channel_config=None, include_engines=True):
         self.errors = []
         failed_engines = failed_engines if failed_engines is not None else set()
         if not isinstance(query, str) or not query.strip() or len(query) > 200:
             raise SearchError("网页搜索词必须是 1 至 200 字的文本")
         query = query.strip()
+        channels = channel_queries(channel_config, query) if channel_config is not None else []
+        cache_key = (query, tuple(name for name, _url in channels), include_engines) if channel_config is not None else query
         with _cache_lock:
-            cached = _cache.get(query)
+            cached = _cache.get(cache_key)
             if not refresh and cached and time.monotonic() - cached[0] < 300:
                 self.errors = list(cached[2])
                 return [dict(item) for item in cached[1]]
@@ -376,11 +380,14 @@ class WebSearch:
                    ("Bing", "https://cn.bing.com/search?format=rss&mkt=zh-CN&" + params),
                    ("Google", "https://www.google.com/search?gbv=1&num=10&" + params),
                    ("Sogou", "https://www.sogou.com/web?" + urlencode({"query": query + " 夸克"}))]
+        engines = [job for pair in zip_longest(engines if include_engines else [], channels) for job in pair if job]
 
         def search_engine(engine, url):
             report_progress("search", source=f"网页搜索 {engine}", query=query)
             fetch = self._fetch_with_retry if engine == "Meijusou" else self._fetch
             body, final_url = fetch(url, deadline)
+            if engine.startswith(("Telegram @", "腾讯频道 ")):
+                return channel_results(engine, body, final_url, query)
             return _search_results(engine, body, final_url)
 
         candidates, succeeded = [], 0
@@ -431,7 +438,7 @@ class WebSearch:
             for item, future in jobs:
                 try:
                     body, final_url = future.result()
-                    if re.search(r"challenge-form|cf-chl-|verify you are human|访问过于频繁", body, re.I):
+                    if re.search(r"challenge-form|cf-chl-|verify you are human|EO_Bot_Ssid|__tst_status|访问过于频繁", body, re.I):
                         raise SearchError("落地页要求人工验证")
                     page = _Page(body)
                     title = "".join(page.title).strip() or item["title"]
@@ -454,13 +461,15 @@ class WebSearch:
                 if output or not self.errors:
                     if len(_cache) >= 32:
                         _cache.pop(next(iter(_cache)))
-                    _cache[query] = (time.monotonic(), output, list(self.errors))
+                    _cache[cache_key] = (time.monotonic(), output, list(self.errors))
                 else:
-                    _cache.pop(query, None)
+                    _cache.pop(cache_key, None)
         return [dict(item) for item in output]
 
     @staticmethod
     def _entry(item, url, title, content, page_url):
+        page_url = item.get("page_url") or page_url
         return {"taskname": title, "shareurl": url, "content": content, "datetime": "",
-                "source": "网页搜索", "channel": f"{item['engine']} · {urlsplit(page_url).hostname}",
+                "source": "频道索引" if item["engine"].startswith(("Telegram @", "腾讯频道 ")) else "网页搜索",
+                "channel": f"{item['engine']} · {urlsplit(page_url).hostname}",
                 "page_url": page_url}
