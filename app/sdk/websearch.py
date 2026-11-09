@@ -143,6 +143,47 @@ class _Page(HTMLParser):
         self.text.append(text)
 
 
+class _GooglePage(_Page):
+    def __init__(self, body):
+        self.results = []
+        self._result = None
+        self._depth = 0
+        self._heading = False
+        super().__init__(body)
+
+    def handle_starttag(self, tag, attrs):
+        super().handle_starttag(tag, attrs)
+        if self._skip:
+            return
+        if tag == "div":
+            self._depth += 1
+            classes = dict(attrs).get("class", "").split()
+            if self._result is None and {"MjjYud", "g", "Gx5Zad", "ezO2md"}.intersection(classes):
+                self._result = (self._depth, len(self.links), len(self.text))
+        if tag == "h3" and self._anchor is not None:
+            self._heading = True
+            self._anchor["heading"] = []
+
+    def handle_data(self, text):
+        super().handle_data(text)
+        if not self._skip and self._heading and self._anchor is not None and "heading" in self._anchor:
+            self._anchor["heading"].append(text)
+
+    def handle_endtag(self, tag):
+        super().handle_endtag(tag)
+        if tag == "h3":
+            self._heading = False
+        if tag == "div" and not self._skip:
+            if self._result and self._depth == self._result[0]:
+                _, start_link, start_text = self._result
+                headings = [link for link in self.links[start_link:] if link.get("heading")]
+                # 多条结果共用的外层容器不能把其他作品的分享链接混进摘要。
+                if len(headings) == 1:
+                    self.results.append({**headings[0], "snippet": " ".join(self.text[start_text:])})
+                self._result = None
+            self._depth -= 1
+
+
 def _relevant(query, text):
     query = re.sub(r"第[一二三四五六七八九十百\d]+季|\bS\d+\b|\b(?:19|20)\d{2}\b", " ", query, flags=re.I)
     terms = [part.casefold() for part in re.split(r"[\W_]+", query) if part]
@@ -171,6 +212,25 @@ def _search_results(engine, body, url):
             raise SearchError("Bing RSS 格式已改变")
         return [{"title": item.findtext("title", ""), "url": item.findtext("link", ""),
                  "snippet": item.findtext("description", "")} for item in root.findall("./channel/item")[:10]]
+    if engine == "Google":
+        if (urlsplit(url).hostname == "consent.google.com"
+                or re.search(r"captcha-form|g-recaptcha|unusual traffic|verify you are human|/sorry/|Before you continue to Google", body, re.I)):
+            raise SearchError("Google 要求人工验证或同意页面，请稍后重试")
+        page = _GooglePage(body)
+        results, seen = [], set()
+        for item in page.results + [link for link in page.links if link.get("heading")]:
+            link = urljoin(url, item["url"])
+            parts = urlsplit(link)
+            if parts.hostname == "google.com" or (parts.hostname or "").endswith(".google.com"):
+                link = ((parse_qs(parts.query).get("q") or parse_qs(parts.query).get("url") or [""])[0]
+                        if parts.path == "/url" else "")
+            if link and link not in seen:
+                seen.add(link)
+                results.append({"title": "".join(item["heading"]).strip(), "url": link,
+                                "snippet": item.get("snippet", "")})
+        if not results and not re.search(r"did not match any documents|No results found|找不到和|没有找到", " ".join(page.text), re.I):
+            raise SearchError("Google 页面格式已改变或要求启用 JavaScript/人工验证")
+        return results[:10]
     if re.search(r"anomaly\.js|challenge-form|anomaly-modal|unusual traffic|verify you are human", body, re.I):
         raise SearchError("DuckDuckGo 要求人工验证，请稍后重试")
     page = _Page(body)
@@ -265,7 +325,8 @@ class WebSearch:
         deadline = time.monotonic() + 32
         params = urlencode({"q": query + " 夸克"})
         engines = [("DuckDuckGo", "https://html.duckduckgo.com/html/?" + params),
-                   ("Bing", "https://cn.bing.com/search?format=rss&mkt=zh-CN&" + params)]
+                   ("Bing", "https://cn.bing.com/search?format=rss&mkt=zh-CN&" + params),
+                   ("Google", "https://www.google.com/search?gbv=1&num=10&" + params)]
 
         def search_engine(engine, url):
             body, final_url = self._fetch(url, deadline)
@@ -300,8 +361,14 @@ class WebSearch:
             if item["url"] not in seen and urlsplit(item["url"]).hostname != "pan.quark.cn":
                 seen.add(item["url"])
                 pages.append(item)
+        first_pages = {}
+        for item in pages:
+            first_pages.setdefault(item["engine"], item)
+        # 每个引擎先检查一个落地页，避免前一个引擎占满全部读取额度。
+        selected_pages = list(first_pages.values())
+        selected_pages.extend(item for item in pages if item not in selected_pages)
         with ThreadPoolExecutor(max_workers=2) as executor:
-            jobs = [(item, executor.submit(self._fetch, item["url"], deadline)) for item in pages[:4]]
+            jobs = [(item, executor.submit(self._fetch, item["url"], deadline)) for item in selected_pages[:4]]
             for item, future in jobs:
                 try:
                     body, final_url = future.result()

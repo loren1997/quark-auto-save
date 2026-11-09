@@ -6,7 +6,7 @@
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.5 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.5) 中的 `quark-auto-save-nas-docker-v3.5.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.6 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.6) 中的 `quark-auto-save-nas-docker-v3.6.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -66,9 +66,13 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 在任务名称中输入资源名，或点击名称旁的搜索按钮。PanSou 兼容新版原生接口和公共代理接口；支持提取码。可填写多个 PanSou 聚合地址，每行一个；主源、聚合源与启用的 CloudSaver 会一起查询、去重，并标注来源。单个源失败不影响其他源的结果，全部失败时明确报错。频道和插件筛选留空时使用 PanSou 服务已启用的全部渠道，也可填写逗号分隔的名称进行筛选。
 
+V3.6 将找到的资源线索独立保存到 `config/quark_config.resources.json`，仅保存标题、别名和分享链接。删除订阅不会清除这些线索；重新一键订阅、自动换源和补集时，会尝试匹配的历史链接，并实时验证分享及实际视频，失效或不匹配时继续搜索其他来源。历史记录不代表链接永久有效，也不会使已删除的任务自行恢复。
+
+第 6 节的更新命令会自动读取安装目录下的当前配置与 `backup-v*/config/quark_config.json`，按修改时间最多检查 10 份配置，导入其中的资源线索。它只写入独立线索文件，不恢复订阅、Cookie 或其他旧设置；以后备份时保留整个 `config/` 即可。
+
 V3.5 在一次自动查找中会记住失败的索引来源，后续译名查询不再重复等待该来源；其他健康来源继续查询。下一次任务运行会重新尝试，不会修改或永久禁用搜索配置。日志保留首次超时等失败原因。
 
-搜索会从索引返回的结构化结果和公开帖子正文中提取夸克链接、就近关联提取码。“网页搜索”默认启用，通过 DuckDuckGo 和 Bing 查询公开网页，再读取有限数量的结果页面提取夸克链接。任务列表搜索会合并这些结果；自动订阅与失效换源在索引未找到可验证候选时再补搜网页。页面不执行脚本、不登录，也不绕过验证码；搜索引擎返回验证码或网络失败会明确报错。
+搜索会从索引返回的结构化结果和公开帖子正文中提取夸克链接、就近关联提取码。“网页搜索”默认启用，V3.6 通过 Google、DuckDuckGo 和 Bing 查询公开网页，再读取有限数量的结果页面提取夸克链接。任务列表搜索会合并这些结果；自动订阅与失效换源在历史线索和索引未找到可验证候选时再补搜网页。页面不执行脚本、不登录，也不绕过验证码；搜索引擎返回验证码或网络失败会明确报错。
 
 搜索结果摘要中的完整夸克链接同样进入候选验证；落地页 HTTP 403 等错误不会丢弃已经取得的候选。部分搜索源失败时继续使用其他来源的结果。错误导致的空结果不缓存为“没有资源”，再次操作会重新查询。
 
@@ -92,7 +96,9 @@ V3.5 在一次自动查找中会记住失败的索引来源，后续译名查询
 
 开启“删除子目录后重存”的任务不会自动换源，以免新来源触发已有删除规则。单任务可在 JSON 配置中设置 `auto_repair: false` 禁用换源。
 
-热门订阅运行时还会检查明确集号之间的缺口，例如 `01、03、04、05、05.mkv` 去重后缺第 2 集；从其他通过同作品、同季、已知年份验证的分享中仅补入缺号，再交给下载插件，保留原订阅继续追更。每轮只进行一次有界补搜，未补齐会打印剩余缺号并在下次运行重试。不会根据文件数量推断集数，也不猜测首集之前或最新集之后是否还缺集。
+热门订阅运行时还会检查明确集号之间的缺口，例如 `01、03、04、05、05.mkv` 去重后缺第 2 集；从其他通过同作品、同季、已知年份验证的分享中仅补入缺号，再交给下载插件，保留原订阅继续追更。V3.6 每轮最多使用 3 份不同候选分享，每次按剩余缺号继续查找；120 秒预算用于停止发起下一轮查询，已返回的候选仍会验证和转存。未补齐会打印剩余缺号并在下次运行重试。不会根据文件数量推断集数，也不猜测首集之前或最新集之后是否还缺集。
+
+资源标题只写片名、没有标注总集数或“全集”，也会检查分享目录内的实际视频。只有真实文件中包含缺号且符合当前转存规则才补入；例如缺第 2、4 集时，可分别从两份同作品分享补齐，不重复保存已有集数。备用分享失效不影响原订阅；补集文件改名失败会保留目标文件记录，下次按文件 ID、原名和保存路径核对后重试，成功改名再交下载插件。
 
 V3.5 补搜优先使用“片名 02”和可信中文别名等缺号查询，再搜索整季分享，索引还会尝试“片名 第2集”等写法；搜索多个缺号时先围绕最早缺号查询，同一分享内其他已缺集数也可一起补入。各关键词先检查少量新候选，再处理剩余候选，避免首个词的结果占满所有机会；补集索引最多检查 12 个、网页最多检查 8 个新候选。视频判定与正常转存共用扩展名白名单，不因接口分类标错漏掉视频。失败日志会列出实际查询词，以及已验证同作品但不含符合转存规则缺号视频的候选数量，便于区分搜索源故障与分享本身缺集。
 
@@ -140,24 +146,27 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.5：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.6：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.5/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.6/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.5-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.6-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"
 mv compose.yaml.next compose.yaml
+docker compose -p qas-maintained run --rm --no-deps --entrypoint python -v "$PWD:/history:ro" quark-auto-save scripts/recover_resource_history.py --root /history
 docker compose -p qas-maintained up -d
 docker compose -p qas-maintained ps
 )
 ```
+
+导入步骤以只读方式挂载安装目录，输出读取的配置份数和新增线索数，不需要手动粘贴旧分享链接。若旧任务已删除，当前配置及保留的备份中也没有该链接，就仍需由搜索渠道重新发现；导入不会恢复旧任务。
 
 更新后强制刷新浏览器页面。默认仍访问 `http://NAS局域网IP:5006`；如果 `.env` 改过 `QAS_PORT`，继续使用该端口。需要回退时停止维护版，将这次备份中的 `compose.yaml`、`.env` 和 `config/` 恢复到原位置后重新 `up -d`。
 
@@ -183,7 +192,7 @@ GitHub Actions 会先跑 Python 3.11/3.13 测试，再构建 amd64/arm64 镜像�
 - 无法搜索：查看页面源错误和 `docker compose logs --tail=100 pansou`；确认地址为 `http://pansou:8888`。公共 `https://so.252035.xyz` 可作备用，但没有稳定性保证。
 - 动漫源超时：页面会显示降级。如果你有自己的网络代理，可在 Compose 的服务 `environment` 中配置标准 `HTTPS_PROXY`，同时设置 `NO_PROXY: localhost,127.0.0.1,pansou`；不要关闭 TLS 校验。无需代理也能查看可达来源。
 - “未找到匹配的有效资源”：展开“查看搜索详情”区分来源故障与候选验证失败；已有有效分享时，可在热门页报错下粘贴该作品的夸克链接直接验证订阅。日历有片名不保证分享存在或可用。
-- 网页搜索会分别显示 Bing、DuckDuckGo 及落地页的 DNS、TLS、代理、验证码、超时等错误；只有真实代理故障才需要检查代理设置。NAS 能正常搜到候选而验证失败时，应核对实际文件名称和目录年份。
+- 网页搜索会分别显示 Google、DuckDuckGo、Bing 及落地页的 DNS、TLS、代理、验证码、超时等错误；只有真实代理故障才需要检查代理设置。NAS 能正常搜到候选而验证失败时，应核对实际文件名称和目录年份。
 - “配置已被更新”：任务自动换源或另一页面写入了新配置。刷新后重新编辑，避免把新订阅或修复结果覆盖掉。
 - 订阅已创建但没转存：查看手动运行日志、Cookie 是否有效、目标网盘空间；在任务列表运行该任务重试。
 - NAS 没有本地文件：先看网盘是否已转存，再检查 Aria2 的连接、密钥、容器目录映射和该任务 `auto_download` 选项。

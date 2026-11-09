@@ -225,6 +225,8 @@ def update():
         if payload.get("config_revision") and payload["config_revision"] != config_revision(current):
             return jsonify(success=False, message="配置已被任务或其他页面更新，请刷新后重新编辑，避免覆盖自动换源结果"), 409
         updated = deepcopy(current)
+        if "tasklist" in payload:
+            Config.remember_resources(Config.resource_history_path(CONFIG_PATH), current.get("tasklist", []))
         for key, value in payload.items():
             if key in allowed_keys:
                 updated[key] = value
@@ -311,10 +313,31 @@ def run_script_now():
 def get_task_suggestions():
     if not is_login():
         return jsonify({"success": False, "message": "未登录"})
-    return jsonify(search_resources(
-        request.args.get("q", ""), Config.read_json(CONFIG_PATH),
+    from urllib.parse import urlsplit
+
+    query = request.args.get("q", "")
+    result = search_resources(
+        query, Config.read_json(CONFIG_PATH),
         refresh=request.args.get("d") == "1",
-    ))
+    )
+    history = []
+    if query.strip() and len(query) <= 200:
+        for item in Config.resource_history(Config.resource_history_path(CONFIG_PATH)):
+            title = item.get("taskname", "")
+            link = normalize_share_url(item.get("shareurl", ""))
+            if link and resource_titles_match(query, title, allow_missing_year=True):
+                history.append({"taskname": title, "shareurl": link, "source": "历史资源（待验证）",
+                                "content": "本机保存的分享线索，使用前仍需验证有效性", "datetime": ""})
+    if not history:
+        return jsonify(result)
+    unique = {}
+    for item in result.get("data", []) + history:
+        parts = urlsplit(item["shareurl"])
+        key = (parts.path.rstrip("/"), parts.fragment)
+        previous = unique.get(key)
+        if previous is None or (not urlsplit(previous["shareurl"]).query and parts.query):
+            unique[key] = item
+    return jsonify({**result, "success": True, "data": list(unique.values())})
 
 
 @app.route("/api/discovery")
@@ -368,6 +391,7 @@ def subscribe_discovery():
     if aliases:
         task["search_aliases"] = aliases
     account = Quark(cookie)
+    account.resource_history_path = Config.resource_history_path(CONFIG_PATH)
     result = (account.verify_resource_link(task, shareurl) if shareurl is not None
               else account.find_valid_resource(task, current))
     if not result.get("success") or not result.get("candidate"):
@@ -383,6 +407,8 @@ def subscribe_discovery():
         "resource_id": entry["id"], "runweek": list(range(1, 8)),
         "addition": deepcopy(task_plugins_config_default),
     })
+    if result["candidate"].get("search_aliases"):
+        task["search_aliases"] = result["candidate"]["search_aliases"]
     apply_media_rename_defaults(task)
     task["addition"].setdefault("aria2", {})["save_path"] = base.strip("/")
     if auto_download:
@@ -394,6 +420,7 @@ def subscribe_discovery():
             return jsonify(success=True, existing=True, data=existing, message="已经订阅")
         config_data.setdefault("tasklist", []).append(task)
         Config.write_json(CONFIG_PATH, config_data)
+        Config.remember_resources(account.resource_history_path, [task])
     return jsonify(success=True, existing=False, data=task, message="订阅已保存，正在开始转存")
 
 
@@ -722,6 +749,7 @@ def init():
         # 读取配置
         config_data = Config.read_json(CONFIG_PATH)
         Config.breaking_change_update(config_data)
+        Config.remember_resources(Config.resource_history_path(CONFIG_PATH), config_data.get("tasklist", []))
         if not config_data.get("magic_regex"):
             config_data["magic_regex"] = MagicRename().magic_regex
 

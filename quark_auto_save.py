@@ -382,13 +382,66 @@ class Config:
                 else:
                     current[key] = deepcopy(after)
 
+    def resource_history_path(config_path):
+        return os.path.splitext(os.path.abspath(config_path))[0] + ".resources.json"
+
+    def resource_history(path):
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            data = Config.read_json(path)
+            return [item for item in data if isinstance(item, dict)][:256] if isinstance(data, list) else []
+        except (OSError, ValueError) as exc:
+            print(f"资源记录读取失败（{type(exc).__name__}），继续查询其他来源")
+            return []
+
+    def remember_resources(path, tasks):
+        """仅记录作品与分享线索；删除订阅不会删线索，使用前仍必须实时验证。"""
+        from app.sdk.common import normalize_share_url
+
+        if not path or not tasks:
+            return
+        try:
+            with Config.locked(path):
+                old = Config.resource_history(path)
+                records, seen, counts = [], set(), {}
+                for task in list(tasks) + old:
+                    if not isinstance(task, dict):
+                        continue
+                    title, link = task.get("taskname"), task.get("shareurl")
+                    if not isinstance(title, str) or not title.strip() or len(title) > 200:
+                        continue
+                    link = normalize_share_url(link) if isinstance(link, str) and len(link) <= 4096 else ""
+                    if not link:
+                        continue
+                    title = title.strip()
+                    key = (title.casefold(), link)
+                    if key in seen or counts.get(key[0], 0) >= 5:
+                        continue
+                    seen.add(key)
+                    counts[key[0]] = counts.get(key[0], 0) + 1
+                    record = {"taskname": title, "shareurl": link}
+                    aliases = task.get("search_aliases", [])
+                    if isinstance(aliases, list):
+                        aliases = list(dict.fromkeys(value.strip() for value in aliases
+                                                     if isinstance(value, str) and value.strip() and len(value) <= 200))[:8]
+                        if aliases:
+                            record["search_aliases"] = aliases
+                    records.append(record)
+                    if len(records) == 256:
+                        break
+                if records != old:
+                    Config.write_json(path, records)
+        except (OSError, ValueError) as exc:
+            print(f"资源记录保存失败（{type(exc).__name__}），本次转存与搜索继续")
+
     def merge_task_state(config_data, original, updated):
         matches = [task for task in config_data.get("tasklist", []) if all(
             task.get(key) == original.get(key) for key in ("taskname", "shareurl", "savepath")
         )]
         if len(matches) != 1:
             return False
-        fields = ("shareurl", "shareurl_ban", "startfid", "repair_history", "addition", "pattern", "replace", "savepath", "rename_pending", "aria2_pending", "aria2_pending_dirs")
+        fields = ("shareurl", "shareurl_ban", "startfid", "repair_history", "search_aliases", "addition", "pattern", "replace", "savepath", "rename_pending", "aria2_pending", "aria2_pending_dirs")
         Config._merge_changes(matches[0], {key: original[key] for key in fields if key in original},
                              {key: updated[key] for key in fields if key in updated})
         return True
@@ -786,6 +839,7 @@ class Quark:
 
     def __init__(self, cookie="", index=0):
         self.cookie = cookie.strip()
+        self.resource_history_path = None
         self.index = index + 1
         self.is_active = False
         self.nickname = ""
@@ -1311,7 +1365,7 @@ class Quark:
             max_checked=1, verify_index_title=False,
         )
 
-    def find_valid_resource(self, task, config, required_episodes=None):
+    def find_valid_resource(self, task, config, required_episodes=None, exclude_candidates=None):
         from resource_search import search_resources, search_web_resources, search_error_reason
 
         title = task.get("taskname", "").strip()
@@ -1326,6 +1380,26 @@ class Quark:
             entry.get("from_id") for entry in task.get("repair_history", [])
             if isinstance(entry, dict)
         }
+        visited = set(exclude_candidates or ())
+        history = [item for item in Config.resource_history(self.resource_history_path)
+                   if resource_titles_match(title, item.get("taskname", ""), allow_missing_year=True, aliases=aliases)]
+        history_result = None
+        if history:
+            # 已保存的同名同季作品别名用于复验，避免目录服务暂时丢失别名时误拒旧分享。
+            for item in history:
+                names = item.get("search_aliases", [])
+                if isinstance(names, list):
+                    aliases.extend(value.strip() for value in names
+                                   if isinstance(value, str) and value.strip() and len(value) <= 200)
+            aliases = list(dict.fromkeys(aliases))[:8]
+            task = dict(task, search_aliases=aliases)
+            queries = _resource_search_queries(title, aliases)
+            history_result = self._find_verified_resource(
+                task, history, seen, aliases, visited=visited, required_episodes=required_episodes,
+            )
+            if history_result["success"]:
+                print("已从本地资源记录重新验证到可用分享")
+                return history_result
         attempted, source_errors = [], []
         failed_sources = set()
         index_deadline = time.monotonic() + 60
@@ -1411,7 +1485,7 @@ class Quark:
             queries = list(dict.fromkeys(focused + web_queries
                                         + [f"{word} 第{episode}集" for word in web_queries] + queries))
             web_queries = list(dict.fromkeys(focused + web_queries))
-        failures, visited = [], set()
+        failures = [history_result] if history_result else []
         for web, words in ((False, queries), (True, web_queries)):
             try:
                 result = self._find_verified_resource(task, search_candidates(words, web), seen, aliases,
@@ -1596,6 +1670,10 @@ class Quark:
                 combined = combined or bool(years and path_years == years and any(matched_videos) and consistent_videos)
                 if not exact and not combined:
                     continue
+                history_url = (urllib.parse.urlunsplit(parsed._replace(fragment=f"/list/share/{selected_fid}"))
+                               if selected_fid else shareurl)
+                Config.remember_resources(self.resource_history_path, [{"taskname": title, "shareurl": history_url,
+                                                                       "search_aliases": aliases}])
                 episode_fids = None
                 if required_episodes is not None:
                     episode_fids = _episode_repair_files(task, video_files, required_episodes)
@@ -1609,6 +1687,7 @@ class Quark:
                 return {"success": True, "candidate": {
                     **candidate, "shareurl": shareurl, "pwd_id": pwd_id, "passcode": passcode,
                     "pdir_fid": pdir_fid, "stoken": stoken,
+                    "search_aliases": aliases,
                     **({"episode_fids": episode_fids} if episode_fids is not None else {}),
                 }, "error": ""}
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
@@ -1652,7 +1731,8 @@ class Quark:
                 or task.get("shareurl_ban") or tree.root is None):
             return
         mr = MagicRename(CONFIG_DATA.get("magic_regex", {}))
-        _, replace = mr.magic_regex_conv(task.get("pattern", ""), task.get("replace", ""))
+        mr.set_taskname(task["taskname"])
+        pattern, replace = mr.magic_regex_conv(task.get("pattern", ""), task.get("replace", ""))
         if (task.get("startfid") or task.get("update_subdir_resave_mode")
                 or re.search(r"\{I+\}", replace) or _resource_episode_number(task, "01.mkv") is None):
             print("缺集检查已跳过：订阅边界、重新编号或季数无法安全确认")
@@ -1667,6 +1747,20 @@ class Quark:
             if response.get("code") != 0 or not isinstance(files, list):
                 print("缺集检查暂不可用：无法读取保存目录，下次运行重试")
                 return
+            tree_fids = {str(node.data.get("fid")) for node in tree.all_nodes() if node.data}
+            for item in files:
+                fid = str(item.get("fid"))
+                pending = task.get("rename_pending", {}).get(fid, {})
+                if (fid not in tree_fids and is_media_file(item)
+                        and pending.get("original") == item.get("file_name") and pending.get("path") == savepath
+                        and (not is_video_file(item) or re.search(pattern, item["file_name"]))):
+                    # 补集文件可能不在主分享中，仅凭已记录的目标文件身份恢复改名和下载。
+                    renamed = mr.media_name(pattern, replace, item["file_name"])
+                    tree.create_node(self._get_file_icon(item) + renamed, f"episode-repair:pending:{fid}",
+                                     parent=tree.root, data={"file_name": item["file_name"], "file_name_re": renamed,
+                                                           "fid": fid, "path": f"{savepath}/{item['file_name']}",
+                                                           "is_dir": False, "obj_category": item.get("obj_category", "")})
+                    tree_fids.add(fid)
             shared_path = savepath == "/cartoon" or sum(
                 other.get("savepath", "").rstrip("/") == savepath.rstrip("/")
                 for other in CONFIG_DATA.get("tasklist", [])
@@ -1703,34 +1797,63 @@ class Quark:
             if not missing:
                 return
             print(f"🔎《{task['taskname']}》检测到中间缺集 {sorted(missing)[:20]}，查找其他同作品同季分享")
-            result = self.find_valid_resource(task, CONFIG_DATA, required_episodes=missing)
-            if not result["success"]:
-                print(f"补集未完成：{result['error']}；原订阅和已有文件保留")
-                if result.get("queries"):
-                    print("补集已查询关键词：" + "、".join(result["queries"]))
-                if result.get("missing_in_candidates"):
-                    print(f"已验证 {result['missing_in_candidates']} 个同作品候选，但其中没有符合转存规则的缺失集视频")
-                return
-            candidate = result["candidate"]
-            supplement = self.dir_check_and_save(
-                dict(task), candidate["pwd_id"], candidate["stoken"], candidate["pdir_fid"],
-                allowed_episode_fids=candidate["episode_fids"],
-            )
-            saved = set()
-            for node in supplement.all_nodes():
-                if node.identifier == supplement.root or not node.data or node.data.get("is_dir"):
-                    continue
-                episode = _resource_episode_number(task, node.data.get("file_name", ""))
-                if episode in missing or (is_media_file(node.data) and not is_video_file(node.data)):
-                    tree.create_node(node.tag, f"episode-repair:{candidate['pwd_id']}:{node.identifier}",
-                                     parent=tree.root, data=node.data)
-                    if episode in missing:
-                        saved.add(episode)
-            if saved:
-                print(f"补集转存成功：{sorted(saved)}；保留原订阅继续追更")
-            remaining = missing - saved
+            remaining, attempted = set(missing), set()
+            deadline = time.monotonic() + 120
+            for _ in range(3):
+                if not remaining or time.monotonic() >= deadline:
+                    break
+                result = self.find_valid_resource(
+                    task, CONFIG_DATA, required_episodes=set(remaining),
+                    exclude_candidates=set(attempted),
+                )
+                if not result["success"]:
+                    print(f"补集未完成：{result['error']}；原订阅和已有文件保留")
+                    if result.get("queries"):
+                        print("补集已查询关键词：" + "、".join(result["queries"]))
+                    if result.get("missing_in_candidates"):
+                        print(f"已验证 {result['missing_in_candidates']} 个同作品候选，但其中没有符合转存规则的缺失集视频")
+                    break
+                candidate = result["candidate"]
+                candidate_aliases = candidate.get("search_aliases", [])
+                if isinstance(candidate_aliases, list):
+                    aliases = task.get("search_aliases", [])
+                    aliases = aliases if isinstance(aliases, list) else []
+                    aliases = list(dict.fromkeys(value.strip() for value in aliases + candidate_aliases
+                                                if isinstance(value, str) and value.strip() and len(value) <= 200))[:8]
+                    if aliases:
+                        task["search_aliases"] = aliases
+                identity = (candidate["pwd_id"], candidate["pdir_fid"], candidate.get("passcode", ""))
+                if identity in attempted:
+                    break
+                attempted.add(identity)
+                if candidate.get("shareurl"):
+                    pwd_id, passcode, pdir_fid, _ = self.extract_url(candidate["shareurl"])
+                    attempted.add((pwd_id, pdir_fid, passcode))
+                supplement_task = dict(task)
+                try:
+                    supplement = self.dir_check_and_save(
+                        supplement_task, candidate["pwd_id"], candidate["stoken"], candidate["pdir_fid"],
+                        allowed_episode_fids=candidate["episode_fids"],
+                    )
+                finally:
+                    # 备用分享失效不能封禁主订阅；已保存文件的待更名状态仍须持久化。
+                    if supplement_task.get("rename_pending"):
+                        task.setdefault("rename_pending", {}).update(supplement_task["rename_pending"])
+                saved = set()
+                for node in supplement.all_nodes():
+                    if node.identifier == supplement.root or not node.data or node.data.get("is_dir"):
+                        continue
+                    episode = _resource_episode_number(task, node.data.get("file_name", ""))
+                    if episode in remaining or (is_media_file(node.data) and not is_video_file(node.data)):
+                        tree.create_node(node.tag, f"episode-repair:{candidate['pwd_id']}:{node.identifier}",
+                                         parent=tree.root, data=node.data)
+                        if episode in remaining:
+                            saved.add(episode)
+                if saved:
+                    print(f"补集转存成功：{sorted(saved)}；保留原订阅继续追更")
+                remaining -= saved
             if remaining:
-                print(f"仍有中间缺集 {sorted(remaining)[:20]}；本次补搜结束，下次运行再检查")
+                print(f"仍有中间缺集 {sorted(remaining)[:20]}；本轮补搜结束，下次运行继续自动查找")
         except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
             print(f"补集暂未完成（{type(exc).__name__}）；保留原订阅和已有文件")
 
@@ -2216,6 +2339,11 @@ def main():
         print("❌ cookie 未配置")
         return
     accounts = [Quark(cookie, index) for index, cookie in enumerate(cookies)]
+    if cookie_form_file:
+        history_path = Config.resource_history_path(config_path)
+        Config.remember_resources(history_path, CONFIG_DATA.get("tasklist", []))
+        for account in accounts:
+            account.resource_history_path = history_path
     # 签到
     print(f"===============签到任务===============")
     if tasklist_from_env:

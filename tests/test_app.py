@@ -41,6 +41,7 @@ class AppIntegrationTests(unittest.TestCase):
         self.reload = self.patch("reload_tasks", return_value=True)
         self.get_calendar = self.patch("get_calendar", return_value=self.calendar)
         self.get_search_aliases = self.patch("get_search_aliases", return_value=[])
+        self.real_find = web.Quark.find_valid_resource
         find_patcher = patch.object(web.Quark, "find_valid_resource", return_value=self.candidate)
         self.find = find_patcher.start()
         self.addCleanup(find_patcher.stop)
@@ -145,6 +146,52 @@ class AppIntegrationTests(unittest.TestCase):
             response = self.client.get("/task_suggestions", query_string={"q": "测试动漫", "d": "1"})
         self.assertEqual(response.json, result)
         search.assert_called_once_with("测试动漫", self.config, refresh=True)
+
+    def test_manual_search_recovers_deleted_task_hints_when_sources_fail(self):
+        title = "测试动漫 第二季 (2024)"
+        self.config["tasklist"] = [{"taskname": title, "shareurl": "https://pan.quark.cn/s/old",
+                                    "cookie": "must-not-copy", "stoken": "private-token",
+                                    "addition": {"aria2": {"secret": "private-rpc"}}}]
+        self.write_config()
+        self.assertTrue(self.client.post("/update", json={"tasklist": []}).json["success"])
+        failure = {"success": False, "data": [], "errors": [{"source": "PanSou", "message": "连接超时"}],
+                   "message": "PanSou: 连接超时"}
+        with patch.object(web, "search_resources", return_value=failure) as search:
+            result = self.client.get("/task_suggestions", query_string={"q": title}).json
+        self.assertTrue(result["success"])
+        self.assertEqual(result["errors"], failure["errors"])
+        self.assertEqual(result["message"], failure["message"])
+        self.assertEqual(len(result["data"]), 1)
+        self.assertEqual(result["data"][0]["shareurl"], "https://pan.quark.cn/s/old")
+        self.assertEqual(result["data"][0]["source"], "历史资源（待验证）")
+        self.assertTrue(all(secret not in str(result) for secret in ("must-not-copy", "private-token", "private-rpc", "fake-cookie")))
+        self.assertEqual(self.saved_config()["tasklist"], [])
+        self.find.assert_not_called()
+        search.assert_called_once()
+
+    def test_manual_history_search_matches_work_season_and_year(self):
+        records = [{"taskname": name, "shareurl": f"https://pan.quark.cn/s/share{index}"}
+                   for index, name in enumerate(("测试动漫 第二季 (2024)", "测试动漫 第三季 (2024)",
+                                                 "测试动漫 第二季 (2025)", "其他动漫 第二季 (2024)"))]
+        web.Config.remember_resources(web.Config.resource_history_path(self.config_path), records)
+        with patch.object(web, "search_resources", return_value={"success": True, "data": [], "errors": [], "message": ""}):
+            result = self.client.get("/task_suggestions", query_string={"q": "测试动漫 S02 (2024)"}).json
+        self.assertEqual([item["shareurl"] for item in result["data"]], [records[0]["shareurl"]])
+
+    def test_manual_history_search_keeps_new_sources_and_deduplicates_with_passcode(self):
+        title = "测试动漫 第二季 (2024)"
+        web.Config.remember_resources(web.Config.resource_history_path(self.config_path), [
+            {"taskname": title, "shareurl": "https://pan.quark.cn/s/old?pwd=AB12"}])
+        fresh = {"success": True, "data": [
+            {"taskname": title, "shareurl": "https://pan.quark.cn/s/old", "source": "PanSou"},
+            {"taskname": title, "shareurl": "https://pan.quark.cn/s/new", "source": "网页搜索"}],
+            "errors": [], "message": ""}
+        with patch.object(web, "search_resources", return_value=fresh) as search:
+            result = self.client.get("/task_suggestions", query_string={"q": title, "d": "1"}).json
+        self.assertEqual([item["shareurl"] for item in result["data"]],
+                         ["https://pan.quark.cn/s/old?pwd=AB12", "https://pan.quark.cn/s/new"])
+        self.assertEqual(result["data"][1]["source"], "网页搜索")
+        search.assert_called_once_with(title, self.config, refresh=True)
 
     def test_discovery_returns_seven_days_and_source_errors(self):
         self.calendar["errors"] = [{"source": "tv", "message": "上游暂不可用"}]
@@ -267,6 +314,39 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertTrue(response.json["existing"])
         self.assertEqual(len(self.saved_config()["tasklist"]), 1)
         self.find.assert_not_called()
+
+    def test_delete_then_resubscribe_revalidates_remembered_share_without_search(self):
+        listing = {"code": 0, "data": {"list": [
+            {"fid": "episode", "file_name": "测试动漫 S02E01 (2024).mkv", "dir": False},
+        ]}}
+        with patch.object(web.Quark, "find_valid_resource", self.real_find), \
+                patch("resource_search.search_resources", return_value={"success": True, "data": [self.candidate["candidate"]]}) as search, \
+                patch("resource_search.search_web_resources", side_effect=AssertionError("不应依赖网页搜索")), \
+                patch.object(web.Quark, "get_stoken", return_value={"status": 200, "data": {"stoken": "private-token"}}) as token, \
+                patch.object(web.Quark, "get_detail", return_value=listing):
+            first = self.subscribe()
+            self.assertEqual(first.status_code, 200, first.json)
+            self.assertTrue(self.client.post("/update", json={"tasklist": []}).json["success"])
+            self.assertEqual(self.saved_config()["tasklist"], [])
+            search.side_effect = AssertionError("外部搜索源故障时仍需复验本地记录")
+            second = self.subscribe()
+            self.assertEqual(second.status_code, 200, second.json)
+            self.assertFalse(second.json["existing"])
+            self.assertEqual(second.json["data"]["shareurl"], first.json["data"]["shareurl"])
+            self.assertEqual(token.call_count, 2)
+            search.assert_called_once()
+        history = Path(web.Config.resource_history_path(self.config_path)).read_text(encoding="utf-8")
+        self.assertNotIn("private-token", history)
+        self.assertNotIn("fake-cookie", history)
+
+    def test_deleting_legacy_task_keeps_only_resource_hint_before_list_is_replaced(self):
+        old = {"taskname": "测试动漫 第二季 (2024)", "shareurl": "https://pan.quark.cn/s/old",
+               "savepath": "/cartoon", "cookie": "must-not-copy", "addition": {"aria2": {"secret": "private-rpc"}}}
+        self.config["tasklist"] = [old]
+        self.write_config()
+        self.assertTrue(self.client.post("/update", json={"tasklist": []}).json["success"])
+        records = web.Config.resource_history(web.Config.resource_history_path(self.config_path))
+        self.assertEqual(records, [{"taskname": old["taskname"], "shareurl": old["shareurl"]}])
 
     def test_same_show_from_another_catalog_is_already_subscribed(self):
         for resource_id in ("tvmaze:99", None):

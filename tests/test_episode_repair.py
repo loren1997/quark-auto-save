@@ -1,6 +1,8 @@
 import contextlib
 import copy
 import io
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -285,14 +287,199 @@ class EpisodeRepairTests(unittest.TestCase):
         result = {"success": True, "candidate": {"pwd_id": "other", "stoken": "token", "pdir_fid": "", "episode_fids": {"four": 4}}}
         tree = self.tree()
         with patch.object(self.account, "ls_dir", return_value=target), \
-                patch.object(self.account, "find_valid_resource", return_value=result) as search, \
+                patch.object(self.account, "find_valid_resource", side_effect=[result, {"success": False, "error": "未找到"}]) as search, \
                 patch.object(self.account, "dir_check_and_save", return_value=supplemental):
             self.account.repair_episode_gaps(self.task, tree)
-        self.assertEqual(search.call_args.kwargs["required_episodes"], {4, 6})
+        self.assertEqual([call.kwargs["required_episodes"] for call in search.call_args_list], [{4, 6}, {6}])
         self.assertEqual(tree.size(), 2)
         self.assertEqual(tree.children(tree.root)[0].data["fid"], "saved-four")
         self.assertIn("仍有中间缺集 [6]", self.output.getvalue())
         self.assertEqual(self.task["shareurl"], "https://pan.quark.cn/s/original")
+
+    def test_title_only_shares_combine_missing_files_and_reach_download_plugin(self):
+        existing = [video(f"Black Summoner {episode:02d}.mkv") for episode in (1, 3, 5)]
+        original = copy.deepcopy(existing)
+        sources = {"two": [video("Black Summoner 02.mkv", "second"), video("01.mkv")],
+                   "four": [video("Black Summoner 04.mkv", "fourth"), video("03.mkv")]}
+        def detail(share, *_args, **_kwargs):
+            return {"code": 0, "data": {"share": {"title": "黑色召唤师 (2022)"},
+                    "list": copy.deepcopy(original if share == "original" else sources[share])}}
+        def save(fids, _tokens, _destination, share, _stoken):
+            self.assertEqual(fids, [sources[share][0]["fid"]])
+            existing.append({**sources[share][0], "fid": "saved-" + share})
+            return {"code": 0, "data": {"task_id": share}}
+        with patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                patch.object(self.account, "get_detail", side_effect=detail), \
+                patch.object(self.account, "ls_dir", side_effect=lambda *_a, **_k: {"code": 0, "data": {"list": copy.deepcopy(existing)}}), \
+                patch.object(self.account, "save_file", side_effect=save) as saving, \
+                patch.object(self.account, "query_task", side_effect=lambda share: {"code": 0, "data": {
+                    "save_as": {"save_as_top_fids": ["saved-" + share]}}}), \
+                patch("resource_search.search_resources", return_value={"success": True, "data": [
+                    self.candidate("two"), self.candidate("four")]}) as search:
+            tree = self.account.do_save_task(self.task)
+            self.assertEqual(tree.size(), 3)
+            self.assertEqual({node.data["fid"] for node in tree.children(tree.root)}, {"saved-two", "saved-four"})
+            self.assertFalse(self.account.do_save_task(self.task))
+        self.assertEqual(saving.call_count, 2)
+        self.assertEqual(search.call_count, 2)
+        self.assertEqual(self.task["shareurl"], "https://pan.quark.cn/s/original")
+        plugin = Mock(spec=["is_active", "run"])
+        plugin.is_active, plugin.run.return_value = True, None
+        self.account.nickname = "test"
+        with patch.object(qas.Config, "load_plugins", return_value=({"aria2": plugin}, {}, {"aria2": {"auto_download": True}})), \
+                patch.object(self.account, "update_savepath_fid"), patch.object(self.account, "do_save_task", return_value=tree):
+            qas.do_save(self.account, [self.task])
+        plugin.run.assert_called_once()
+        received = plugin.run.call_args.kwargs["tree"]
+        self.assertEqual({node.data["fid"] for node in received.children(received.root)}, {"saved-two", "saved-four"})
+
+    def test_history_alias_survives_gap_file_revalidation_and_next_run(self):
+        self.task.pop("search_aliases")
+        existing = [video(f"黒の召喚士 {episode:02d}.mkv") for episode in (1, 3)]
+        missing = video("Black Summoner 02.mkv", "second")
+        detail = {"code": 0, "data": {"share": {"title": "Black Summoner (2022)"}, "list": [missing]}}
+
+        def save(fids, *_args):
+            self.assertEqual(fids, ["second"])
+            existing.append({**missing, "fid": "saved-second"})
+            return {"code": 0, "data": {"task_id": "save"}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.account.resource_history_path = str(Path(directory) / "history.json")
+            qas.Config.remember_resources(self.account.resource_history_path, [{
+                "taskname": self.task["taskname"], "shareurl": "https://pan.quark.cn/s/history",
+                "search_aliases": ["Black Summoner"],
+            }])
+            with patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}) as token, \
+                    patch.object(self.account, "get_detail", return_value=detail), \
+                    patch.object(self.account, "ls_dir", side_effect=lambda *_a, **_k: {"code": 0, "data": {"list": copy.deepcopy(existing)}}), \
+                    patch.object(self.account, "save_file", side_effect=save) as saving, \
+                    patch.object(self.account, "query_task", return_value={"code": 0, "data": {"save_as": {"save_as_top_fids": ["saved-second"]}}}), \
+                    patch("resource_search.search_resources", side_effect=AssertionError("history should fill the gap")):
+                tree = self.tree()
+                self.account.repair_episode_gaps(self.task, tree)
+                self.assertEqual([node.data["fid"] for node in tree.children(tree.root)], ["saved-second"])
+                self.assertEqual(self.task["search_aliases"], ["Black Summoner"])
+                self.account.repair_episode_gaps(self.task, self.tree())
+            saving.assert_called_once()
+            token.assert_called_once()
+        self.assertIn("补集转存成功：[2]", self.output.getvalue())
+        self.assertNotIn("仍有中间缺集", self.output.getvalue())
+
+    def test_failed_supplement_is_excluded_without_banning_original_and_pending_rename_survives(self):
+        candidate = {"success": True, "candidate": {"pwd_id": "other", "pdir_fid": "wrapped", "stoken": "token",
+                     "shareurl": "https://pan.quark.cn/s/other?pwd=code", "passcode": "code", "episode_fids": {"second": 2}}}
+        pending = {"saved-second": {"original": "02.mkv", "renamed": "Black Summoner S01E02.mkv", "path": self.task["savepath"]}}
+        def failed_save(task, *_args, **_kwargs):
+            task["shareurl_ban"] = "备用分享已失效"
+            task["rename_pending"] = pending
+            return Tree()
+        with patch.object(self.account, "ls_dir", return_value=self.files(["01.mkv", "03.mkv"])), \
+                patch.object(self.account, "find_valid_resource", side_effect=[candidate, {"success": False, "error": "未找到"}]) as search, \
+                patch.object(self.account, "dir_check_and_save", side_effect=failed_save) as saving:
+            self.account.repair_episode_gaps(self.task, self.tree())
+        saving.assert_called_once()
+        self.assertEqual(search.call_args.kwargs["required_episodes"], {2})
+        self.assertEqual(search.call_args.kwargs["exclude_candidates"], {("other", 0, "code"), ("other", "wrapped", "code")})
+        self.assertEqual(self.task["rename_pending"], pending)
+        self.assertEqual(self.task["shareurl"], "https://pan.quark.cn/s/original")
+        self.assertNotIn("shareurl_ban", self.task)
+
+    def test_partial_save_exception_keeps_pending_rename(self):
+        candidate = {"success": True, "candidate": {"pwd_id": "other", "pdir_fid": "", "stoken": "token", "episode_fids": {"second": 2}}}
+        pending = {"saved-second": {"original": "02.mkv", "renamed": "Black Summoner S01E02.mkv", "path": self.task["savepath"]}}
+        def failed_save(task, *_args, **_kwargs):
+            task["rename_pending"] = pending
+            raise requests.Timeout()
+        with patch.object(self.account, "ls_dir", return_value=self.files(["01.mkv", "03.mkv"])), \
+                patch.object(self.account, "find_valid_resource", return_value=candidate), \
+                patch.object(self.account, "dir_check_and_save", side_effect=failed_save):
+            self.account.repair_episode_gaps(self.task, self.tree())
+        self.assertEqual(self.task["rename_pending"], pending)
+
+    def test_supplement_only_file_rename_retries_next_run_then_reaches_plugin(self):
+        self.task.update(taskname="黑色召唤师 (2022)", savepath="/cartoon",
+                         pattern=qas.MEDIA_PATTERN, replace="{TASKNAME} S01E{EXX}.{EXT}")
+        self.account.savepath_fid = {"/cartoon": "destination"}
+        existing = [video(f"黑色召唤师 S01E{episode:02d}.mkv") for episode in (1, 3)]
+        original = copy.deepcopy(existing)
+        def detail(share, *_args, **_kwargs):
+            return {"code": 0, "data": {"share": {"title": "黑色召唤师 (2022)"},
+                    "list": copy.deepcopy(original if share == "original" else [video("02.mkv", "second")])}}
+        def save(fids, *_args):
+            self.assertEqual(fids, ["second"])
+            existing.append(video("02.mkv", "saved-second"))
+            return {"code": 0, "data": {"task_id": "save"}}
+        def rename(fid, name):
+            self.assertEqual((fid, name), ("saved-second", "黑色召唤师 (2022) S01E02.mkv"))
+            existing[-1]["file_name"] = name
+            return {"code": 0}
+        with patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                patch.object(self.account, "get_detail", side_effect=detail), \
+                patch.object(self.account, "ls_dir", side_effect=lambda *_a, **_k: {"code": 0, "data": {"list": copy.deepcopy(existing)}}), \
+                patch.object(self.account, "save_file", side_effect=save) as saving, \
+                patch.object(self.account, "query_task", return_value={"code": 0, "data": {"save_as": {"save_as_top_fids": ["saved-second"]}}}), \
+                patch.object(self.account, "rename", return_value={"code": 1}) as renaming, \
+                patch("resource_search.search_resources", return_value={"success": True, "data": [self.candidate("other")]}) as search:
+            first = self.account.do_save_task(self.task)
+            self.assertTrue(first.children(first.root)[0].data["rename_failed"])
+            self.assertEqual(set(self.task["rename_pending"]), {"saved-second"})
+            renaming.side_effect = rename
+            retried = self.account.do_save_task(self.task)
+            self.assertEqual(retried.children(retried.root)[0].data["path"], "/cartoon/黑色召唤师 (2022) S01E02.mkv")
+            self.assertNotIn("rename_pending", self.task)
+        saving.assert_called_once()
+        search.assert_called_once()
+        self.assertEqual(renaming.call_count, 2)
+        plugin = Mock(spec=["is_active", "run"])
+        plugin.is_active, plugin.run.return_value = True, None
+        self.account.nickname = "test"
+        with patch.object(qas.Config, "load_plugins", return_value=({"aria2": plugin}, {}, {"aria2": {"auto_download": True}})), \
+                patch.object(self.account, "update_savepath_fid"), patch.object(self.account, "do_save_task", return_value=retried):
+            qas.do_save(self.account, [self.task])
+        plugin.run.assert_called_once()
+        received = plugin.run.call_args.kwargs["tree"].children(retried.root)[0].data
+        self.assertEqual(received["fid"], "saved-second")
+        self.assertEqual(received["path"], "/cartoon/黑色召唤师 (2022) S01E02.mkv")
+        self.assertNotIn("rename_failed", received)
+
+    def test_pending_supplement_rename_requires_exact_identity_path_and_media_filter(self):
+        for filename, fid, recorded, pattern in (
+            ("02.mkv", "other-fid", {}, self.task["pattern"]),
+            ("02.mkv", "second", {"original": "03.mkv"}, self.task["pattern"]),
+            ("02.mkv", "second", {"path": "/other"}, self.task["pattern"]),
+            ("02.mkv", "second", {}, r".*\.mp4$"),
+            ("02.exe", "second", {"original": "02.exe"}, ".*"),
+        ):
+            with self.subTest(filename=filename, fid=fid, recorded=recorded, pattern=pattern):
+                task = {**self.task, "pattern": pattern, "rename_pending": {"second": {
+                    "original": "02.mkv", "renamed": "Black Summoner S01E02.mkv", "path": self.task["savepath"], **recorded}}}
+                tree = self.tree()
+                with patch.object(self.account, "ls_dir", return_value={"code": 0, "data": {"list": [video(filename, fid)]}}), \
+                        patch.object(self.account, "find_valid_resource") as search:
+                    self.account.repair_episode_gaps(task, tree)
+                self.assertEqual(tree.size(), 1)
+                search.assert_not_called()
+
+    def test_gap_search_stops_after_three_distinct_shares_or_elapsed_budget(self):
+        for slow in (False, True):
+            with self.subTest(slow=slow):
+                clock, calls = {"now": 0}, []
+                def search(*_args, **kwargs):
+                    calls.append(kwargs)
+                    if slow:
+                        clock["now"] = 121
+                    return {"success": True, "candidate": {"pwd_id": "other" + str(len(calls)),
+                            "stoken": "token", "pdir_fid": "", "episode_fids": {"second": 2}}}
+                with patch.object(qas.time, "monotonic", side_effect=lambda: clock["now"]), \
+                        patch.object(self.account, "ls_dir", return_value=self.files(["01.mkv", "03.mkv"])), \
+                        patch.object(self.account, "find_valid_resource", side_effect=search), \
+                        patch.object(self.account, "dir_check_and_save", return_value=Tree()) as saving:
+                    self.account.repair_episode_gaps(self.task, self.tree())
+                self.assertEqual(len(calls), 1 if slow else 3)
+                self.assertEqual(saving.call_count, len(calls))
+                self.assertTrue(all(call["required_episodes"] == {2} for call in calls))
+                self.assertEqual(len(calls[-1]["exclude_candidates"]), len(calls) - 1)
 
     def test_normal_save_fills_only_two_then_does_not_repeat(self):
         existing = [video(name) for name in ("黑色召唤师 01.mkv", "黑色召唤师 03.mkv", "黑色召唤师 04.mkv", "黑色召唤师 05.mkv", "05.mkv")]

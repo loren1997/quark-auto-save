@@ -110,6 +110,17 @@ class ConfigPersistenceTests(unittest.TestCase):
         self.assertEqual(current["tasklist"][-1]["shareurl_ban"], "分享失效")
         self.assertEqual(current["source"]["server"], "user-selected")
 
+    def test_verified_aliases_persist_without_overwriting_user_edit(self):
+        original = {"tasklist": [task()]}
+        updated = deepcopy(original)
+        updated["tasklist"][0]["search_aliases"] = ["官方译名"]
+        current = deepcopy(original)
+        Config.merge_runtime_state(current, original, updated)
+        self.assertEqual(current["tasklist"][0]["search_aliases"], ["官方译名"])
+        current["tasklist"][0]["search_aliases"] = ["用户别名"]
+        Config.merge_runtime_state(current, original, updated)
+        self.assertEqual(current["tasklist"][0]["search_aliases"], ["用户别名"])
+
     def test_task_identity_changes_are_not_overwritten(self):
         for field, value in (("taskname", "重命名"), ("shareurl", "https://pan.quark.cn/s/user"), ("savepath", "/new")):
             with self.subTest(field=field):
