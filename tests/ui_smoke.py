@@ -31,7 +31,7 @@ def main():
                       "donghua": [donghua] if day == 1 else [],
                       "anime": [item] if day == 1 else [failed_item] if day == 3 else [],
                       "tv": []} for day in range(1, 8)]}
-    web.get_calendar = lambda: calendar
+    web.get_calendar = lambda **kwargs: calendar
     web.get_search_aliases = lambda entry: []
     web.search_resources = lambda *args, **kwargs: {
         "success": False, "data": [], "message": "PanSou: 搜索源暂时不可用", "errors": []}

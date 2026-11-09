@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from app.sdk.cloudsaver import CloudSaver
 from app.sdk.common import SearchError
 from app.sdk.pansou import PanSou
+from app.sdk.source_health import SourceHealth
 from app.sdk.websearch import WebSearch
 from run_progress import report_progress
 
@@ -19,6 +20,9 @@ MAX_PANSOU_SERVERS = 3
 def search_error_reason(message):
     """Only fixed diagnostic categories may leave a transport exception."""
     message = str(message)
+    cooldown = re.fullmatch(r"来源冷却中：(HTTP (?:403|429)|需要人工验证|请求超时)（剩余 (\d{1,8}) 秒）", message)
+    if cooldown:
+        return cooldown.group(0)
     status = re.search(r"HTTP\s*(\d{3})", message, re.I)
     if status:
         return f"HTTP {status.group(1)}"
@@ -32,6 +36,7 @@ def search_error_reason(message):
         (r"频道配置|频道列表", "频道配置无效"),
         (r"未返回公开消息|未返回公开帖子", "频道未返回可匿名读取的公开内容"),
         (r"timeout|超时", "请求超时"),
+        (r"Network is unreachable|Network unreachable|Errno 101|网络不可达", "网络不可达，请检查容器出口与代理"),
         (r"MiB|大小|读取(?:上限|限制)", "网页超过读取限制"),
         (r"时间预算|时间上限", "达到本次查询时间预算"),
         (r"json|rss|格式|不是文本网页|decode", "响应格式异常"),
@@ -81,7 +86,7 @@ def _selection(value, label):
     return list(dict.fromkeys(item.lstrip("@") for item in value))
 
 
-def search_web_resources(query, config, refresh=False, failed_engines=None):
+def search_web_resources(query, config, refresh=False, failed_engines=None, health_path=None):
     """自动订阅在网盘索引未找到可验证资源时，单独查询公开网页。"""
     sources = config.get("source") or {}
     source = sources.get("websearch") or {}
@@ -90,7 +95,7 @@ def search_web_resources(query, config, refresh=False, failed_engines=None):
         return {"success": True, "data": [], "errors": [], "message": ""}
     if not isinstance(query, str) or not query.strip() or len(query) > 200:
         return {"success": False, "data": [], "errors": [], "message": "搜索词必须是 200 字以内的文本"}
-    client = WebSearch()
+    client = WebSearch(health_path=health_path)
     try:
         options = {"failed_engines": failed_engines} if failed_engines is not None else {}
         entries = client.search(query.strip(), refresh=refresh, channel_config=channels, include_engines=_enabled(source), **options)
@@ -106,7 +111,7 @@ def search_web_resources(query, config, refresh=False, failed_engines=None):
         client.session.close()
 
 
-def search_resources(query, config, refresh=False, include_web=True, failed_sources=None):
+def search_resources(query, config, refresh=False, include_web=True, failed_sources=None, health_path=None):
     """聚合网盘索引与公开网页；索引源最多三个 PanSou 与一个 CloudSaver。
 
     PanSou fallback_servers 与 PANSOU_FALLBACK_SERVERS 环境变量为补充源，
@@ -166,10 +171,12 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
         label, server, token = job
         report_progress("search", source=label, query=query)
         if label == "网页搜索":
-            response = search_web_resources(query, config, refresh=refresh)
+            response = search_web_resources(query, config, refresh=refresh, health_path=health_path)
             return response["data"], response["errors"], response["success"]
         client = CloudSaver(server) if label == "CloudSaver" else PanSou(server, token=token)
+        health = SourceHealth(health_path)
         try:
+            health.check(server)
             if label == "CloudSaver":
                 client.set_auth(cs.get("username", ""), cs.get("password", ""), cs.get("token", ""))
                 response = client.auto_login_search(query)
@@ -177,6 +184,13 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
                     raise SearchError(response.get("message", "搜索失败"))
                 return client.clean_search_results(response.get("data", [])), [], True
             return client.search(query, refresh=refresh, **selection), [], True
+        except SearchError as error:
+            reason = search_error_reason(error)
+            if reason in {"HTTP 403", "HTTP 429", "需要人工验证", "请求超时"}:
+                response = getattr(error.__cause__, "response", None)
+                retry_after = response.headers.get("Retry-After") if response is not None else None
+                health.record(server, reason, retry_after=retry_after)
+            raise
         finally:
             client.session.close()
 

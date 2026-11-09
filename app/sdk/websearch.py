@@ -23,6 +23,7 @@ from urllib3.util.connection import create_connection
 
 from .common import SearchError, extract_share_urls, normalize_share_url
 from .channel_search import channel_queries, channel_results
+from .source_health import SourceHealth
 from run_progress import report_progress
 
 
@@ -290,7 +291,8 @@ def _search_results(engine, body, url):
 
 
 class WebSearch:
-    def __init__(self):
+    def __init__(self, health_path=None):
+        self.health = SourceHealth(health_path)
         self.session = requests.Session()
         # 不读取 .netrc 或系统代理设置；显式环境代理由部署者信任并负责最终解析。
         self.session.trust_env = False
@@ -305,6 +307,7 @@ class WebSearch:
     def _fetch(self, url, deadline):
         for redirect in range(3):
             _validate_url(url)
+            self.health.check(url)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SearchError("网页搜索已达到本次时间上限")
@@ -317,6 +320,8 @@ class WebSearch:
                             raise SearchError("网页重定向次数超过上限")
                         url = urljoin(url, response.headers["Location"])
                         continue
+                    if response.status_code in (403, 429):
+                        self.health.record(url, f"HTTP {response.status_code}", response.headers.get("Retry-After"))
                     response.raise_for_status()
                     content_type = response.headers.get("Content-Type", "").lower()
                     if not any(kind in content_type for kind in ("text/", "application/xml", "application/rss+xml", "application/xhtml+xml")):
@@ -386,9 +391,14 @@ class WebSearch:
             report_progress("search", source=f"网页搜索 {engine}", query=query)
             fetch = self._fetch_with_retry if engine == "Meijusou" else self._fetch
             body, final_url = fetch(url, deadline)
-            if engine.startswith(("Telegram @", "腾讯频道 ")):
-                return channel_results(engine, body, final_url, query)
-            return _search_results(engine, body, final_url)
+            try:
+                if engine.startswith(("Telegram @", "腾讯频道 ")):
+                    return channel_results(engine, body, final_url, query)
+                return _search_results(engine, body, final_url)
+            except SearchError as error:
+                if "人工验证" in str(error):
+                    self.health.record(final_url, "需要人工验证")
+                raise
 
         candidates, succeeded = [], 0
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -431,15 +441,17 @@ class WebSearch:
 
         def fetch_page(item):
             report_progress("search", source=f"网页搜索 {item['engine']} 落地页", query=query)
-            return self._fetch_with_retry(item["url"], deadline)
+            body, final_url = self._fetch_with_retry(item["url"], deadline)
+            if re.search(r"challenge-form|cf-chl-|verify you are human|EO_Bot_Ssid|__tst_status|访问过于频繁", body, re.I):
+                self.health.record(final_url, "需要人工验证")
+                raise SearchError("落地页要求人工验证")
+            return body, final_url
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             jobs = [(item, executor.submit(fetch_page, item)) for item in selected_pages[:max(4, len(first_pages))]]
             for item, future in jobs:
                 try:
                     body, final_url = future.result()
-                    if re.search(r"challenge-form|cf-chl-|verify you are human|EO_Bot_Ssid|__tst_status|访问过于频繁", body, re.I):
-                        raise SearchError("落地页要求人工验证")
                     page = _Page(body)
                     title = "".join(page.title).strip() or item["title"]
                     text = "".join(page.text)

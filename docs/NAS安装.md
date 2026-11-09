@@ -10,7 +10,7 @@ V3.8 可以连续点击多部作品加入订阅队列，依次在后台执行，
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.8 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.8) 中的 `quark-auto-save-nas-docker-v3.8.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.8.1 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.8.1) 中的 `quark-auto-save-nas-docker-v3.8.1.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -68,15 +68,17 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 ## 3. 搜索与自动换源
 
+V3.8.1 在不同订阅和进程间共享来源冷却：超时默认 60 秒、HTTP 429 默认 5 分钟、HTTP 403 默认 15 分钟、验证码默认 30 分钟；网站提供 `Retry-After` 时按其要求等待，最多 7 天。日志显示原因和剩余秒数，其他健康来源继续查询，冷却到期自动恢复。手动刷新不会强行绕过冷却。状态保存在 `config/quark_config.search-health.sqlite3`，仅记录域名和固定故障信息，不含 Cookie 或搜索词；无需手工编辑。
+
 在任务名称中输入资源名，或点击名称旁的搜索按钮。PanSou 兼容新版原生接口和公共代理接口；支持提取码。可填写多个 PanSou 聚合地址，每行一个；主源、聚合源与启用的 CloudSaver 会一起查询、去重，并标注来源。单个源失败不影响其他源的结果，全部失败时明确报错。频道和插件筛选留空时使用 PanSou 服务已启用的全部渠道，也可填写逗号分隔的名称进行筛选。
 
 V3.6 将找到的资源线索独立保存到 `config/quark_config.resources.json`，仅保存标题、别名和分享链接。删除订阅不会清除这些线索；重新一键订阅、自动换源和补集时，会尝试匹配的历史链接，并实时验证分享及实际视频，失效或不匹配时继续搜索其他来源。历史记录不代表链接永久有效，也不会使已删除的任务自行恢复。
 
 第 6 节的更新命令会自动读取安装目录下的当前配置与 `backup-v*/config/quark_config.json`，按修改时间最多检查 10 份配置，导入其中的资源线索。它只写入独立线索文件，不恢复订阅、Cookie 或其他旧设置；以后备份时保留整个 `config/` 即可。
 
-V3.5 在一次自动查找中会记住失败的索引来源，后续译名查询不再重复等待该来源；其他健康来源继续查询。下一次任务运行会重新尝试，不会修改或永久禁用搜索配置。日志保留首次超时等失败原因。
+在一次自动查找中会记住失败的索引来源，后续译名查询不再重复等待该来源；其他健康来源继续查询。后续任务在来源冷却到期后重新尝试，不会修改或永久禁用搜索配置。日志保留首次超时等失败原因。
 
-V3.6.1 也会在同一次自动查找中记住失败的网页搜索引擎，查询其他别名时只继续使用健康引擎；下一次任务运行会重新尝试失败引擎。资源落地页的 HTTP 403 等错误只属于该页面，不会因此禁用已经成功返回搜索结果的引擎。
+同一次自动查找也会记住失败的网页搜索引擎，查询其他别名时只继续使用健康引擎；后续任务在来源冷却到期后重新尝试。资源落地页的 HTTP 403 等错误只冷却该页面实际域名，不会因此禁用已经成功返回搜索结果的引擎。
 
 搜索会从索引返回的结构化结果和公开帖子正文中提取夸克链接、就近关联提取码。“网页搜索”默认启用，V3.7 查询 Meijusou 公开站内搜索，并通过搜狗、Google、DuckDuckGo 和 Bing 查询公开网页，再读取有限数量的结果页面提取夸克链接。任务列表搜索会合并这些结果；自动订阅与失效换源在历史线索和索引未找到可验证候选时再补搜网页。页面不执行脚本、不登录，也不绕过验证码；搜索引擎返回验证码或网络失败会明确报错。
 
@@ -84,7 +86,7 @@ V3.6.1 也会在同一次自动查找中记住失败的网页搜索引擎，查�
 
 网页搜索使用独立请求，不使用账号 Cookie、`.netrc` 或操作系统保存的代理配置；NAS 必须能访问对应搜索引擎和网页。可在容器环境中显式设置 `HTTP_PROXY` / `HTTPS_PROXY` 使用自己信任的代理，代理负责最终域名解析和转发。网络受限时也可在系统配置关闭“网页搜索”，继续使用自托管 PanSou/CloudSaver。网页来源及真实标题会保留，自动订阅仍检查夸克分享中的实际文件。
 
-使用仓库或发布包的 Compose 时，可在 `.env` 增加 `QAS_PROXY=http://你的代理局域网地址:端口`，然后 `docker compose up -d` 重建应用容器。默认不启用代理；不要把 NAS 以外的代理写成 `127.0.0.1`，该地址在容器内指向容器自身。
+使用仓库或发布包的 Compose 时，可在 `.env` 增加 `QAS_PROXY=http://你的代理局域网地址:端口`，然后 `docker compose -p qas-maintained up -d` 重建容器；V3.8.1 会让应用与 PanSou 同时使用该代理。默认不启用代理；不要把 NAS 以外的代理写成 `127.0.0.1`，该地址在容器内指向容器自身。代理不能保证解除网站验证码或封禁。
 
 “分享失效时自动搜索并替换”默认启用。每次正常任务运行时，会重新检查原分享和旧版标记失效的分享；明确取消、过期、不存在，或完整扫描确认分享不含视频时，会尝试查找新来源。只有字幕的分享也不作为视频资源。登录、提取码、网络和限流错误，以及未完成的分页或目录扫描，都不会被误判为无视频，会保留原订阅，下次重试。
 
@@ -162,16 +164,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.8：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.8.1：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.8/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.8.1/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.8-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.8.1-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"
@@ -204,6 +206,14 @@ docker compose up -d --build
 GitHub Actions 会先跑 Python 3.11/3.13 测试，再构建 amd64/arm64 镜像到该仓库的 GHCR。Fork 的 Actions 可能需要你先在 GitHub 的 Actions 页启用；仓库连接器还需要有该 Fork 的访问权限。镜像第一次发布后若为 private，需要在 Packages 中设为 public 或在 NAS 登录 GHCR；本地 `build` 安装不受此影响。只有 Actions 实际通过后才能确认远程镜像已发布。
 
 ## 7. 排错与验收
+
+V3.8.1 可在 NAS 安装目录执行只读网络检查：
+
+```sh
+docker compose -p qas-maintained exec -T quark-auto-save python scripts/probe_sources.py
+```
+
+它检查固定来源的 DNS、IPv4/IPv6 连通性和匿名 HTTP，只显示代理是否启用，不读取账号配置、Cookie 或密钥，也不转存下载。`--direct` 可额外比较不使用代理时的结果。健康接口正常并不能证明 PanSou 实际搜索正常；HTTP 200 也可能是验证页面。出现“地址解析为非公网 IP”时应结合检查结果确认是否为真实私网链接或 DNS/代理的 fake-IP 设置，不要关闭私网保护。单部订阅现在只读取目标作品的日历来源，不再为订阅动漫查询无关电视剧别名。
 
 - 无法搜索：查看页面源错误和 `docker compose logs --tail=100 pansou`；确认地址为 `http://pansou:8888`。公共 `https://so.252035.xyz` 可作备用，但没有稳定性保证。
 - 动漫源超时：页面会显示降级。如果你有自己的网络代理，可在 Compose 的服务 `environment` 中配置标准 `HTTPS_PROXY`，同时设置 `NO_PROXY: localhost,127.0.0.1,pansou`；不要关闭 TLS 校验。无需代理也能查看可达来源。

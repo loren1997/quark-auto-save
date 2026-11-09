@@ -145,7 +145,8 @@ class AppIntegrationTests(unittest.TestCase):
         with patch.object(web, "search_resources", return_value=result) as search:
             response = self.client.get("/task_suggestions", query_string={"q": "测试动漫", "d": "1"})
         self.assertEqual(response.json, result)
-        search.assert_called_once_with("测试动漫", self.config, refresh=True)
+        search.assert_called_once_with("测试动漫", self.config, refresh=True,
+                                      health_path=web.Config.search_health_path(web.CONFIG_PATH))
 
     def test_manual_search_recovers_deleted_task_hints_when_sources_fail(self):
         title = "测试动漫 第二季 (2024)"
@@ -191,7 +192,8 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual([item["shareurl"] for item in result["data"]],
                          ["https://pan.quark.cn/s/old?pwd=AB12", "https://pan.quark.cn/s/new"])
         self.assertEqual(result["data"][1]["source"], "网页搜索")
-        search.assert_called_once_with(title, self.config, refresh=True)
+        search.assert_called_once_with(title, self.config, refresh=True,
+                                      health_path=web.Config.search_health_path(web.CONFIG_PATH))
 
     def test_discovery_returns_seven_days_and_source_errors(self):
         self.calendar["errors"] = [{"source": "tv", "message": "上游暂不可用"}]

@@ -335,6 +335,7 @@ def get_task_suggestions():
     result = search_resources(
         query, Config.read_json(CONFIG_PATH),
         refresh=request.args.get("d") == "1",
+        health_path=Config.search_health_path(CONFIG_PATH),
     )
     history = []
     if query.strip() and len(query) <= 200:
@@ -412,7 +413,7 @@ def subscribe_discovery_payload(payload):
         return jsonify(success=False, pending=True, existing=True, data=Config.pending_summary(pending),
                        message="已保留自动查找订阅，将在现有定时规则执行时继续查找资源"), 202
     entry = next((dict(item, resource_type="anime" if kind == "donghua" else kind)
-                  for day in get_calendar()["days"]
+                  for day in get_calendar(resource_id=payload["id"])["days"]
                   for kind in ("donghua", "anime", "tv") for item in day.get(kind, [])
                   if item["id"] == payload["id"]), None)
     if entry is None:
@@ -452,6 +453,7 @@ def subscribe_discovery_payload(payload):
         task["addition"].setdefault("aria2", {}).update(auto_download=True, download_subdir=True)
     account = Quark(cookie)
     account.resource_history_path = Config.resource_history_path(CONFIG_PATH)
+    account.search_health_path = Config.search_health_path(CONFIG_PATH)
     result = (account.verify_resource_link(task, shareurl) if shareurl is not None
               else account.find_valid_resource(task, current))
     if not result.get("success") or not result.get("candidate"):

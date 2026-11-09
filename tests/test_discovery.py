@@ -60,6 +60,66 @@ class CalendarTests(unittest.TestCase):
         self.assertEqual(fetch.call_count, calls)
 
     @patch.object(discovery, "_get_json")
+    def test_subscription_loads_only_its_calendar_and_does_not_replace_full_cache(self, fetch):
+        fetch.side_effect = self.sources
+        data = discovery.get_calendar(resource_id="bangumi:2")
+        fetch.assert_called_once_with("https://api.bgm.tv/calendar")
+        self.assertEqual([item["id"] for day in data["days"] for item in day["anime"]], ["bangumi:2"])
+        self.assertIsNone(discovery._cache)
+        full = discovery.get_calendar()
+        self.assertEqual(len(full["days"][0]["anime"]), 2)
+        self.assertTrue(full["days"][0]["tv"])
+        fetch.reset_mock()
+        cached = discovery.get_calendar(resource_id="bangumi:2")
+        fetch.assert_not_called()
+        self.assertTrue(cached["cached"])
+        self.assertEqual(len(cached["days"][0]["anime"]), 1)
+        self.assertEqual(len(discovery.get_calendar()["days"][0]["anime"]), 2)
+
+    @patch.object(discovery, "_get_json")
+    def test_tv_subscription_looks_up_only_target_show_aliases(self, fetch):
+        def sources(url):
+            data = self.sources(url)
+            if "/schedule?" in url and "2026-11-02" in url:
+                data.append({"airdate": "2026-11-02", "season": 1, "number": 1,
+                             "show": {"id": 95314, "name": "Unrelated", "type": "Scripted", "weight": 99}})
+            if "/shows/95314/" in url:
+                raise requests.ConnectionError("Network unreachable")
+            return data
+        fetch.side_effect = sources
+        data = discovery.get_calendar(resource_id="tvmaze:3:s1")
+        self.assertEqual([item["id"] for day in data["days"] for item in day["tv"]], ["tvmaze:3:s1"])
+        urls = [call.args[0] for call in fetch.call_args_list]
+        self.assertEqual([url for url in urls if "/akas" in url], ["https://api.tvmaze.com/shows/3/akas"])
+        self.assertTrue(all(url.startswith("https://api.tvmaze.com/") for url in urls))
+        self.assertEqual(data["warnings"], [])
+
+    @patch.object(discovery, "_get_json")
+    def test_bilibili_subscription_does_not_fetch_other_sources_or_identity(self, fetch):
+        fetch.side_effect = self.official_duplicate_sources
+        data = discovery.get_calendar(resource_id="bilibili:1733")
+        fetch.assert_called_once_with(discovery.BILIBILI_CALENDAR)
+        self.assertEqual([item["id"] for day in data["days"] for item in day["donghua"]], ["bilibili:1733"])
+
+    @patch.object(discovery, "_get_json")
+    def test_subscription_calendar_failure_is_not_cached_as_missing_resource(self, fetch):
+        fetch.side_effect = requests.Timeout("timeout")
+        failed = discovery.get_calendar(resource_id="bangumi:2")
+        self.assertFalse(any(day["anime"] for day in failed["days"]))
+        self.assertTrue(failed["warnings"])
+        fetch.side_effect = self.sources
+        recovered = discovery.get_calendar(resource_id="bangumi:2")
+        self.assertEqual(len(recovered["days"][0]["anime"]), 1)
+        self.assertEqual(fetch.call_count, 2)
+
+    @patch.object(discovery, "_get_json")
+    def test_unknown_subscription_id_does_not_trigger_calendar_fetches(self, fetch):
+        for resource_id in ("unknown:123", "bangumi:../123", "tvmaze:3", "", 1):
+            data = discovery.get_calendar(resource_id=resource_id)
+            self.assertFalse(any(day[kind] for day in data["days"] for kind in ("anime", "donghua", "tv")))
+        fetch.assert_not_called()
+
+    @patch.object(discovery, "_get_json")
     def test_week_changes_at_shanghai_monday_without_reusing_old_dates(self, fetch):
         fetch.side_effect = self.sources
         discovery.get_calendar()
@@ -365,8 +425,41 @@ class CalendarTests(unittest.TestCase):
     @patch.object(discovery.requests, "get")
     def test_failed_relations_preserve_subject_aliases(self, get):
         response = get.return_value.__enter__.return_value
-        response.json.side_effect = [{"id": 123, "type": 2, "name": "Original", "name_cn": "中文名"}, requests.Timeout("timeout")]
+        response.json.side_effect = [{"id": 123, "type": 2, "name": "Original", "name_cn": "中文名"},
+                                     requests.Timeout("timeout"), requests.Timeout("timeout")]
         self.assertEqual(discovery.get_search_aliases({"id": "bangumi:123", "title": "中文名"}), ["中文名", "Original"])
+
+    @patch.object(discovery.requests, "get")
+    def test_bangumi_aliases_retry_one_transient_failure_and_keep_trusted_names(self, get):
+        response = get.return_value.__enter__.return_value
+        response.json.side_effect = [
+            {"id": 123, "type": 2, "name_cn": "作品", "name": "Original"},
+            [{"type": 1, "relation": "原作", "name": "Original", "name_cn": "原作译名"}],
+        ]
+        get.side_effect = [requests.Timeout("read timeout"), get.return_value, get.return_value]
+        self.assertEqual(discovery.get_search_aliases({"id": "bangumi:123", "title": "作品"}),
+                         ["作品", "原作译名", "Original"])
+        self.assertEqual(get.call_count, 3)
+
+    @patch.object(discovery.requests, "get")
+    def test_alias_http_and_tls_errors_are_not_retried(self, get):
+        for error in (requests.HTTPError(response=MagicMock(status_code=429)),
+                      requests.HTTPError(response=MagicMock(status_code=403)),
+                      requests.exceptions.SSLError("certificate verification failed")):
+            get.reset_mock()
+            get.side_effect = error
+            self.assertEqual(discovery.get_search_aliases({"id": "bangumi:123", "title": "作品"}), ["作品"])
+            get.assert_called_once()
+
+    @patch.object(discovery, "monotonic", side_effect=[0, 0, 6, 10.1])
+    @patch.object(discovery.requests, "get")
+    def test_alias_detail_and_relations_share_a_ten_second_retry_budget(self, get, clock):
+        response = get.return_value.__enter__.return_value
+        response.json.return_value = {"id": 123, "type": 2, "name": "Original", "name_cn": "作品"}
+        get.side_effect = [requests.Timeout("read timeout"), get.return_value]
+        self.assertEqual(discovery.get_search_aliases({"id": "bangumi:123", "title": "作品"}), ["作品", "Original"])
+        self.assertEqual(get.call_count, 2)
+        self.assertLessEqual(sum(get.call_args_list[1].kwargs["timeout"]), 4)
 
     def official_duplicate_sources(self, url):
         if url == discovery.BILIBILI_CALENDAR:

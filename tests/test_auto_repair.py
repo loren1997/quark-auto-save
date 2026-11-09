@@ -245,7 +245,7 @@ class AutoRepairTests(unittest.TestCase):
         self.task["search_aliases"] = ["官方译名"]
         attempts = []
 
-        def search(query, config, refresh=False, failed_engines=None):
+        def search(query, config, refresh=False, failed_engines=None, health_path=None):
             attempts.append(set(failed_engines))
             if not failed_engines:
                 failed_engines.add("Google")

@@ -30,6 +30,9 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
+      HTTP_PROXY: ${QAS_PROXY:-}
+      HTTPS_PROXY: ${QAS_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1,pansou,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
       ENABLED_PLUGINS: labi,zhizhen,shandian,duoduo,muou
       CHANNELS: tgsearchers7,Quark_Movies,Q_dongman,guoman4K,leoziyuan,kuakedongman
     volumes:

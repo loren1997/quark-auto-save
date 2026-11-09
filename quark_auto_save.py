@@ -402,6 +402,9 @@ class Config:
     def resource_history_path(config_path):
         return os.path.splitext(os.path.abspath(config_path))[0] + ".resources.json"
 
+    def search_health_path(config_path):
+        return os.path.splitext(os.path.abspath(config_path))[0] + ".search-health.sqlite3"
+
     def existing_subscription(tasks, resource_id, title):
         return next((task for task in tasks if task.get("resource_id") == resource_id
                      or (resource_titles_match(title, task.get("taskname", ""))
@@ -867,6 +870,7 @@ class Quark:
     def __init__(self, cookie="", index=0):
         self.cookie = cookie.strip()
         self.resource_history_path = None
+        self.search_health_path = None
         self.index = index + 1
         self.is_active = False
         self.nickname = ""
@@ -1454,8 +1458,10 @@ class Quark:
                 report_progress("search", task=title, source="网页搜索" if web else "网盘索引", query=query)
                 try:
                     # Reuse index caches; share validity is checked live below.
-                    result = search_web_resources(query, config, refresh=False, failed_engines=failed_web_engines) if web else search_resources(
-                        query, config, refresh=False, include_web=False, failed_sources=failed_sources
+                    result = search_web_resources(query, config, refresh=False, failed_engines=failed_web_engines,
+                                                  health_path=self.search_health_path) if web else search_resources(
+                        query, config, refresh=False, include_web=False, failed_sources=failed_sources,
+                        health_path=self.search_health_path
                     )
                 except (requests.RequestException, ValueError, TypeError) as exc:
                     record_error("网页搜索" if web else "索引搜索", type(exc).__name__)
@@ -2489,6 +2495,7 @@ def main():
         Config.remember_resources(history_path, CONFIG_DATA.get("tasklist", []))
         for account in accounts:
             account.resource_history_path = history_path
+            account.search_health_path = Config.search_health_path(config_path)
     # 签到
     report_progress("signin", task="账号检查与签到")
     print(f"===============签到任务===============")
