@@ -180,6 +180,67 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(response.json["message"], "没有匹配的有效分享")
         self.assertEqual(self.saved_config(), self.config)
 
+    def test_direct_subscription_rejects_invalid_links_without_network_or_writing(self):
+        for value in (None, [], "", "not a link", "http://127.0.0.1/s/abc123",
+                      "https://pan.quark.cn.attacker.example/s/abc123",
+                      "https://user@pan.quark.cn/s/abc123", "https://pan.quark.cn:443/s/abc123",
+                      "https://pan.quark.cn/drive", "x" * 2001):
+            with self.subTest(value=value):
+                response = self.client.post("/api/discovery/subscribe", json={"id": self.entry["id"], "shareurl": value})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(self.saved_config(), self.config)
+        self.find.assert_not_called()
+
+    def test_direct_subscription_verifies_real_files_and_reuses_defaults_without_search(self):
+        payload = {"id": self.entry["id"], "shareurl": "分享 http://pan.quark.cn/s/abc123 提取码：abcd"}
+        listing = {"code": 0, "data": {"list": [
+            {"fid": "video", "file_name": "测试动漫 S02E01 (2024).mkv", "dir": False},
+        ]}}
+        with patch.object(web.Quark, "get_stoken", return_value={"status": 200, "data": {"stoken": "private-test-token"}}) as token, \
+                patch.object(web.Quark, "get_detail", return_value=listing):
+            response = self.client.post("/api/discovery/subscribe", json=payload)
+            self.assertEqual(response.status_code, 200, response.json)
+            task = response.json["data"]
+            self.assertEqual(task["shareurl"], "https://pan.quark.cn/s/abc123?pwd=abcd")
+            self.assertEqual(task["resource_id"], self.entry["id"])
+            self.assertEqual(task["savepath"], "/cartoon")
+            self.assertEqual(task["replace"], "{TASKNAME} S02E{EXX}.{EXT}")
+            self.assertEqual(task["addition"]["aria2"]["save_path"], "cartoon")
+            self.assertEqual(self.saved_config()["tasklist"], [task])
+            self.assertNotIn("private-test-token", response.get_data(as_text=True))
+            duplicate = self.client.post("/api/discovery/subscribe", json=payload)
+            self.assertTrue(duplicate.json["existing"])
+            token.assert_called_once_with("abc123", "abcd")
+        self.find.assert_not_called()
+
+    def test_direct_subscription_rejects_wrong_title_season_year_and_non_video(self):
+        payload = {"id": self.entry["id"], "shareurl": "https://pan.quark.cn/s/abc123"}
+        with patch.object(web.Quark, "get_stoken", return_value={"status": 200, "data": {"stoken": "test"}}):
+            for filename in ("别的动漫 S02E01 (2024).mp4", "测试动漫 S03E01 (2024).mp4",
+                             "测试动漫 S02E01 (2023).mp4", "测试动漫 S02E01 (2024).srt",
+                             "测试动漫 S02E01 (2024).mp4.exe"):
+                with self.subTest(filename=filename), patch.object(web.Quark, "get_detail", return_value={
+                    "code": 0, "data": {"list": [{"fid": "file", "file_name": filename, "dir": False}]},
+                }):
+                    response = self.client.post("/api/discovery/subscribe", json=payload)
+                    self.assertEqual(response.status_code, 422, response.json)
+                    self.assertEqual(self.saved_config(), self.config)
+        self.find.assert_not_called()
+
+    def test_direct_subscription_uses_only_catalog_aliases(self):
+        self.get_search_aliases.return_value = ["官方别名"]
+        with patch.object(web.Quark, "get_stoken", return_value={"status": 200, "data": {"stoken": "test"}}), \
+                patch.object(web.Quark, "get_detail", return_value={"code": 0, "data": {"list": [
+                    {"fid": "video", "file_name": "官方别名 S02E01 (2024).mp4", "dir": False},
+                ]}}):
+            response = self.client.post("/api/discovery/subscribe", json={
+                "id": self.entry["id"], "shareurl": "https://pan.quark.cn/s/abc123",
+                "search_aliases": ["客户端不可信别名"],
+            })
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json["data"]["search_aliases"], ["官方别名"])
+        self.find.assert_not_called()
+
     def test_subscription_persists_only_task_fields_and_keeps_credentials_private(self):
         response = self.subscribe()
         self.assertEqual(response.status_code, 200)

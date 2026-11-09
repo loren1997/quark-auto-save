@@ -690,6 +690,49 @@ class AutoRepairTests(unittest.TestCase):
                 self.assertEqual(result["status"], 503)
                 self.assertFalse(qas.is_expired_share(result))
 
+    def test_terminal_empty_page_accepts_visible_files_despite_stale_total(self):
+        first = copy.deepcopy(FILES)
+        first["metadata"] = {"_total": 8, "_count": 1, "_page": 1}
+        last = {"code": 0, "metadata": {"_total": 8, "_count": 0, "_page": 2}, "data": {"list": []}}
+        with patch.object(self.account, "_send_request", side_effect=[
+                Mock(json=Mock(return_value=first)), Mock(json=Mock(return_value=last))]):
+            detail = self.account.get_detail("newshare", "token", 0, max_pages=3)
+        self.assertTrue(qas.share_listing_complete(detail))
+        self.assertEqual(detail["metadata"]["_total"], 8)
+        self.assertEqual(detail["data"]["share"], FILES["data"]["share"])
+        with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", return_value=detail):
+            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertTrue(self.account._scan_share_media(self.task, "newshare", "token", 0)["has_video"])
+
+    def test_limit_or_failed_next_page_never_becomes_complete(self):
+        first = copy.deepcopy(FILES)
+        first["metadata"] = {"_total": 8}
+        with patch.object(self.account, "_send_request", return_value=Mock(json=Mock(return_value=first))):
+            detail = self.account.get_detail("newshare", "token", 0, max_pages=1)
+        self.assertFalse(qas.share_listing_complete(detail))
+        self.assertFalse(detail["data"]["listing_complete"])
+        first["data"].pop("truncated")
+        with patch.object(self.account, "_send_request", side_effect=[Mock(json=Mock(return_value=first)),
+                                                                   requests.Timeout("offline")]):
+            self.assertFalse(qas.share_listing_complete(self.account.get_detail("newshare", "token", 0, max_pages=3)))
+
+    def test_manual_link_verifies_real_files_without_any_search(self):
+        with self.search([]) as search, patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", return_value=FILES):
+            result = self.account.verify_resource_link(self.task, "https://pan.quark.cn/s/newshare?pwd=abcd")
+        self.assertTrue(result["success"])
+        search.assert_not_called()
+        self.web_search.assert_not_called()
+        wrong = copy.deepcopy(FILES)
+        wrong["data"]["share"]["title"] = "另一部剧 第二季 (2024)"
+        with patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", return_value=wrong):
+            self.assertFalse(self.account.verify_resource_link(self.task, "https://pan.quark.cn/s/newshare")["success"])
+        with patch.object(self.account, "get_stoken") as token:
+            self.assertFalse(self.account.verify_resource_link(self.task, "http://127.0.0.1/private")["success"])
+        token.assert_not_called()
+
     def test_temporary_listing_failures_do_not_abort_later_subscriptions(self):
         later_task = {**self.task, "taskname": "后续任务"}
         response = Mock()

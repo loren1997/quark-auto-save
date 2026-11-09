@@ -16,6 +16,7 @@ from flask import (
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sdk.discovery import get_calendar, get_search_aliases
+from sdk.common import normalize_share_url
 from copy import deepcopy
 from datetime import timedelta
 import subprocess
@@ -331,6 +332,12 @@ def subscribe_discovery():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
         return jsonify(success=False, message="缺少资源 ID"), 400
+    shareurl = None
+    if "shareurl" in payload:
+        value = payload["shareurl"]
+        shareurl = normalize_share_url(value) if isinstance(value, str) and len(value) <= 2000 else ""
+        if not shareurl:
+            return jsonify(success=False, message="请粘贴有效的夸克分享链接，可包含提取码"), 400
     entry = next((dict(item, resource_type="anime" if kind == "donghua" else kind)
                   for day in get_calendar()["days"]
                   for kind in ("donghua", "anime", "tv") for item in day.get(kind, [])
@@ -360,7 +367,9 @@ def subscribe_discovery():
     aliases = get_search_aliases(entry)
     if aliases:
         task["search_aliases"] = aliases
-    result = Quark(cookie).find_valid_resource(task, current)
+    account = Quark(cookie)
+    result = (account.verify_resource_link(task, shareurl) if shareurl is not None
+              else account.find_valid_resource(task, current))
     if not result.get("success") or not result.get("candidate"):
         return jsonify(success=False, code=result.get("code", "no_match"),
                        queries=result.get("queries", []), source_errors=result.get("source_errors", []),

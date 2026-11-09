@@ -176,14 +176,18 @@ def _search_results(engine, body, url):
     page = _Page(body)
     results = []
     for item in page.links:
-        if "result__a" not in item["class"].split():
+        classes = item["class"].split()
+        if not {"result__a", "result__snippet"}.intersection(classes):
             continue
         link = urljoin(url, item["url"])
         parts = urlsplit(link)
         if parts.hostname in ("duckduckgo.com", "html.duckduckgo.com"):
             link = (parse_qs(parts.query).get("uddg") or [""])[0]
-        if link:
+        if link and "result__a" in classes:
             results.append({"title": item["text"], "url": link, "snippet": ""})
+        elif link and results and link == results[-1]["url"]:
+            # 摘要只归属紧邻、指向同一落地页的结果，避免串用另一条的分享和提取码。
+            results[-1]["snippet"] = item["text"]
     if not results and not re.search(r"no-results|No results found|没有找到", body, re.I):
         raise SearchError("DuckDuckGo 页面格式已改变或需要验证")
     return results[:10]
@@ -319,9 +323,12 @@ class WebSearch:
                 unique[key] = item
         output = list(unique.values())
         with _cache_lock:
-            if len(_cache) >= 32:
-                _cache.pop(next(iter(_cache)))
-            _cache[query] = (time.monotonic(), output, list(self.errors))
+            if output or not self.errors:
+                if len(_cache) >= 32:
+                    _cache.pop(next(iter(_cache)))
+                _cache[query] = (time.monotonic(), output, list(self.errors))
+            else:
+                _cache.pop(query, None)
         return [dict(item) for item in output]
 
     @staticmethod

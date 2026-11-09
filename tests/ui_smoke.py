@@ -18,7 +18,7 @@ import run as web
 def main():
     output = ROOT / "test-results"
     output.mkdir(exist_ok=True)
-    errors, runs = [], []
+    errors, runs, link_checks = [], [], []
     item = {"id": "bangumi:123", "title": "测试动漫", "search_title": "测试动漫",
             "year": "2026", "source": "Bangumi", "source_url": "https://bgm.tv/subject/123",
             "poster": "", "heat": 100, "heat_label": "Bangumi 在看人数", "schedule_note": "周播表"}
@@ -40,6 +40,12 @@ def main():
          "queries": ["失败番剧", "Test Anime"], "source_errors": [{"source": "网页搜索", "message": "请求超时"}]}
         if "失败番剧" in task["taskname"] else
         {"success": True, "candidate": {"shareurl": "https://pan.quark.cn/s/abc123", "stoken": "NEVER_SAVE"}})
+
+    def verify_link(self, task, shareurl):
+        link_checks.append((task["taskname"], shareurl))
+        return {"success": True, "candidate": {"shareurl": shareurl, "stoken": "NEVER_SAVE"}}
+
+    web.Quark.verify_resource_link = verify_link
     web.reload_tasks = lambda: True
     web.task_plugins_config_default = {"aria2": {"auto_download": False, "download_subdir": False}}
 
@@ -66,6 +72,8 @@ def main():
                 browser = playwright.chromium.launch(headless=True)
                 page = browser.new_page(viewport={"width": 1440, "height": 1000})
                 page.on("pageerror", lambda error: errors.append(str(error)))
+                page.on("console", lambda message: print("Browser console:", message.text)
+                        if message.type == "error" and "Vue warn" in message.text else None)
                 page.route("https://api.github.com/**", lambda route: route.fulfill(json=[{"name": "dev"}]))
                 page.goto(f"http://127.0.0.1:{server.server_port}/")
                 page.locator('input[name="username"]').fill("test")
@@ -97,6 +105,23 @@ def main():
                 assert page.get_by_text("已尝试关键词：失败番剧、Test Anime", exact=True).is_visible()
                 assert page.get_by_text("网页搜索：请求超时", exact=True).is_visible()
                 assert len(web.Config.read_json(web.CONFIG_PATH)["tasklist"]) == 2
+                page.get_by_label("粘贴《失败番剧》的夸克链接订阅").fill("https://example.com/not-quark")
+                page.get_by_role("button", name="验证链接并订阅", exact=True).click()
+                page.get_by_role("alert").filter(has_text="请粘贴有效的夸克分享链接").wait_for()
+                assert not link_checks
+                page.set_viewport_size({"width": 390, "height": 844})
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+                page.get_by_label("粘贴《失败番剧》的夸克链接订阅").fill("http://pan.quark.cn/s/direct123 提取码：abcd")
+                page.get_by_role("button", name="验证链接并订阅", exact=True).click()
+                page.wait_for_function("app.formData.tasklist.some(task => task.resource_id === 'bangumi:456')")
+                page.locator("#logModal").wait_for(state="visible")
+                page.wait_for_function("!app.modalLoading")
+                assert link_checks == [("失败番剧 (2026)", "https://pan.quark.cn/s/direct123?pwd=abcd")]
+                assert len(runs) == 2 and runs[1]["tasklist"][0]["resource_id"] == "bangumi:456"
+                assert len(web.Config.read_json(web.CONFIG_PATH)["tasklist"]) == 3
+                page.locator("#logModal .close").click()
+                assert page.locator("#discovery-share-url").count() == 0
+                page.set_viewport_size({"width": 1440, "height": 1000})
                 page.get_by_role("button", name="周二", exact=True).click()
                 assert page.get_by_text("当天暂无已收录的更新", exact=False).first.is_visible()
                 page.set_viewport_size({"width": 390, "height": 844})
@@ -129,8 +154,8 @@ def main():
                 ).click()
                 page.locator("#logModal").wait_for(state="visible")
                 page.wait_for_function("!app.modalLoading")
-                assert len(runs) == 2
-                retry = runs[1]["tasklist"][0]
+                assert len(runs) == 3
+                retry = runs[2]["tasklist"][0]
                 assert retry["resource_id"] == "bangumi:123"
                 assert retry["addition"]["aria2"] == {
                     "auto_download": True, "download_subdir": True, "download_existing": True,
@@ -145,8 +170,10 @@ def main():
                 page.get_by_text("PanSou: 搜索源暂时不可用", exact=True).wait_for()
                 assert not errors, errors
                 browser.close()
-            print("UI smoke passed: login, donghua/source groups, seven days, subscribe/run, dedup, mobile, enable existing Aria2 download/save/refresh/run, contextual search errors; no JS errors")
+            print("UI smoke passed: login, donghua/source groups, seven days, subscribe/run, dedup, mobile, direct link fallback/validation/run, enable existing Aria2 download/save/refresh/run, contextual search errors; no JS errors")
         finally:
+            if errors:
+                print("Browser errors:", errors)
             server.shutdown()
             worker.join(timeout=5)
 

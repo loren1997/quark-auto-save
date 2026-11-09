@@ -342,6 +342,18 @@
                 <div v-for="(error, i) in discoverySearchDetails.source_errors || []" :key="i">{{ error.source }}：{{ error.message }}</div>
               </details>
             </div>
+            <div v-if="discoveryFailedItem" class="mb-3" role="group" aria-label="通过夸克链接订阅">
+              <label for="discovery-share-url">粘贴《{{ discoveryFailedItem.title }}》的夸克链接订阅</label>
+              <div class="row">
+                <div class="col-12 col-md mb-2">
+                  <input id="discovery-share-url" type="text" class="form-control" v-model="discoveryShareUrl" maxlength="2000" placeholder="https://pan.quark.cn/s/…（可带提取码）" :disabled="!!subscribing" @keydown.enter.stop.prevent="discoveryShareUrl.trim() && subscribeDiscovery(discoveryFailedItem, discoveryShareUrl)">
+                </div>
+                <div class="col-12 col-md-auto mb-2">
+                  <button type="button" class="btn btn-outline-primary" :disabled="!!subscribing || !discoveryShareUrl.trim()" @click="subscribeDiscovery(discoveryFailedItem, discoveryShareUrl)">{{ subscribing ? '正在验证…' : '验证链接并订阅' }}</button>
+                </div>
+              </div>
+              <small class="text-muted">直接验证分享内的视频、片名、季度和年份，通过后按当前设置转存。</small>
+            </div>
             <div v-for="warning in calendar.warnings" :key="warning" class="alert alert-warning" role="status">{{ warning }}</div>
             <p v-if="discoveryLoading" role="status">正在读取本周排期，请稍候…</p>
             <div class="btn-group flex-wrap my-3" role="group" aria-label="更新星期">
@@ -766,6 +778,8 @@
         discoveryLoading: false,
         discoveryError: '',
         discoverySearchDetails: {},
+        discoveryFailedItem: null,
+        discoveryShareUrl: '',
         discoveryDay: new Date(Date.now() + 8 * 3600000).getUTCDay() || 7,
         discoveryKind: 'donghua',
         subscribing: '',
@@ -884,7 +898,7 @@
           }
           return groups;
         },
-        async subscribeDiscovery(item) {
+        async subscribeDiscovery(item, shareurl = '') {
           if (this.configModified) {
             this.showToast('请先保存当前配置，再订阅资源', 'warning');
             return;
@@ -892,9 +906,17 @@
           this.subscribing = item.id;
           this.discoveryError = '';
           this.discoverySearchDetails = {};
+          if (!shareurl) {
+            this.discoveryFailedItem = null;
+            this.discoveryShareUrl = '';
+          }
           try {
-            const response = await axios.post('/api/discovery/subscribe', { id: item.id });
+            const payload = { id: item.id };
+            if (shareurl) payload.shareurl = shareurl.trim();
+            const response = await axios.post('/api/discovery/subscribe', payload);
             if (!response.data.success) throw new Error(response.data.message);
+            this.discoveryFailedItem = null;
+            this.discoveryShareUrl = '';
             await this.fetchData();
             this.showToast(response.data.message, 'success');
             if (!response.data.existing) {
@@ -904,6 +926,7 @@
           } catch (error) {
             this.discoveryError = `《${item.title}》：` + (error.response?.data?.message || error.message || '订阅失败，请重试');
             this.discoverySearchDetails = error.response?.data || {};
+            this.discoveryFailedItem = item;
           } finally {
             this.subscribing = '';
           }

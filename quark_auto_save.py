@@ -79,6 +79,18 @@ def is_expired_share(response):
     ))
 
 
+def share_listing_complete(response):
+    data = response.get("data") or {}
+    files = data.get("list")
+    if response.get("code") != 0 or not isinstance(files, list) or data.get("truncated"):
+        return False
+    # 接口的总数可能包含已隐藏文件；实际读到成功空页也代表可见列表结束。
+    if data.get("listing_complete") is True:
+        return True
+    total = (response.get("metadata") or {}).get("_total", len(files))
+    return type(total) is int and 0 <= total <= len(files)
+
+
 _RESOURCE_SEASON_PATTERN = r"第\s*([\d零一二三四五六七八九十两]+)\s*[季部]|\bseason\s*(\d{1,2})\b|(?<![a-z])s(\d{1,2})(?=e\d|\b)"
 
 
@@ -922,6 +934,8 @@ class Quark:
     ):
         temporary_error = {"code": 1, "status": 503, "message": "分享服务暂不可用或返回格式异常，请稍后重试"}
         list_merge = []
+        share_info = None
+        complete = False
         page = 1
         while True:
             url = f"{self.BASE_URL}/1/clouddrive/share/sharepage/detail"
@@ -958,6 +972,8 @@ class Quark:
             if not isinstance(data, dict) or not isinstance(data.get("list"), list):
                 return temporary_error
             files = data["list"]
+            if page == 1:
+                share_info = data.get("share")
             if any(not isinstance(item, dict) or not isinstance(item.get("file_name"), str)
                    or "fid" not in item or not isinstance(item.get("dir"), bool) for item in files):
                 return temporary_error
@@ -969,12 +985,17 @@ class Quark:
                 list_merge += files
                 page += 1
             else:
+                complete = True
                 break
             if len(list_merge) >= total or (max_pages and page > max_pages):
+                complete = len(list_merge) >= total
                 if len(list_merge) < total:
                     response["data"]["truncated"] = True
                 break
         response["data"]["list"] = list_merge
+        response["data"]["listing_complete"] = complete
+        if isinstance(share_info, dict):
+            response["data"]["share"] = share_info
         return response
 
     def get_fids(self, file_paths):
@@ -1276,6 +1297,20 @@ class Quark:
             print(f"❌ 转存测试失败: {str(e)}")
             traceback.print_exc()
 
+    def verify_resource_link(self, task, shareurl):
+        from app.sdk.common import normalize_share_url
+
+        normalized = normalize_share_url(shareurl) if isinstance(shareurl, str) and len(shareurl) <= 4096 else ""
+        if not normalized or not task.get("taskname", "").strip():
+            return {"success": False, "candidate": None, "code": "invalid_link",
+                    "error": "请填写有效的夸克分享链接和作品名称"}
+        aliases = task.get("search_aliases", [])
+        aliases = [value.strip() for value in aliases if isinstance(value, str) and value.strip() and len(value) <= 200][:8] if isinstance(aliases, list) else []
+        return self._find_verified_resource(
+            task, [{"taskname": task["taskname"], "shareurl": normalized}], set(), aliases,
+            max_checked=1, verify_index_title=False,
+        )
+
     def find_valid_resource(self, task, config, required_episodes=None):
         from resource_search import search_resources, search_web_resources, search_error_reason
 
@@ -1401,10 +1436,7 @@ class Quark:
 
         def listing_is_complete(detail):
             nonlocal limited
-            data = detail.get("data") or {}
-            files = data.get("list", [])
-            total = (detail.get("metadata") or {}).get("_total", len(files))
-            complete = not data.get("truncated") and type(total) is int and 0 <= total <= len(files)
+            complete = share_listing_complete(detail)
             if not complete:
                 limited = True
             return complete
@@ -1478,8 +1510,7 @@ class Quark:
                                 and (not years or not child_years or child_years == years)
                             ):
                                 matching.append(item)
-                        total = (detail.get("metadata") or {}).get("_total", len(files))
-                        if len(matching) > 1 or (matching and total > len(files)):
+                        if len(matching) > 1:
                             ambiguous = True
                             break
                         if not matching:
@@ -1740,10 +1771,7 @@ class Quark:
                 raise ValueError("分享目录读取失败")
             data = response.get("data") or {}
             files = data.get("list")
-            if not isinstance(files, list) or data.get("truncated"):
-                raise ValueError("分享目录未完整读取")
-            total = (response.get("metadata") or {}).get("_total", len(files))
-            if type(total) is not int or total > len(files):
+            if not share_listing_complete(response):
                 raise ValueError("分享目录未完整读取")
             count += len(files)
             if count > 10000:

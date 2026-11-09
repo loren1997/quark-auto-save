@@ -6,7 +6,7 @@
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.3 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.3) 中的 `quark-auto-save-nas-docker-v3.3.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.4 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.4) 中的 `quark-auto-save-nas-docker-v3.4.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -68,6 +68,8 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 
 搜索会从索引返回的结构化结果和公开帖子正文中提取夸克链接、就近关联提取码。“网页搜索”默认启用，通过 DuckDuckGo 和 Bing 查询公开网页，再读取有限数量的结果页面提取夸克链接。任务列表搜索会合并这些结果；自动订阅与失效换源在索引未找到可验证候选时再补搜网页。页面不执行脚本、不登录，也不绕过验证码；搜索引擎返回验证码或网络失败会明确报错。
 
+搜索结果摘要中的完整夸克链接同样进入候选验证；落地页 HTTP 403 等错误不会丢弃已经取得的候选。部分搜索源失败时继续使用其他来源的结果。错误导致的空结果不缓存为“没有资源”，再次操作会重新查询。
+
 网页搜索使用独立请求，不使用账号 Cookie、`.netrc` 或操作系统保存的代理配置；NAS 必须能访问对应搜索引擎和网页。可在容器环境中显式设置 `HTTP_PROXY` / `HTTPS_PROXY` 使用自己信任的代理，代理负责最终域名解析和转发。网络受限时也可在系统配置关闭“网页搜索”，继续使用自托管 PanSou/CloudSaver。网页来源及真实标题会保留，自动订阅仍检查夸克分享中的实际文件。
 
 使用仓库或发布包的 Compose 时，可在 `.env` 增加 `QAS_PROXY=http://你的代理局域网地址:端口`，然后 `docker compose up -d` 重建应用容器。默认不启用代理；不要把 NAS 以外的代理写成 `127.0.0.1`，该地址在容器内指向容器自身。
@@ -75,6 +77,8 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 “分享失效时自动搜索并替换”默认启用。每次正常任务运行时，会重新检查原分享和旧版标记失效的分享；明确取消、过期、不存在，或完整扫描确认分享不含视频时，会尝试查找新来源。只有字幕的分享也不作为视频资源。登录、提取码、网络和限流错误，以及未完成的分页或目录扫描，都不会被误判为无视频，会保留原订阅，下次重试。
 
 候选需满足标题、季数和已知年份约束，并确认实际分享包含视频；纯字幕、文档或广告候选会跳过并继续查找。索引最多检查 5 个候选，网页补搜最多检查 3 个新候选；每层目录最多验证 3 页，未完整读取时不贸然确认。无法可靠匹配时保留原订阅并输出日志。换源沿用任务当前的目录、筛选、命名和周期；旧分享的 `startfid` 无法迁移，会清除。最近 10 次替换记录仅保存分享 ID，不包含验证 token。
+
+夸克接口的总数可能与实际可见条目数不一致。V3.4 会以成功读取的空终页确认列表结束，不再仅因计数差异拒绝有效分享；分页达到上限、超时或读取失败仍按未完成处理，不据此认定无视频。
 
 热门订阅会使用目录来源的别名，包括 Bangumi 中原名相同且明确关联为原作书籍的中文译名。最多保留 8 个别名，先查询不带年份的不同名称，再补充季号写法与基础片名；索引阶段最多 12 个关键词并设有时间预算，连续两次所有源失败会提前进入网页补搜。网页补搜最多 2 个名称。查询时去掉年份或季数不代表取消验证约束。
 
@@ -93,6 +97,8 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 ## 4. 热门追更
 
 左侧“热门追更”按周一到周日显示，分国漫、动漫、电视剧，默认打开国漫。一键订阅先搜索并验证资源，再保存任务并立即调用转存，之后按系统定时规则持续追更。重复点击或来源切换时会检查已有订阅。若浏览器在创建订阅后关闭，已保存的任务仍会在下一次定时运行时执行。
+
+一键搜索失败后，可在报错下方粘贴该作品的夸克分享链接（可包含提取码）。此方式直接验证所填分享，不依赖搜索引擎；仍需通过同作品、同季、已知年份及实际视频检查，成功后沿用原订阅目录、命名和 Aria2 设置。请粘贴夸克分享链接，而非 Google 搜索页或普通资源帖子。
 
 - 国漫整合哔哩哔哩官方国创周历与 TVmaze 中国电视/网络播出排期，无论 Bangumi 是否可用均独立显示；TVmaze 国漫最多收录本周 60 部，实际数量以来源为准。同日同规范标题优先显示 B站官方条目，不合并明确不同季的标题。
 - 国漫按来源分组、各自热度排序，B站追番人数不与 TVmaze 的 0–100 热度混算。B站条目显示集数及已发布、待发布或延期状态。
@@ -128,16 +134,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.3：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.4：先下载并检查新配置、拉取镜像，再停止维护版并备份；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.3/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.4/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.3-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.4-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"
@@ -170,7 +176,7 @@ GitHub Actions 会先跑 Python 3.11/3.13 测试，再构建 amd64/arm64 镜像�
 
 - 无法搜索：查看页面源错误和 `docker compose logs --tail=100 pansou`；确认地址为 `http://pansou:8888`。公共 `https://so.252035.xyz` 可作备用，但没有稳定性保证。
 - 动漫源超时：页面会显示降级。如果你有自己的网络代理，可在 Compose 的服务 `environment` 中配置标准 `HTTPS_PROXY`，同时设置 `NO_PROXY: localhost,127.0.0.1,pansou`；不要关闭 TLS 校验。无需代理也能查看可达来源。
-- “未找到匹配的有效资源”：日历有片名不代表网络上存在可用的夸克分享；在任务列表检查名称、季数、年份，手动选择正确分享。
+- “未找到匹配的有效资源”：展开“查看搜索详情”区分来源故障与候选验证失败；已有有效分享时，可在热门页报错下粘贴该作品的夸克链接直接验证订阅。日历有片名不保证分享存在或可用。
 - 网页搜索会分别显示 Bing、DuckDuckGo 及落地页的 DNS、TLS、代理、验证码、超时等错误；只有真实代理故障才需要检查代理设置。NAS 能正常搜到候选而验证失败时，应核对实际文件名称和目录年份。
 - “配置已被更新”：任务自动换源或另一页面写入了新配置。刷新后重新编辑，避免把新订阅或修复结果覆盖掉。
 - 订阅已创建但没转存：查看手动运行日志、Cookie 是否有效、目标网盘空间；在任务列表运行该任务重试。

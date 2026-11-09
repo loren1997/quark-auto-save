@@ -37,6 +37,20 @@ class WebSearchTests(unittest.TestCase):
         rss = '<rss><channel><item><title>作品</title><link>https://example.com/show</link><description>资源</description></item></channel></rss>'
         self.assertEqual(_search_results("Bing", rss, "https://bing.com")[0]["title"], "作品")
 
+    def test_duck_snippets_stay_with_their_matching_result(self):
+        html = f'''
+            <a class="result__snippet" href="https://example.com/a">孤立摘要 {URL}</a>
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=heading">作品 A</a>
+            <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=snippet"><b>作品 A</b> {URL} 提取码 AA11</a>
+            <a class="result__a" href="https://example.com/b">作品 B</a>
+            <a class="result__snippet" href="https://example.com/a">其他条目 提取码 XX99</a>
+            <a class="result__snippet" href="https://example.com/b">作品 B 提取码 BB22</a>
+        '''
+        rows = _search_results("DuckDuckGo", html, "https://html.duckduckgo.com/html/")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["snippet"], f"作品 A {URL} 提取码 AA11")
+        self.assertEqual(rows[1]["snippet"], "作品 B 提取码 BB22")
+
     def test_challenges_and_changed_pages_are_errors_not_empty(self):
         for engine, body in (("DuckDuckGo", '<form id="challenge-form"></form>'),
                              ("DuckDuckGo", "<html>unexpected</html>"),
@@ -135,6 +149,52 @@ class WebSearchTests(unittest.TestCase):
         self.client._fetch.side_effect = SearchError("offline")
         with self.assertRaisesRegex(SearchError, "offline"):
             self.client.search("作品", refresh=True)
+
+    @patch("app.sdk.websearch._validate_url", return_value="example.com")
+    def test_landing_page_403_keeps_snippet_share_and_other_page_results(self, validate):
+        other = "https://pan.quark.cn/s/other"
+        duck = f'''
+            <a class="result__a" href="https://example.com/blocked">作品 A</a>
+            <a class="result__snippet" href="https://example.com/blocked">{URL} 提取码 AA11</a>
+            <a class="result__a" href="https://example.com/working">作品 B</a>
+            <a class="result__snippet" href="https://example.com/working">作品 B 提取码 BB22</a>
+        '''
+        def fetch(url, deadline):
+            if "duckduckgo.com" in url:
+                return duck, url
+            if "bing.com" in url:
+                return "<rss><channel/></rss>", url
+            if url.endswith("blocked"):
+                raise SearchError("网页 HTTP 403")
+            return f'<title>作品 B</title><p><a href="{other}">下载</a> 提取码 BB22</p>', url
+        self.client._fetch = Mock(side_effect=fetch)
+        rows = self.client.search("作品")
+        self.assertEqual({row["shareurl"] for row in rows}, {URL + "?pwd=AA11", other + "?pwd=BB22"})
+        self.assertEqual(rows[0]["taskname"], "作品 A")
+        self.assertIn("DuckDuckGo 落地页: 网页 HTTP 403", self.client.errors)
+
+    @patch("app.sdk.websearch._validate_url", return_value="example.com")
+    def test_failed_empty_search_is_retried_without_refresh(self, validate):
+        def fetch(url, deadline):
+            if "duckduckgo.com" in url:
+                return '<a class="result__a" href="https://example.com/blocked">作品</a>', url
+            if "bing.com" in url:
+                return "<rss><channel/></rss>", url
+            raise SearchError("网页 HTTP 403")
+        self.client._fetch = Mock(side_effect=fetch)
+        self.assertEqual(self.client.search("作品"), [])
+        self.assertNotIn("作品", _cache)
+        self.assertEqual(self.client.search("作品"), [])
+        self.assertEqual(self.client._fetch.call_count, 6)
+
+    def test_successful_empty_search_is_cached(self):
+        def fetch(url, deadline):
+            return ('<div class="no-results">No results found</div>' if "duckduckgo.com" in url
+                    else "<rss><channel/></rss>"), url
+        self.client._fetch = Mock(side_effect=fetch)
+        self.assertEqual(self.client.search("作品"), [])
+        self.assertEqual(self.client.search("作品"), [])
+        self.assertEqual(self.client._fetch.call_count, 2)
 
     def test_visible_text_and_anchor_links_do_not_execute_or_parse_scripts(self):
         page = _Page(f'<title>作品</title><script>"https://pan.quark.cn/s/evil"</script><a href="{URL}">下载</a> 提取码: ab12')
