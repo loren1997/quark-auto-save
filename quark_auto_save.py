@@ -149,7 +149,7 @@ def _resource_video_title(filename):
 
 def _resource_episode_number(task, filename):
     """只识别单作品目录中的明确集号，不用重命名规则里的任意数字兜底。"""
-    if not re.search(r"\.(?:mp4|mkv|mov|m4v|avi|ts|m2ts|wmv|flv|webm)$", filename, re.I):
+    if not is_video_file({"file_name": filename}):
         return None
     title = task.get("taskname", "")
     name, seasons, years = _resource_title_parts(title)
@@ -192,13 +192,13 @@ def _episode_repair_files(task, files, required_episodes):
     pattern, replace = mr.magic_regex_conv(task.get("pattern", ""), task.get("replace", ""))
     selected, numbers = {}, set()
     for item in files:
-        if item.get("dir") or item.get("obj_category", "video") != "video":
+        if not is_video_file(item):
             continue
         filename = item.get("file_name", "")
         episode = _resource_episode_number(task, filename)
         if episode not in required_episodes or episode in numbers or not re.search(pattern, filename):
             continue
-        renamed = mr.sub(pattern, replace, filename)
+        renamed = mr.media_name(pattern, replace, filename)
         if _resource_episode_number(task, renamed) != episode:
             continue
         selected[item["fid"]] = episode
@@ -1327,6 +1327,7 @@ class Quark:
             if isinstance(entry, dict)
         }
         attempted, source_errors = [], []
+        failed_sources = set()
         index_deadline = time.monotonic() + 60
         interrupted = False
 
@@ -1340,6 +1341,7 @@ class Quark:
             nonlocal interrupted
             had_error, had_results = False, False
             consecutive_errors = 0
+            deferred = []
             for query in words:
                 if not web and time.monotonic() >= index_deadline:
                     interrupted = True
@@ -1348,7 +1350,7 @@ class Quark:
                 try:
                     # Reuse index caches; share validity is checked live below.
                     result = search_web_resources(query, config, refresh=False) if web else search_resources(
-                        query, config, refresh=False, include_web=False
+                        query, config, refresh=False, include_web=False, failed_sources=failed_sources
                     )
                 except (requests.RequestException, ValueError, TypeError) as exc:
                     record_error("网页搜索" if web else "索引搜索", type(exc).__name__)
@@ -1376,11 +1378,14 @@ class Quark:
                 if not entries and errors:
                     had_error = True
                 had_results = had_results or bool(entries)
-                for candidate in entries[:50]:
-                    if not web and time.monotonic() >= index_deadline:
-                        interrupted = True
-                        return
+                checked_before = len(visited)
+                for index, candidate in enumerate(entries[:50]):
+                    # 已返回的结果继续验证；截止线只阻止发起下一轮查询。
                     yield candidate
+                    if required_episodes and len(visited) - checked_before >= 2:
+                        deferred.extend(entries[index + 1:50])
+                        break  # 先给其他译名机会，再用剩余名额验证本次余下候选。
+            yield from deferred
             if had_error and not had_results:
                 raise requests.RequestException("搜索源不可用，请检查搜索配置")
 
@@ -1398,11 +1403,19 @@ class Quark:
                 if words and words[0] not in web_queries:
                     web_queries.append(words[0])
                     break
+        web_queries = web_queries[:2]
+        if required_episodes:
+            episode = min(required_episodes)
+            # 先找最早的缺集，再查整季合集；其他缺集仍从同一候选中一并补齐。
+            focused = [f"{word} {episode:02d}" for word in web_queries]
+            queries = list(dict.fromkeys(focused + web_queries
+                                        + [f"{word} 第{episode}集" for word in web_queries] + queries))
+            web_queries = list(dict.fromkeys(focused + web_queries))
         failures, visited = [], set()
-        for web, words in ((False, queries), (True, web_queries[:2])):
+        for web, words in ((False, queries), (True, web_queries)):
             try:
                 result = self._find_verified_resource(task, search_candidates(words, web), seen, aliases,
-                                                      visited=visited, max_checked=3 if web else 5,
+                                                      visited=visited, max_checked=(8 if web else 12) if required_episodes else (3 if web else 5),
                                                       verify_index_title=not web, required_episodes=required_episodes)
             except (requests.RequestException, ValueError, TypeError) as exc:
                 print(f"资源搜索异常：{type(exc).__name__}")
@@ -1415,6 +1428,7 @@ class Quark:
                       next((result for result in failures if result["code"] == "unavailable"), failures[0]))
         result["queries"] = list(dict.fromkeys(query for _, query in attempted))
         result["source_errors"] = source_errors
+        result["missing_in_candidates"] = sum(item.get("missing_in_candidates", 0) for item in failures)
         result["search_complete"] = not (source_errors or interrupted or any(item.get("validation_limited") for item in failures))
         if source_errors or interrupted:
             summary = "；".join(f"{error['source']}：{error['message']}" for error in source_errors[:3])
@@ -1427,7 +1441,7 @@ class Quark:
     def _find_verified_resource(self, task, candidates, seen, aliases, visited=None,
                                 max_checked=5, verify_index_title=True, required_episodes=None):
         title = task["taskname"]
-        checked, found_results = 0, False
+        checked, found_results, missing_in_candidates = 0, False, 0
         limited = False
         visited = visited if visited is not None else set()
         name, seasons, years = _resource_title_parts(title)
@@ -1441,14 +1455,21 @@ class Quark:
                 limited = True
             return complete
 
-        for candidate in candidates:
-            found_results = True
-            if checked >= max_checked:
-                limited = True
+        candidates = iter(candidates)
+        while checked < max_checked:
+            try:
+                candidate = next(candidates)
+            except StopIteration:
                 break
-            if not isinstance(candidate, dict) or (verify_index_title and not resource_titles_match(
-                title, candidate.get("taskname", ""), allow_missing_year=True, aliases=aliases
-            )):
+            found_results = True
+            if not isinstance(candidate, dict):
+                continue
+            candidate_title = candidate.get("taskname", "")
+            candidate_file = candidate_title if is_video_file({"file_name": candidate_title}) else f"{candidate_title}.mp4"
+            if verify_index_title and not resource_titles_match(
+                title, candidate_title, allow_missing_year=True, aliases=aliases
+            ) and not (required_episodes and isinstance(candidate_title, str)
+                       and _resource_episode_number(task, candidate_file) in required_episodes):
                 continue
             shareurl = candidate.get("shareurl", "")
             if not isinstance(shareurl, str):
@@ -1579,6 +1600,7 @@ class Quark:
                 if required_episodes is not None:
                     episode_fids = _episode_repair_files(task, video_files, required_episodes)
                     if not episode_fids:
+                        missing_in_candidates += 1
                         continue
                     pdir_fid = verified_pdir_fid
                 if selected_fid:
@@ -1591,8 +1613,11 @@ class Quark:
                 }, "error": ""}
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 print(f"候选分享验证失败：{type(exc).__name__}")
+        else:
+            limited = True
         return {"success": False, "candidate": None, "code": "no_match" if found_results else "no_results", "validation_limited": limited,
-                "error": "候选目录验证达到分页或深度上限，尚未完整确认可用视频" if limited else
+                "missing_in_candidates": missing_in_candidates,
+                "error": "候选验证达到数量、分页或目录深度上限，尚未完整确认可用视频" if limited else
                 "未找到经夸克视频文件验证的同名、同季、同年份资源，请尝试其他译名或手动选择链接" if found_results
                 else "已查询的来源未返回该名称的夸克资源，请尝试其他译名或手动搜索"}
 
@@ -1681,6 +1706,10 @@ class Quark:
             result = self.find_valid_resource(task, CONFIG_DATA, required_episodes=missing)
             if not result["success"]:
                 print(f"补集未完成：{result['error']}；原订阅和已有文件保留")
+                if result.get("queries"):
+                    print("补集已查询关键词：" + "、".join(result["queries"]))
+                if result.get("missing_in_candidates"):
+                    print(f"已验证 {result['missing_in_candidates']} 个同作品候选，但其中没有符合转存规则的缺失集视频")
                 return
             candidate = result["candidate"]
             supplement = self.dir_check_and_save(

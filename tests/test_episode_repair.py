@@ -116,6 +116,137 @@ class EpisodeRepairTests(unittest.TestCase):
         self.assertEqual(qas._episode_repair_files(renamed, files, {2}), {files[0]["fid"]: 2})
         self.assertEqual(qas._episode_repair_files({**renamed, "replace": "E09.mkv"}, files, {2}), {})
 
+    def test_supplement_uses_media_extensions_even_with_wrong_server_category(self):
+        task = {**self.task, "pattern": qas.MEDIA_PATTERN, "replace": "{TASKNAME} S01E{EXX}.{EXT}"}
+        for extension in ("mp4", "mts", "mpg", "rmvb"):
+            for category in (None, "document", "video"):
+                with self.subTest(extension=extension, category=category):
+                    item = {**video("Black Summoner 02." + extension, "second"), "obj_category": category}
+                    self.assertEqual(qas._episode_repair_files(task, [item], {2}), {"second": 2})
+        for filename in ("02.srt", "02.exe", "封面02.png"):
+            self.assertEqual(qas._episode_repair_files(task, [video(filename)], {2}), {})
+
+    def test_gap_queries_try_numbered_alias_and_broad_pack_before_giving_up(self):
+        self.task["taskname"] = "黑色召唤师 (2022)"
+        self.task["search_aliases"] = ["另一中文译名"]
+        expected = ["黑色召唤师 02", "另一中文译名 02", "黑色召唤师", "另一中文译名"]
+        for successful_query in expected[1:]:
+            with self.subTest(query=successful_query):
+                def search(query, *_args, **_kwargs):
+                    return {"success": True, "data": [{"taskname": "另一中文译名 02", "shareurl":
+                            "https://pan.quark.cn/s/second"}] if query == successful_query else []}
+                detail = self.files(["02.mkv"])
+                detail["data"]["share"] = {"title": "黑色召唤师 (2022)"}
+                with patch("resource_search.search_resources", side_effect=search) as lookup, \
+                        patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                        patch.object(self.account, "get_detail", return_value=detail):
+                    result = self.account.find_valid_resource(self.task, {}, required_episodes={2})
+                self.assertTrue(result["success"])
+                self.assertEqual([call.args[0] for call in lookup.call_args_list],
+                                 expected[:expected.index(successful_query) + 1])
+
+    def test_one_query_cannot_use_all_gap_candidate_slots(self):
+        self.task["taskname"] = "黑色召唤师 (2022)"
+        self.task["search_aliases"] = ["另一中文译名"]
+        def search(query, *_args, **_kwargs):
+            return {"success": True, "data": [self.candidate("with")] if query == "另一中文译名 02"
+                    else [self.candidate("without" + str(n)) for n in range(10)]}
+        def detail(share, *_args, **_kwargs):
+            result = self.files(["02.mkv" if share == "with" else "03.mkv"])
+            result["data"]["share"] = {"title": "黑色召唤师 (2022)"}
+            return result
+        with patch("resource_search.search_resources", side_effect=search) as lookup, \
+                patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}) as token, \
+                patch.object(self.account, "get_detail", side_effect=detail):
+            result = self.account.find_valid_resource(self.task, {}, required_episodes={2})
+        self.assertTrue(result["success"])
+        self.assertEqual(lookup.call_count, 2)
+        self.assertEqual(token.call_count, 3)
+
+    def test_valid_gap_candidate_returned_after_search_deadline_is_still_verified(self):
+        detail = self.files(["02.mkv"])
+        detail["data"]["share"] = {"title": "黑色召唤师 (2022)"}
+        clock = {"now": 0}
+        def slow_search(*_args, **_kwargs):
+            clock["now"] = 61
+            return {"success": True, "data": [self.candidate("second")],
+                    "errors": [{"source": "PanSou 聚合 1", "message": "ReadTimeout"}]}
+        with patch("resource_search.search_resources", side_effect=slow_search), \
+                patch.object(qas.time, "monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}) as token, \
+                patch.object(self.account, "get_detail", return_value=detail):
+            result = self.account.find_valid_resource(self.task, {}, required_episodes={2})
+        self.assertTrue(result["success"])
+        token.assert_called_once()
+
+    def test_later_candidate_is_deferred_for_aliases_but_never_discarded(self):
+        candidates = [self.candidate("without0"), self.candidate("without1"), self.candidate("with")]
+        calls = []
+        def search(query, *_args, **_kwargs):
+            calls.append(query)
+            return {"success": True, "data": candidates if len(calls) == 1 else []}
+        def detail(share, *_args, **_kwargs):
+            result = self.files(["02.mkv" if share == "with" else "03.mkv"])
+            result["data"]["share"] = {"title": "黑色召唤师 (2022)"}
+            return result
+        with patch("resource_search.search_resources", side_effect=search), \
+                patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                patch.object(self.account, "get_detail", side_effect=detail):
+            result = self.account.find_valid_resource(self.task, {}, required_episodes={2})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["candidate"]["pwd_id"], "with")
+        self.assertGreater(len(calls), 1)
+
+    def test_exhausted_validation_budget_does_not_start_another_network_query(self):
+        def candidates():
+            yield self.candidate("first")
+            self.fail("验证名额用完后不应继续取候选或发起网络查询")
+        detail = self.files(["03.mkv"])
+        detail["data"]["share"] = {"title": "黑色召唤师 (2022)"}
+        with patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                patch.object(self.account, "get_detail", return_value=detail):
+            result = self.account._find_verified_resource(
+                self.task, candidates(), set(), self.task["search_aliases"], max_checked=1, required_episodes={2})
+        self.assertFalse(result["success"])
+        self.assertTrue(result["validation_limited"])
+
+    def test_numbered_index_titles_still_require_real_matching_share_files(self):
+        for filename in ("黑色召唤师 02", "黑色召唤师 02.mkv", "黑色召唤师 EP02.mp4"):
+            with self.subTest(filename=filename):
+                detail = self.files(["02.mkv"])
+                detail["data"]["share"] = {"title": "黑色召唤师 (2022)"}
+                candidate = {**self.candidate("second"), "taskname": filename}
+                with patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                        patch.object(self.account, "get_detail", return_value=detail):
+                    result = self.account._find_verified_resource(
+                        self.task, [candidate], set(), self.task["search_aliases"], required_episodes={2})
+                self.assertTrue(result["success"])
+        for title in ("另一部作品 (2022)", "黑色召唤师 (2021)", "黑色召唤师 第二季 (2022)"):
+            with self.subTest(title=title):
+                detail = self.files(["02.mkv"])
+                detail["data"]["share"] = {"title": title}
+                candidate = {**self.candidate("second"), "taskname": "黑色召唤师 EP02"}
+                with patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}) as token, \
+                        patch.object(self.account, "get_detail", return_value=detail):
+                    result = self.account._find_verified_resource(
+                        self.task, [candidate], set(), self.task["search_aliases"], required_episodes={2})
+                self.assertFalse(result["success"])
+                token.assert_called_once()
+
+    def test_missing_episode_failure_logs_queries_and_verified_candidate_reason(self):
+        target = self.files(["01.mkv", "03.mkv"])
+        candidate_detail = self.files(["01.mkv", "03.mkv"])
+        candidate_detail["data"]["share"] = {"title": "黑色召唤师 (2022)"}
+        with patch.object(self.account, "ls_dir", return_value=target), \
+                patch("resource_search.search_resources", return_value={"success": True, "data": [self.candidate("missing")]}), \
+                patch("resource_search.search_web_resources", return_value={"success": True, "data": []}), \
+                patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                patch.object(self.account, "get_detail", return_value=candidate_detail):
+            self.account.repair_episode_gaps(self.task, self.tree())
+        self.assertIn("补集已查询关键词", self.output.getvalue())
+        self.assertIn("已验证 1 个同作品候选", self.output.getvalue())
+        self.assertNotIn("补集转存成功", self.output.getvalue())
+
     def test_candidate_file_changed_before_transfer_is_not_saved(self):
         for changed_name in ("03.mkv", "S02E02.mkv", "Other Show 02.mkv"):
             with self.subTest(filename=changed_name), \

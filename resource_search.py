@@ -100,11 +100,12 @@ def search_web_resources(query, config, refresh=False):
         client.session.close()
 
 
-def search_resources(query, config, refresh=False, include_web=True):
+def search_resources(query, config, refresh=False, include_web=True, failed_sources=None):
     """聚合网盘索引与公开网页；索引源最多三个 PanSou 与一个 CloudSaver。
 
     PanSou fallback_servers 与 PANSOU_FALLBACK_SERVERS 环境变量为补充源，
     不转发主源 token；channels/plugins 可为数组或逗号、空白分隔名称。
+    failed_sources 可由一次自动查找的多个关键词共用，避免重复等待故障源。
     返回 {success, data, errors, message}，所有源故障时 success=False。
     """
     if not isinstance(query, str) or len(query) > 200:
@@ -113,6 +114,7 @@ def search_resources(query, config, refresh=False, include_web=True):
     if not query:
         return {"success": True, "data": [], "errors": [], "message": ""}
     sources = config.get("source") or {}
+    failed_sources = failed_sources if failed_sources is not None else set()
     results, errors, jobs = [], [], []
     successful = 0
     ps = sources.get("pansou") or {}
@@ -172,8 +174,9 @@ def search_resources(query, config, refresh=False, include_web=True):
             client.session.close()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [(job[0], executor.submit(search_source, job)) for job in jobs]
-        for label, future in futures:
+        futures = [(job, executor.submit(search_source, job)) for job in jobs
+                   if (job[0], job[1]) not in failed_sources]
+        for (label, server, _token), future in futures:
             try:
                 entries, warnings, source_ok = future.result()
                 successful += bool(source_ok)
@@ -181,9 +184,12 @@ def search_resources(query, config, refresh=False, include_web=True):
                 results.extend({**item, "source": item.get("source") or label} if label == "网页搜索"
                                else {**item, "source": label} for item in entries)
             except (SearchError, ValueError) as error:
+                failed_sources.add((label, server))
                 errors.append({"source": label, "message": str(error)})
     if not successful and not errors:
-        errors.append({"source": "搜索配置", "message": "没有启用的搜索源，请启用 PanSou、网页搜索或配置 CloudSaver"})
+        errors.append({"source": "搜索源" if jobs else "搜索配置", "message":
+                       "本次查找已跳过此前失败的来源" if jobs else
+                       "没有启用的搜索源，请启用 PanSou、网页搜索或配置 CloudSaver"})
     results.sort(key=lambda item: item.get("datetime", ""), reverse=True)
     unique = {}
     for item in results:

@@ -177,6 +177,46 @@ class SharedSearchTests(unittest.TestCase):
         result = search_resources("作品", {"source": {"pansou": {"fallback_servers": ["http://pansou:8888"]}}})
         self.assertTrue(result["data"])
 
+    @patch("resource_search.PanSou")
+    def test_failed_fallback_is_skipped_for_aliases_but_retried_in_next_find(self, pansou):
+        primary, backup = Mock(), Mock()
+        primary.search.side_effect = [[], [entry()], []]
+        backup.search.side_effect = [SearchError("网络请求失败 (ReadTimeout)"), []]
+        pansou.side_effect = lambda server, **kwargs: primary if server == DEFAULT_PANSOU_SERVER else backup
+        config = {"source": {"pansou": {"fallback_servers": ["https://backup.example"]}}}
+        failed_sources = set()
+        first = search_resources("作品", config, failed_sources=failed_sources)
+        self.assertTrue(first["success"])
+        self.assertEqual(first["data"], [])
+        self.assertEqual(first["errors"], [{"source": "PanSou 聚合 1", "message": "网络请求失败 (ReadTimeout)"}])
+        self.assertEqual(failed_sources, {("PanSou 聚合 1", "https://backup.example")})
+        second = search_resources("另一个译名", config, failed_sources=failed_sources)
+        self.assertEqual(second["data"][0]["shareurl"], URL)
+        self.assertEqual(backup.search.call_count, 1)
+        self.assertEqual([call.args[0] for call in primary.search.call_args_list], ["作品", "另一个译名"])
+        search_resources("下次运行", config, failed_sources=set())
+        self.assertEqual(backup.search.call_count, 2)
+
+    @patch("resource_search.PanSou")
+    def test_all_suppressed_sources_are_not_reported_as_disabled(self, pansou):
+        pansou.return_value.search.side_effect = ValueError("invalid JSON")
+        failed_sources = set()
+        first = search_resources("作品", {}, failed_sources=failed_sources)
+        second = search_resources("别名", {}, failed_sources=failed_sources)
+        self.assertFalse(first["success"])
+        self.assertIn("invalid JSON", first["message"])
+        self.assertFalse(second["success"])
+        self.assertIn("此前失败", second["message"])
+        self.assertNotIn("没有启用", second["message"])
+        pansou.return_value.search.assert_called_once()
+
+    @patch("resource_search.PanSou")
+    def test_default_calls_do_not_keep_failed_sources(self, pansou):
+        pansou.return_value.search.side_effect = [SearchError("offline"), [entry()]]
+        self.assertFalse(search_resources("作品", {})["success"])
+        self.assertTrue(search_resources("作品", {})["success"])
+        self.assertEqual(pansou.return_value.search.call_count, 2)
+
     @patch("resource_search.CloudSaver")
     @patch("resource_search.PanSou")
     def test_nonempty_sources_are_aggregated_and_merge_provenance(self, pansou, cloudsaver):
