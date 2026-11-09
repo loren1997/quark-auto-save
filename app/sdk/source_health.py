@@ -12,7 +12,8 @@ from .common import SearchError
 
 
 class SourceHealth:
-    DURATIONS = {"HTTP 429": 300, "HTTP 403": 900, "需要人工验证": 1800, "请求超时": 60}
+    DURATIONS = {"HTTP 429": 300, "HTTP 403": 900, "需要人工验证": 1800, "请求超时": 60,
+                 "搜索源上游协议错误": 300}
 
     def __init__(self, path=None):
         self.path = path

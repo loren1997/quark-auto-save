@@ -819,7 +819,7 @@ def init():
         source.setdefault("cloudsaver", {"enable": False, "server": "", "username": "", "password": ""})
         source.setdefault("websearch", {"enable": True})
         source.setdefault("channelsearch", {"enable": True,
-                                            "telegram_channels": ["Q_dongman", "guoman4K", "kuakedongman"],
+                                            "telegram_channels": ["guoman4K", "kuakedongman"],
                                             "qq_channels": ["pd26778899"]})
         if new_config and os.getenv("PANSOU_SERVER"):
             source["pansou"]["server"] = os.environ["PANSOU_SERVER"]

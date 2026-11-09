@@ -3,7 +3,7 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.sdk.common import SearchError
 from resource_search import search_error_reason, search_resources, search_web_resources
@@ -12,6 +12,33 @@ with contextlib.redirect_stdout(io.StringIO()):
 
 
 class SearchHealthIntegrationTests(unittest.TestCase):
+    def test_protocol_error_cools_only_broken_source_across_tasks_and_expires(self):
+        config = {"source": {"pansou": {"server": "https://broken.example",
+                                        "fallback_servers": ["https://working.example"]},
+                             "cloudsaver": {"enable": False}}}
+        broken, working = Mock(), Mock()
+        broken.search.side_effect = SearchError("搜索源上游协议错误")
+        working.search.return_value = [{"taskname": "作品", "shareurl": "https://pan.quark.cn/s/good"}]
+        with tempfile.TemporaryDirectory() as directory, patch("resource_search.PanSou") as constructor, \
+                patch.dict("os.environ", {"PANSOU_FALLBACK_SERVERS": ""}), \
+                patch("app.sdk.source_health.time.time", return_value=10000) as clock:
+            path = str(Path(directory) / "health.sqlite3")
+            constructor.side_effect = lambda server, **kwargs: broken if "broken" in server else working
+            first = search_resources("作品", config, include_web=False, health_path=path)
+            second = search_resources("另一作品", config, refresh=True, include_web=False, health_path=path)
+            self.assertEqual(first["errors"][0]["message"], "搜索源上游协议错误")
+            cooldown = "来源冷却中：搜索源上游协议错误（剩余 300 秒）"
+            self.assertEqual(second["errors"][0]["message"], cooldown)
+            self.assertEqual(search_error_reason(cooldown), cooldown)
+            for result in (first, second):
+                self.assertTrue(result["success"])
+                self.assertEqual(result["data"][0]["shareurl"], "https://pan.quark.cn/s/good")
+            self.assertEqual(broken.search.call_count, 1)
+            self.assertEqual(working.search.call_count, 2)
+            clock.return_value = 10301
+            search_resources("下次运行", config, include_web=False, health_path=path)
+            self.assertEqual(broken.search.call_count, 2)
+
     def test_pansou_timeout_is_shared_by_separate_searches(self):
         config = {"source": {"pansou": {"server": "https://index.example"},
                              "cloudsaver": {"enable": False}}}

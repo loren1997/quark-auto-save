@@ -33,9 +33,16 @@ class PanSou:
                 params["channels"] = channels
             if plugins:
                 params["plugins"] = plugins
-            response = self.session.post(url, json=params, timeout=(5, 25))
-            response.raise_for_status()
-            result = response.json()
+            response = self.session.post(url, json=params, timeout=(5, 25), stream=True)
+            try:
+                if response.status_code == 400:
+                    prefix = next(response.iter_content(chunk_size=2048), b"")
+                    if b"the plain http request was sent to https port" in prefix.lower():
+                        raise SearchError("搜索源上游协议错误")
+                response.raise_for_status()
+                result = response.json()
+            finally:
+                response.close()
         except requests.HTTPError as error:
             raise SearchError(f"HTTP {error.response.status_code}") from error
         except requests.RequestException as error:

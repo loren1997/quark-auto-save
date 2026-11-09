@@ -561,6 +561,17 @@ class Config:
         return plugins_available, plugins_config, task_plugins_config
 
     def breaking_change_update(config_data):
+        from app.sdk.channel_search import DEFAULT_TELEGRAM_CHANNELS
+
+        source = config_data.get("source")
+        channelsearch = source.get("channelsearch") if isinstance(source, dict) else None
+        if isinstance(channelsearch, dict):
+            channels = channelsearch.get("telegram_channels")
+            if isinstance(channels, str):
+                channels = [item.lstrip("@") for item in re.split(r"[,，\s]+", channels.strip()) if item]
+            # 旧默认频道已改作钱包验证，只迁移原厂名单，保留用户自定义频道。
+            if channels == ["Q_dongman", "guoman4K", "kuakedongman"]:
+                channelsearch["telegram_channels"] = list(DEFAULT_TELEGRAM_CHANNELS)
         discovery = config_data.setdefault("discovery", {})
         if isinstance(discovery, dict) and discovery.get("savepath") in (None, "/追更"):
             discovery["savepath"] = "/cartoon"

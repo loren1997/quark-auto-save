@@ -6,7 +6,7 @@ from urllib.parse import urlencode, urljoin, urlsplit
 from .common import SearchError
 
 
-DEFAULT_TELEGRAM_CHANNELS = ["Q_dongman", "guoman4K", "kuakedongman"]
+DEFAULT_TELEGRAM_CHANNELS = ["guoman4K", "kuakedongman"]
 DEFAULT_QQ_CHANNELS = ["pd26778899"]
 
 

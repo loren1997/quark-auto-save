@@ -83,7 +83,13 @@ def response_shape(body, content_type):
     try:
         value = json.loads(body)
     except (ValueError, UnicodeError):
-        return {"structure": "html" if "html" in content_type.lower() else "non_json"}
+        result = {"structure": "html" if "html" in content_type.lower() else "non_json"}
+        text = (body.decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else str(body)).lower()
+        if result["structure"] == "html" and (
+                ("eo_bot_ssid" in text and "__tst_status" in text)
+                or "challenge-form" in text or "cf-chl-" in text):
+            result["error"] = "browser_verification_required"
+        return result
     if isinstance(value, list):
         return {"structure": "json_array", "items": len(value)}
     if not isinstance(value, dict):
@@ -119,9 +125,12 @@ def check_http(url, direct=False):
                 for chunk in response.iter_content(chunk_size=4096):
                     body.extend(chunk)
                     if len(body) > MAX_BYTES or time.monotonic() - started > TIMEOUT * 2:
+                        result.update(response_shape(body[:MAX_BYTES], response.headers.get("Content-Type", "")))
                         result["structure"] = "read_limit"
                         return result
                 result.update(response_shape(body, response.headers.get("Content-Type", "")))
+                if response.status_code == 400 and b"the plain http request was sent to https port" in body.lower():
+                    result["error"] = "upstream_protocol_error"
         except (requests.RequestException, OSError, ValueError) as error:
             result["error"] = error_reason(error)
         finally:

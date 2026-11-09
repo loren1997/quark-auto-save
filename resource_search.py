@@ -20,9 +20,11 @@ MAX_PANSOU_SERVERS = 3
 def search_error_reason(message):
     """Only fixed diagnostic categories may leave a transport exception."""
     message = str(message)
-    cooldown = re.fullmatch(r"来源冷却中：(HTTP (?:403|429)|需要人工验证|请求超时)（剩余 (\d{1,8}) 秒）", message)
+    cooldown = re.fullmatch(r"来源冷却中：(HTTP (?:403|429)|需要人工验证|请求超时|搜索源上游协议错误)（剩余 (\d{1,8}) 秒）", message)
     if cooldown:
         return cooldown.group(0)
+    if message == "搜索源上游协议错误":
+        return message
     status = re.search(r"HTTP\s*(\d{3})", message, re.I)
     if status:
         return f"HTTP {status.group(1)}"
@@ -186,7 +188,7 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
             return client.search(query, refresh=refresh, **selection), [], True
         except SearchError as error:
             reason = search_error_reason(error)
-            if reason in {"HTTP 403", "HTTP 429", "需要人工验证", "请求超时"}:
+            if reason in SourceHealth.DURATIONS:
                 response = getattr(error.__cause__, "response", None)
                 retry_after = response.headers.get("Retry-After") if response is not None else None
                 health.record(server, reason, retry_after=retry_after)

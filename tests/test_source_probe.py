@@ -66,6 +66,26 @@ class SourceProbeTests(unittest.TestCase):
         self.assertEqual(probe.error_reason(socket.gaierror("secret")), "dns_failed")
         self.assertEqual(probe.error_reason(requests.ReadTimeout("secret")), "timeout")
 
+    def test_http_200_challenge_is_not_reported_as_normal_html(self):
+        body = b'<html><script>EO_Bot_Ssid="secret"; __tst_status=1;</script></html>'
+        self.assertEqual(probe.response_shape(body, "text/html"),
+                         {"structure": "html", "error": "browser_verification_required"})
+        self.assertEqual(probe.response_shape(b'{"message":"EO_Bot_Ssid __tst_status"}', "application/json"),
+                         {"structure": "json_object", "search_fields": False})
+
+    def test_protocol_error_reports_fixed_reason_without_html_body(self):
+        session = Mock(headers={})
+        response = Mock(status_code=400, headers={"Content-Type": "text/html"})
+        response.iter_content.return_value = [b'<html>The plain HTTP request was sent to HTTPS port secret</html>']
+        session.get.return_value.__enter__ = Mock(return_value=response)
+        session.get.return_value.__exit__ = Mock(return_value=False)
+        with patch.object(probe.requests, "Session") as factory:
+            factory.return_value.__enter__.return_value = session
+            result = probe.check_http("https://example.com", direct=True)
+        self.assertEqual(result["error"], "upstream_protocol_error")
+        self.assertNotIn("secret", json.dumps(result))
+        session.get.assert_called_once()
+
     def test_ipv4_ipv6_separated_and_dns_failure_does_not_connect(self):
         with patch.object(probe, "resolve", return_value=([], "dns_failed")), patch.object(probe.socket, "socket") as sock:
             result = probe.direct_tcp("example.com", 443)

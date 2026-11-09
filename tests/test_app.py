@@ -569,7 +569,7 @@ class AppIntegrationTests(unittest.TestCase):
             web.init()
             defaults = self.saved_config()["source"]["channelsearch"]
             self.assertTrue(defaults["enable"])
-            self.assertEqual(defaults["telegram_channels"], ["Q_dongman", "guoman4K", "kuakedongman"])
+            self.assertEqual(defaults["telegram_channels"], ["guoman4K", "kuakedongman"])
             self.assertEqual(defaults["qq_channels"], ["pd26778899"])
             current = self.saved_config()
             current["source"]["channelsearch"] = {"enable": False, "telegram_channels": ["my_channel"]}

@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 from app.sdk.channel_search import channel_queries, channel_results
 from app.sdk.common import SearchError
 from app.sdk.websearch import WebSearch, _cache
+from quark_auto_save import Config
 
 
 SHARE = "https://pan.quark.cn/s/correct"
@@ -36,6 +37,22 @@ class ChannelSearchTests(unittest.TestCase):
                        {"telegram_channels": [1]}, {"qq_channels": "user:password@private"}):
             with self.subTest(config=config), self.assertRaises(SearchError):
                 channel_queries(config, "作品")
+
+    def test_retired_channel_is_removed_only_from_exact_legacy_defaults(self):
+        legacy = ["Q_dongman", "guoman4K", "kuakedongman"]
+        for channels in (legacy, ",".join(legacy), "\n".join(legacy)):
+            with self.subTest(channels=channels):
+                config = {"source": {"channelsearch": {"enable": False, "telegram_channels": channels,
+                                                        "qq_channels": ["pd123456"]}}}
+                Config.breaking_change_update(config)
+                self.assertEqual(config["source"]["channelsearch"], {
+                    "enable": False, "telegram_channels": ["guoman4K", "kuakedongman"],
+                    "qq_channels": ["pd123456"]})
+        for channels in ([], ["Q_dongman"], legacy + ["my_channel"], "Q_dongman,my_channel"):
+            with self.subTest(custom=channels):
+                config = {"source": {"channelsearch": {"telegram_channels": channels}}}
+                Config.breaking_change_update(config)
+                self.assertEqual(config["source"]["channelsearch"]["telegram_channels"], channels)
 
     def test_telegram_messages_keep_titles_links_and_passwords_separate(self):
         html = (telegram_message("Anime_Test/1", f'名称：目标作品 2026<br>夸克：<a href="{SHARE}">网盘</a> 提取码 AA11')
@@ -117,14 +134,14 @@ class ChannelSearchTests(unittest.TestCase):
         client._fetch = Mock(side_effect=fetch)
         with self.assertRaises(SearchError):
             client.search("目标作品", channel_config={})
-        self.assertEqual(len(deadlines), 9)
+        self.assertEqual(len(deadlines), 8)
         self.assertEqual(len(set(deadlines)), 1)
         self.assertEqual(maximum, 2)
         urls = [call.args[0] for call in client._fetch.call_args_list]
         self.assertIn("meijusou.com", urls[0])
-        self.assertIn("t.me/s/Q_dongman", urls[1])
+        self.assertIn("t.me/s/guoman4K", urls[1])
         self.assertIn("duckduckgo.com", urls[2])
-        self.assertIn("t.me/s/guoman4K", urls[3])
+        self.assertIn("t.me/s/kuakedongman", urls[3])
 
     @patch("app.sdk.websearch._validate_url")
     def test_channel_requests_reuse_public_address_validation(self, validate):

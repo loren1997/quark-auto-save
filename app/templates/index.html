@@ -401,7 +401,7 @@
               <div class="col-sm-10">
                 <label><input id="channelsearch-enabled" type="checkbox" v-model="formData.source.channelsearch.enable"> 搜索 Telegram、腾讯公开频道</label>
                 <label class="d-block" for="telegram-channels">Telegram 频道名</label>
-                <textarea id="telegram-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.telegram_channels" placeholder="Q_dongman, guoman4K, kuakedongman"></textarea>
+                <textarea id="telegram-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.telegram_channels" placeholder="guoman4K, kuakedongman"></textarea>
                 <label class="d-block mt-2" for="qq-channels">腾讯频道 ID</label>
                 <textarea id="qq-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.qq_channels" placeholder="pd26778899"></textarea>
                 <small class="text-muted d-block">多个频道用逗号或换行分隔。Telegram 查询公开消息；腾讯频道读取可访问的公开帖子，覆盖范围受页面限制。登录限制、验证码或连接失败会记录在日志中。</small>
@@ -824,7 +824,7 @@
           magic_regex: {},
           source: {
             websearch: { enable: true },
-            channelsearch: { enable: true, telegram_channels: 'Q_dongman,guoman4K,kuakedongman', qq_channels: 'pd26778899' },
+            channelsearch: { enable: true, telegram_channels: 'guoman4K,kuakedongman', qq_channels: 'pd26778899' },
             net: {
               enable: ""
             },
@@ -1166,10 +1166,10 @@
                 config_data.source = {};
               }
               if (!config_data.source.websearch) config_data.source.websearch = { enable: true };
-              if (!config_data.source.channelsearch) config_data.source.channelsearch = { enable: true, telegram_channels: ['Q_dongman', 'guoman4K', 'kuakedongman'], qq_channels: ['pd26778899'] };
+              if (!config_data.source.channelsearch) config_data.source.channelsearch = { enable: true, telegram_channels: ['guoman4K', 'kuakedongman'], qq_channels: ['pd26778899'] };
               if (config_data.source.channelsearch.enable === undefined) config_data.source.channelsearch.enable = true;
               for (const key of ['telegram_channels', 'qq_channels']) {
-                if (config_data.source.channelsearch[key] === undefined) config_data.source.channelsearch[key] = key === 'telegram_channels' ? ['Q_dongman', 'guoman4K', 'kuakedongman'] : ['pd26778899'];
+                if (config_data.source.channelsearch[key] === undefined) config_data.source.channelsearch[key] = key === 'telegram_channels' ? ['guoman4K', 'kuakedongman'] : ['pd26778899'];
                 if (Array.isArray(config_data.source.channelsearch[key])) config_data.source.channelsearch[key] = config_data.source.channelsearch[key].join('\n');
               }
               if (!config_data.source.cloudsaver) {

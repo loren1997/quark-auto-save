@@ -101,6 +101,40 @@ class SearchAdapterTests(unittest.TestCase):
             client.search("作品")
         self.assertNotIn("secret", str(error.exception))
 
+    def test_upstream_protocol_error_reads_only_prefix_and_hides_body(self):
+        client = self.pansou({})
+        response = client.session.post.return_value
+        response.status_code = 400
+        prefix = b"<title>400 The plain HTTP request was sent to HTTPS port</title> unsafe-secret"
+        chunks = iter([prefix, b"unread-body"])
+        response.iter_content.return_value = chunks
+        with self.assertRaisesRegex(SearchError, "^搜索源上游协议错误$") as error:
+            client.search("作品")
+        self.assertNotIn("unsafe-secret", str(error.exception))
+        self.assertEqual(next(chunks), b"unread-body")
+        response.iter_content.assert_called_once_with(chunk_size=2048)
+        response.json.assert_not_called()
+        response.close.assert_called_once()
+        client.session.post.assert_called_once()
+        self.assertIs(client.session.post.call_args.kwargs["stream"], True)
+
+    def test_other_http_errors_are_not_misclassified_or_retried(self):
+        marker = b"The plain HTTP request was sent to HTTPS port"
+        for status, chunks in ((400, [b"Bad request"]), (400, [b"x" * 2048, marker]),
+                               (403, [marker]), (500, [marker])):
+            with self.subTest(status=status, prefix=chunks[0][:20]):
+                client = self.pansou({})
+                response = client.session.post.return_value
+                response.status_code = status
+                response.iter_content.return_value = iter(chunks)
+                response.raise_for_status.side_effect = requests.HTTPError(response=response)
+                with self.assertRaisesRegex(SearchError, f"^HTTP {status}$"):
+                    client.search("作品")
+                response.close.assert_called_once()
+                client.session.post.assert_called_once()
+                if status != 400:
+                    response.iter_content.assert_not_called()
+
     def test_bad_date_does_not_drop_valid_links(self):
         client = self.pansou({"merged_by_type": {"quark": [{"url": URL, "datetime": "unknown", "note": None}]}})
         self.assertEqual(client.search("作品")[0]["datetime"], "")

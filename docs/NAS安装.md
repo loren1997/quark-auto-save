@@ -4,13 +4,13 @@
 
 V3.8 可以连续点击多部作品加入订阅队列，依次在后台执行，同一作品重复点击会去重。未执行的队列随配置保存在 NAS，服务重启后继续；正在执行的任务若中断，会在日志标记。首次查询未找到可验证资源的作品会进入“运行日志 → 等待自动查找”，按现有定时规则重试；每轮优先检查最久未尝试的 3 部，其余留到后续轮次。找到后自动转存并按原下载设置提交 Aria2，也可以取消继续查找。
 
-“系统配置 → 资源搜索 → 公开频道索引”可以分别填写 Telegram 频道名与腾讯频道 ID，逗号或换行分隔，每类最多 6 个。默认 Telegram 为 `Q_dongman,guoman4K,kuakedongman`，腾讯为 `pd26778899`。Telegram 查询公开消息预览；腾讯只读取可访问的当前公开帖子列表，并非腾讯频道全站或全部历史搜索。各频道只读一页，与网页来源共享有界时间和并发，不会登录、执行脚本或绕过验证。网络防护可能使部分渠道不可用，日志会明确显示。
+“系统配置 → 资源搜索 → 公开频道索引”可以分别填写 Telegram 频道名与腾讯频道 ID，逗号或换行分隔，每类最多 6 个。默认 Telegram 为 `guoman4K,kuakedongman`，腾讯为 `pd26778899`。Telegram 查询公开消息预览；腾讯只读取可访问的当前公开帖子列表，并非腾讯频道全站或全部历史搜索。各频道只读一页，与网页来源共享有界时间和并发，不会登录、执行脚本或绕过验证。网络防护可能使部分渠道不可用，日志会明确显示。
 
 ## 1. 用 Docker Compose 安装
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.8.1 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.8.1) 中的 `quark-auto-save-nas-docker-v3.8.1.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.8.2 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.8.2) 中的 `quark-auto-save-nas-docker-v3.8.2.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -42,7 +42,7 @@ docker compose -p qas-maintained up -d
 
 Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在容器网络中开放，服务地址是 `http://pansou:8888`，不占用 NAS 额外端口。首次新建配置时自动填入该地址。已有配置升级后，在“系统配置 → 资源搜索 → PanSou”中手动改为此地址并保存。
 
-新版 Compose 显式启用 PanSou 的 `labi,zhizhen,shandian,duoduo,muou` 插件及 6 个公开频道；应用的 `PANSOU_FALLBACK_SERVERS` 同时补充公共 PanSou 聚合源。用户填写的聚合地址优先，补充源在后，总计最多 3 个 PanSou 服务器、客户端并发 2。若不使用该公共源，可删除 Compose 中的 `PANSOU_FALLBACK_SERVERS` 环境变量并重建容器；禁用 PanSou 时环境补充源也不会查询。各渠道可用性取决于 NAS 网络及上游服务。
+新版 Compose 显式启用 PanSou 的 `labi,zhizhen,shandian,duoduo,muou,quark4k,quarkres` 插件及 5 个公开频道；应用的 `PANSOU_FALLBACK_SERVERS` 同时补充公共 PanSou 聚合源。用户填写的聚合地址优先，补充源在后，总计最多 3 个 PanSou 服务器、客户端并发 2。若不使用该公共源，可删除 Compose 中的 `PANSOU_FALLBACK_SERVERS` 环境变量并重建容器；禁用 PanSou 时环境补充源也不会查询。各渠道可用性取决于 NAS 网络及上游服务。
 
 配置持久化在项目下 `config/`。必须挂载整个目录，目录需可写；请勿只把单个 JSON 文件 bind mount 到容器，本版用原子替换和旁边的 `.lock` 文件保护并发写入。
 
@@ -67,6 +67,10 @@ Compose 会同时运行 `quark-auto-save` 和纯 API 版 PanSou。PanSou 只在�
 只转存白名单视频和字幕；图片、文本、压缩包和可执行文件均跳过。分享中的目录会逐层检查，允许的文件平铺到任务保存目录，不整文件夹转存。热门任务默认按 `片名 S01E01.原后缀` 命名，明确第三季使用 `S03`；MKV、MP4、ASS、SRT 等保留原后缀，不进行转码。无法可靠识别集号时保留原文件名，已有自定义命名规则保留。
 
 ## 3. 搜索与自动换源
+
+V3.8.2 另识别 PanSou 明确的 HTTP/HTTPS 上游协议错误，冷却 5 分钟后再试；普通 HTTP 400 不会被误判为验证码。旧默认 Telegram 频道 `Q_dongman` 已不再发布动漫资源，更新只迁移精确旧工厂名单；用户自定义列表保持。
+
+V3.8.2 的 Compose 为本地 PanSou 增加 `quark4k`、`quarkres`，共 7 个无需额外账号的索引插件，降低对公共备用服务的依赖。它们的匿名公开接口已检查，但不能保证任一作品有结果；如果在系统配置中自行限定了 PanSou 插件名单，该筛选仍会保留。
 
 V3.8.1 在不同订阅和进程间共享来源冷却：超时默认 60 秒、HTTP 429 默认 5 分钟、HTTP 403 默认 15 分钟、验证码默认 30 分钟；网站提供 `Retry-After` 时按其要求等待，最多 7 天。日志显示原因和剩余秒数，其他健康来源继续查询，冷却到期自动恢复。手动刷新不会强行绕过冷却。状态保存在 `config/quark_config.search-health.sqlite3`，仅记录域名和固定故障信息，不含 Cookie 或搜索词；无需手工编辑。
 
@@ -164,16 +168,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.8.1：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.8.2：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.8.1/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.8.2/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.8.1-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.8.2-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"
@@ -206,6 +210,8 @@ docker compose up -d --build
 GitHub Actions 会先跑 Python 3.11/3.13 测试，再构建 amd64/arm64 镜像到该仓库的 GHCR。Fork 的 Actions 可能需要你先在 GitHub 的 Actions 页启用；仓库连接器还需要有该 Fork 的访问权限。镜像第一次发布后若为 private，需要在 Packages 中设为 public 或在 NAS 登录 GHCR；本地 `build` 安装不受此影响。只有 Actions 实际通过后才能确认远程镜像已发布。
 
 ## 7. 排错与验收
+
+HTTP 200 可能仍是浏览器验证页；新版探针会输出 `browser_verification_required`。`upstream_protocol_error` 表示响应明确提示上游 HTTP/HTTPS 协议错误，需要该服务维护者修复；应用会冷却并切换其他来源。`read_limit` 只是探针达到有界读取上限，并不表示网页不可访问。本地 PanSou 的 `172.*` 容器内网地址正常；只有搜索发现的外部落地页受私网地址限制。
 
 V3.8.1 可在 NAS 安装目录执行只读网络检查：
 
