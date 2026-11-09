@@ -6,7 +6,7 @@
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.6 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.6) 中的 `quark-auto-save-nas-docker-v3.6.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.6.1 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.6.1) 中的 `quark-auto-save-nas-docker-v3.6.1.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 ```sh
 cd /root/quark-save-gpt
@@ -72,6 +72,8 @@ V3.6 将找到的资源线索独立保存到 `config/quark_config.resources.json
 
 V3.5 在一次自动查找中会记住失败的索引来源，后续译名查询不再重复等待该来源；其他健康来源继续查询。下一次任务运行会重新尝试，不会修改或永久禁用搜索配置。日志保留首次超时等失败原因。
 
+V3.6.1 也会在同一次自动查找中记住失败的网页搜索引擎，查询其他别名时只继续使用健康引擎；下一次任务运行会重新尝试失败引擎。资源落地页的 HTTP 403 等错误只属于该页面，不会因此禁用已经成功返回搜索结果的引擎。
+
 搜索会从索引返回的结构化结果和公开帖子正文中提取夸克链接、就近关联提取码。“网页搜索”默认启用，V3.6 通过 Google、DuckDuckGo 和 Bing 查询公开网页，再读取有限数量的结果页面提取夸克链接。任务列表搜索会合并这些结果；自动订阅与失效换源在历史线索和索引未找到可验证候选时再补搜网页。页面不执行脚本、不登录，也不绕过验证码；搜索引擎返回验证码或网络失败会明确报错。
 
 搜索结果摘要中的完整夸克链接同样进入候选验证；落地页 HTTP 403 等错误不会丢弃已经取得的候选。部分搜索源失败时继续使用其他来源的结果。错误导致的空结果不缓存为“没有资源”，再次操作会重新查询。
@@ -105,6 +107,10 @@ V3.5 补搜优先使用“片名 02”和可信中文别名等缺号查询，再
 自动补集目前限单季、可可靠解析集号的热门任务；使用起始文件、重新编号、删除重存、混合季目录或无法识别文件名时跳过。最多检查 3 个空子目录；非空子目录需先确认季别，不自动跨目录补集。无法找到包含缺号的有效分享时会保留原状并说明原因，不表示资源已完整。关闭“分享失效时自动搜索并替换”也会关闭自动补集。
 
 截至 V3.5 排查，《黑暗召唤师在地下恋爱中》的已知原公开分享 `5b14b0663410` 仍缺第 2 集，尚未找到可匿名验证的有效备用链接。更新修复的是漏搜和漏验逻辑；只有取得包含该集的可验证分享，才能实际补齐，不能仅凭更新版本认定补集成功。
+
+V3.6.1 的用户日志排查确认：旧日志中单独出现的 `资源搜索异常：RequestException`，是查询失败且无候选时程序自行抛出、随后捕获的笼统提示，程序仍会继续补搜，并非崩溃。新版明确记录索引查询后继续网页搜索，逐行列出补集查找中各来源的错误；Google 错误使用实际引擎名称，网页运行日志自动换行。本次实测仍遇到 PanSou 请求超时和网页搜索要求人工验证，尚未确认找到第 2 集；这次修复没有消除外部网站的验证要求。
+
+共享 `/cartoon` 中的旧同名文件，若无法通过文件摘要或待改名身份记录核对归属，会保留原状并提示无法确认归属，以免修改其他作品。这条提示不阻止后续缺集查找，与补集搜索源失败分别处理。
 
 ## 4. 热门追更
 
@@ -146,16 +152,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.6：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.6.1：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.6/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.6.1/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.6-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.6.1-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"

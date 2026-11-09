@@ -239,14 +239,18 @@ class EpisodeRepairTests(unittest.TestCase):
         target = self.files(["01.mkv", "03.mkv"])
         candidate_detail = self.files(["01.mkv", "03.mkv"])
         candidate_detail["data"]["share"] = {"title": "黑色召唤师 (2022)"}
+        errors = [{"source": source, "message": "请求超时"} for source in
+                  ("PanSou", "网页搜索 DuckDuckGo", "网页搜索 Bing", "网页搜索 Google")]
         with patch.object(self.account, "ls_dir", return_value=target), \
                 patch("resource_search.search_resources", return_value={"success": True, "data": [self.candidate("missing")]}), \
-                patch("resource_search.search_web_resources", return_value={"success": True, "data": []}), \
+                patch("resource_search.search_web_resources", return_value={"success": True, "data": [], "errors": errors}), \
                 patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
                 patch.object(self.account, "get_detail", return_value=candidate_detail):
             self.account.repair_episode_gaps(self.task, self.tree())
         self.assertIn("补集已查询关键词", self.output.getvalue())
         self.assertIn("已验证 1 个同作品候选", self.output.getvalue())
+        for error in errors:
+            self.assertIn(f"补集来源：{error['source']}：请求超时", self.output.getvalue())
         self.assertNotIn("补集转存成功", self.output.getvalue())
 
     def test_candidate_file_changed_before_transfer_is_not_saved(self):

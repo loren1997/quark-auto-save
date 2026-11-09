@@ -1402,6 +1402,7 @@ class Quark:
                 return history_result
         attempted, source_errors = [], []
         failed_sources = set()
+        failed_web_engines = set()
         index_deadline = time.monotonic() + 60
         interrupted = False
 
@@ -1413,7 +1414,6 @@ class Quark:
 
         def search_candidates(words, web=False):
             nonlocal interrupted
-            had_error, had_results = False, False
             consecutive_errors = 0
             deferred = []
             for query in words:
@@ -1423,12 +1423,11 @@ class Quark:
                 attempted.append(("web" if web else "index", query))
                 try:
                     # Reuse index caches; share validity is checked live below.
-                    result = search_web_resources(query, config, refresh=False) if web else search_resources(
+                    result = search_web_resources(query, config, refresh=False, failed_engines=failed_web_engines) if web else search_resources(
                         query, config, refresh=False, include_web=False, failed_sources=failed_sources
                     )
                 except (requests.RequestException, ValueError, TypeError) as exc:
                     record_error("网页搜索" if web else "索引搜索", type(exc).__name__)
-                    had_error = True
                     consecutive_errors += 1
                     if not web and consecutive_errors == 2:
                         interrupted = True
@@ -1439,7 +1438,6 @@ class Quark:
                     if isinstance(error, dict):
                         record_error(error.get("source"), error.get("message"))
                 if not result.get("success"):
-                    had_error = True
                     if not errors:
                         record_error("网页搜索" if web else "索引搜索", result.get("message", ""))
                     consecutive_errors += 1
@@ -1449,9 +1447,6 @@ class Quark:
                     continue
                 consecutive_errors = 0
                 entries = result.get("data", [])
-                if not entries and errors:
-                    had_error = True
-                had_results = had_results or bool(entries)
                 checked_before = len(visited)
                 for index, candidate in enumerate(entries[:50]):
                     # 已返回的结果继续验证；截止线只阻止发起下一轮查询。
@@ -1460,8 +1455,6 @@ class Quark:
                         deferred.extend(entries[index + 1:50])
                         break  # 先给其他译名机会，再用剩余名额验证本次余下候选。
             yield from deferred
-            if had_error and not had_results:
-                raise requests.RequestException("搜索源不可用，请检查搜索配置")
 
         title_queries = _resource_search_queries(title, [])
         web_queries = title_queries[:1]
@@ -1492,12 +1485,14 @@ class Quark:
                                                       visited=visited, max_checked=(8 if web else 12) if required_episodes else (3 if web else 5),
                                                       verify_index_title=not web, required_episodes=required_episodes)
             except (requests.RequestException, ValueError, TypeError) as exc:
-                print(f"资源搜索异常：{type(exc).__name__}")
+                record_error("网页搜索" if web else "索引搜索", type(exc).__name__)
                 result = {"success": False, "candidate": None, "code": "unavailable",
                           "error": "搜索源暂不可用，请检查搜索配置或稍后重试"}
             if result["success"]:
                 return result
             failures.append(result)
+            if not web:
+                print("索引未找到可验证资源，继续查询网页来源")
         result = next((result for result in failures if result["code"] == "no_match"),
                       next((result for result in failures if result["code"] == "unavailable"), failures[0]))
         result["queries"] = list(dict.fromkeys(query for _, query in attempted))
@@ -1808,6 +1803,8 @@ class Quark:
                 )
                 if not result["success"]:
                     print(f"补集未完成：{result['error']}；原订阅和已有文件保留")
+                    for error in result.get("source_errors", []):
+                        print(f"补集来源：{error['source']}：{error['message']}")
                     if result.get("queries"):
                         print("补集已查询关键词：" + "、".join(result["queries"]))
                     if result.get("missing_in_candidates"):

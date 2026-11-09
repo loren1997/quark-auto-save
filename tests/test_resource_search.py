@@ -306,6 +306,18 @@ class SharedSearchTests(unittest.TestCase):
 
 class WebAggregationTests(unittest.TestCase):
     @patch("resource_search.WebSearch")
+    def test_failed_engines_are_shared_only_when_requested(self, web):
+        failed_engines = {"Google"}
+        web.return_value.search.return_value = [entry()]
+        web.return_value.errors = []
+        self.assertTrue(search_web_resources(" 作品 ", {}, failed_engines=failed_engines)["success"])
+        web.return_value.search.assert_called_once_with("作品", refresh=False, failed_engines=failed_engines)
+        self.assertIs(web.return_value.search.call_args.kwargs["failed_engines"], failed_engines)
+        web.return_value.search.reset_mock()
+        search_web_resources("作品", {})
+        web.return_value.search.assert_called_once_with("作品", refresh=False)
+
+    @patch("resource_search.WebSearch")
     def test_web_search_defaults_on_and_preserves_partial_engine_failure(self, web):
         web.return_value.search.return_value = [{**entry(), "source": "DuckDuckGo", "page_url": "https://public.example/post"}]
         web.return_value.errors = ["Bing: 连接超时"]
@@ -332,10 +344,12 @@ class WebAggregationTests(unittest.TestCase):
 
     @patch("resource_search.WebSearch")
     def test_all_engine_failures_remain_separate_in_web_and_aggregate_results(self, web):
-        web.return_value.errors = ["DuckDuckGo: 网页域名解析失败", "Bing: 网页请求失败 (ProxyError)"]
+        web.return_value.errors = ["DuckDuckGo: 网页域名解析失败", "Bing: 网页请求失败 (ProxyError)",
+                                  "Google: 要求人工验证"]
         web.return_value.search.side_effect = SearchError("；".join(web.return_value.errors))
         expected = [{"source": "网页搜索 DuckDuckGo", "message": "DNS 域名解析失败"},
-                    {"source": "网页搜索 Bing", "message": "代理连接失败"}]
+                    {"source": "网页搜索 Bing", "message": "代理连接失败"},
+                    {"source": "网页搜索 Google", "message": "需要人工验证"}]
         result = search_web_resources("作品", {})
         self.assertFalse(result["success"])
         self.assertEqual(result["errors"], expected)
@@ -348,11 +362,13 @@ class WebAggregationTests(unittest.TestCase):
         web.return_value.search.return_value = []
         web.return_value.errors = ["Bing 落地页: 网页地址解析到了非公网 IP，已拒绝访问",
                                    "DuckDuckGo: InternalError https://user:password@example.com/?token=SECRET",
+                                   "Google 落地页: 网页 HTTP 403 token=SECRET",
                                    "https://secret.example?password=SECRET: unexpected"]
         result = search_web_resources("作品", {})
         self.assertEqual(result["errors"], [
             {"source": "网页搜索 Bing 落地页", "message": "地址解析为非公网 IP，已拒绝访问"},
             {"source": "网页搜索 DuckDuckGo", "message": "查询失败"},
+            {"source": "网页搜索 Google 落地页", "message": "HTTP 403"},
             {"source": "网页搜索", "message": "查询失败"},
         ])
         self.assertNotIn("SECRET", str(result))

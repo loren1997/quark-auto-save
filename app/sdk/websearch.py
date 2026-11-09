@@ -312,8 +312,9 @@ class WebSearch:
             except (requests.RequestException, TransportError, OSError, ValueError, LookupError) as error:
                 raise SearchError(f"网页请求失败 ({type(error).__name__})") from error
 
-    def search(self, query, refresh=False):
+    def search(self, query, refresh=False, failed_engines=None):
         self.errors = []
+        failed_engines = failed_engines if failed_engines is not None else set()
         if not isinstance(query, str) or not query.strip() or len(query) > 200:
             raise SearchError("网页搜索词必须是 1 至 200 字的文本")
         query = query.strip()
@@ -334,16 +335,18 @@ class WebSearch:
 
         candidates, succeeded = [], 0
         with ThreadPoolExecutor(max_workers=2) as executor:
-            jobs = [(engine, executor.submit(search_engine, engine, url)) for engine, url in engines]
+            jobs = [(engine, executor.submit(search_engine, engine, url)) for engine, url in engines
+                    if engine not in failed_engines]
             for engine, future in jobs:
                 try:
                     items = future.result()
                     succeeded += 1
                     candidates.extend({**item, "engine": engine} for item in items if _relevant(query, item["title"] + " " + item["snippet"]))
                 except (SearchError, ValueError) as error:
+                    failed_engines.add(engine)
                     self.errors.append(f"{engine}: {error}")
         if not succeeded:
-            raise SearchError("；".join(self.errors))
+            raise SearchError("；".join(self.errors) or "本次查找已跳过此前失败的网页搜索引擎")
 
         candidates.sort(key=lambda item: ("夸克" in item["title"], "夸克" in item["snippet"]), reverse=True)
         results, pages, seen = [], [], set()
@@ -389,13 +392,15 @@ class WebSearch:
             if old is None or (not urlsplit(old["shareurl"]).query and parts.query):
                 unique[key] = item
         output = list(unique.values())
-        with _cache_lock:
-            if output or not self.errors:
-                if len(_cache) >= 32:
-                    _cache.pop(next(iter(_cache)))
-                _cache[query] = (time.monotonic(), output, list(self.errors))
-            else:
-                _cache.pop(query, None)
+        # 跳过或失败的引擎不构成完整查询，也不能覆盖已有完整缓存。
+        if not failed_engines:
+            with _cache_lock:
+                if output or not self.errors:
+                    if len(_cache) >= 32:
+                        _cache.pop(next(iter(_cache)))
+                    _cache[query] = (time.monotonic(), output, list(self.errors))
+                else:
+                    _cache.pop(query, None)
         return [dict(item) for item in output]
 
     @staticmethod

@@ -30,7 +30,8 @@ class AutoRepairTests(unittest.TestCase):
             "replace": "{TASKNAME}.{I}", "runweek": [1, 4],
             "enddate": "2030-12-31", "addition": {"plugin": {"enabled": True}},
         }
-        self.output = contextlib.redirect_stdout(io.StringIO())
+        self.logs = io.StringIO()
+        self.output = contextlib.redirect_stdout(self.logs)
         self.output.__enter__()
         self.addCleanup(self.output.__exit__, None, None, None)
         self.config = patch.object(qas, "CONFIG_DATA", {"auto_repair": True})
@@ -236,6 +237,27 @@ class AutoRepairTests(unittest.TestCase):
         self.assertFalse(result["search_complete"])
         self.assertIn("backup：请求超时", result["error"])
         self.assertTrue(result["queries"])
+        self.assertNotIn("RequestException", self.logs.getvalue())
+        self.assertIn("继续查询网页来源", self.logs.getvalue())
+
+    def test_web_engine_failures_are_shared_across_aliases_but_reset_next_lookup(self):
+        self.task["search_aliases"] = ["官方译名"]
+        attempts = []
+
+        def search(query, config, refresh=False, failed_engines=None):
+            attempts.append(set(failed_engines))
+            if not failed_engines:
+                failed_engines.add("Google")
+                return {"success": True, "data": [], "errors": [
+                    {"source": "网页搜索 Google", "message": "需要人工验证"}]}
+            return {"success": True, "data": [self.candidate()]}
+
+        self.web_search.side_effect = search
+        with self.search([]), patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", return_value=FILES):
+            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+        self.assertEqual(attempts, [set(), {"Google"}, set(), {"Google"}])
 
     def test_source_diagnostics_do_not_expose_urls_or_auth_tokens(self):
         error = {"source": "https://private.example?token=SECRET", "message": "HTTP 401 Bearer SECRET"}

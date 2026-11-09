@@ -44,7 +44,7 @@ def search_error_reason(message):
 def _web_errors(messages):
     errors = []
     for message in messages:
-        match = re.match(r"^(Bing|DuckDuckGo)(\s+落地页)?:\s*(.*)$", str(message), re.S)
+        match = re.match(r"^(Bing|DuckDuckGo|Google)(\s+落地页)?:\s*(.*)$", str(message), re.S)
         source = "网页搜索" + (f" {match[1]}{match[2] or ''}" if match else "")
         error = {"source": source, "message": search_error_reason(match[3] if match else message)}
         if error not in errors:
@@ -78,7 +78,7 @@ def _selection(value, label):
     return list(dict.fromkeys(item.lstrip("@") for item in value))
 
 
-def search_web_resources(query, config, refresh=False):
+def search_web_resources(query, config, refresh=False, failed_engines=None):
     """自动订阅在网盘索引未找到可验证资源时，单独查询公开网页。"""
     source = (config.get("source") or {}).get("websearch") or {}
     if not _enabled(source):
@@ -87,7 +87,8 @@ def search_web_resources(query, config, refresh=False):
         return {"success": False, "data": [], "errors": [], "message": "搜索词必须是 200 字以内的文本"}
     client = WebSearch()
     try:
-        entries = client.search(query.strip(), refresh=refresh)
+        options = {"failed_engines": failed_engines} if failed_engines is not None else {}
+        entries = client.search(query.strip(), refresh=refresh, **options)
         errors = _web_errors(client.errors)
         return {"success": True, "data": entries, "errors": errors,
                 "message": "；".join(f"{error['source']}：{error['message']}" for error in errors)}

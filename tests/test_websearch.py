@@ -184,6 +184,47 @@ class WebSearchTests(unittest.TestCase):
             self.client.search("作品", refresh=True)
 
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
+    def test_failed_engine_is_skipped_for_aliases_but_next_lookup_retries(self, validate):
+        def fetch(url, deadline):
+            if "duckduckgo.com" in url:
+                return '<div class="no-results">No results found</div>', url
+            if "google.com" in url:
+                raise SearchError("要求人工验证")
+            return f'<rss><channel><item><title>作品 别名</title><link>{URL}</link></item></channel></rss>', url
+        self.client._fetch = Mock(side_effect=fetch)
+        failed = set()
+        self.assertEqual(self.client.search("作品", failed_engines=failed)[0]["shareurl"], URL)
+        self.assertEqual(failed, {"Google"})
+        self.assertNotIn("作品", _cache)
+        self.assertEqual(self.client.search("别名", failed_engines=failed)[0]["shareurl"], URL)
+        self.assertNotIn("别名", _cache)
+        self.assertEqual(sum("google.com" in call.args[0] for call in self.client._fetch.call_args_list), 1)
+        self.assertEqual(self.client.search("作品")[0]["shareurl"], URL)
+        self.assertEqual(sum("google.com" in call.args[0] for call in self.client._fetch.call_args_list), 2)
+
+    @patch("app.sdk.websearch._validate_url", return_value="example.com")
+    def test_skipped_engine_does_not_cache_empty_or_overwrite_complete_results(self, validate):
+        cached = (time.monotonic(), [{"taskname": "作品", "shareurl": URL}], [])
+        _cache["作品"] = cached
+        def fetch(url, deadline):
+            return ('<div class="no-results">No results found</div>' if "duckduckgo.com" in url
+                    else '<rss><channel/></rss>'), url
+        self.client._fetch = Mock(side_effect=fetch)
+        self.assertEqual(self.client.search("作品", refresh=True, failed_engines={"Google"}), [])
+        self.assertEqual(_cache["作品"], cached)
+        self.assertEqual(self.client.search("别名", failed_engines={"Google"}), [])
+        self.assertNotIn("别名", _cache)
+
+    def test_all_skipped_engines_make_no_requests_and_default_call_retries(self):
+        self.client._fetch = Mock(side_effect=SearchError("连接超时"))
+        with self.assertRaisesRegex(SearchError, "跳过"):
+            self.client.search("作品", failed_engines={"Google", "Bing", "DuckDuckGo"})
+        self.client._fetch.assert_not_called()
+        with self.assertRaisesRegex(SearchError, "连接超时"):
+            self.client.search("作品")
+        self.assertEqual(self.client._fetch.call_count, 3)
+
+    @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_landing_page_403_keeps_snippet_share_and_other_page_results(self, validate):
         other = "https://pan.quark.cn/s/other"
         duck = f'''
@@ -203,10 +244,15 @@ class WebSearchTests(unittest.TestCase):
                 raise SearchError("网页 HTTP 403")
             return f'<title>作品 B</title><p><a href="{other}">下载</a> 提取码 BB22</p>', url
         self.client._fetch = Mock(side_effect=fetch)
-        rows = self.client.search("作品")
+        failed = set()
+        rows = self.client.search("作品", failed_engines=failed)
         self.assertEqual({row["shareurl"] for row in rows}, {URL + "?pwd=AA11", other + "?pwd=BB22"})
         self.assertEqual(rows[0]["taskname"], "作品 A")
         self.assertIn("DuckDuckGo 落地页: 网页 HTTP 403", self.client.errors)
+        self.assertEqual(failed, set())
+        self.assertIn("作品", _cache)
+        self.client.search("作品 A", failed_engines=failed)
+        self.assertEqual(sum("duckduckgo.com" in call.args[0] for call in self.client._fetch.call_args_list), 2)
 
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_failed_empty_search_is_retried_without_refresh(self, validate):
