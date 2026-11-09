@@ -18,6 +18,7 @@ import requests
 import importlib
 import traceback
 import urllib.parse
+import html
 import unicodedata
 import tempfile
 import threading
@@ -26,6 +27,7 @@ from copy import deepcopy
 from datetime import datetime
 from natsort import natsorted
 from media_files import MEDIA_PATTERN, is_media_file, is_video_file, media_title
+from run_progress import report_progress
 
 # 兼容青龙
 try:
@@ -138,11 +140,29 @@ def _resource_candidate_parts(expected, candidate):
     return other_name, other_seasons, other_years
 
 
+def _resource_release_labels(value):
+    """只移除独立发布组和明确编码标签，保留年份、季数和片名数字。"""
+    value = unicodedata.normalize("NFKC", html.unescape(value)).strip()
+    value = re.sub(r"^\s*[\[【]\s*(?:0?[1-9]|1[0-2])月(?:新番)?\s*[\]】]\s*", "", value)
+    for _ in range(2):
+        group = re.match(r"^[\[【]([^\]】]{1,60})[\]】]\s*(.+)$", value)
+        if not group or re.search(_RESOURCE_SEASON_PATTERN, group[1], re.I) or re.search(r"\d{4}|^\d+$", group[1]):
+            break
+        value = group[2].strip()
+    label = (r"完全无修版|无修版|未删减版|无删减版|修正版|WEB[- .]?DL|WEBRIP|BDRIP|BLURAY|"
+             r"ABEMA|HIDIVE|2160p|1080p|720p|4k|1920x1080|1280x720|3840x2160|"
+             r"HEVC|AVC|[hx]\.?26[45]|AAC|FLAC|E?AC3|DDP?|MKV|MP4|10bit|8bit|CHS|CHT|ENG|JPN|(?=[a-f0-9]*[a-f])[a-f0-9]{8}")
+    for _ in range(4):
+        suffix = re.search(r"\s*[\[【(]([^\]】)]{1,120})[\]】)]\s*$", value)
+        if not suffix or re.sub(r"[\s._+\-]+", "", re.sub(label, "", suffix[1], flags=re.I)):
+            break
+        value = value[:suffix.start()].strip()
+    return re.sub(r"[ ._-]+(?:2160p|1080p|720p|4k)\s*$", "", value, flags=re.I).strip()
+
+
 def _resource_video_title(filename):
     """识别视频发布标签；不猜测被替换的片名字词，也不删除片名自带的数字。"""
-    title = unicodedata.normalize("NFKC", re.sub(r"\.[^.]+$", "", filename))
-    title = re.sub(r"^\s*[\[【]\s*(?:0?[1-9]|1[0-2])月(?:新番)?\s*[\]】]\s*", "", title)
-    title = re.sub(r"\s*[\[【](?:完全无修版|无修版|未删减版|无删减版|修正版)[\]】]\s*$", "", title)
+    title = _resource_release_labels(re.sub(r"\.[^.]+$", "", filename))
     # shortcut: bare episode numbers need zero padding; ambiguous sequel numbers stay intact.
     return re.sub(r"(?:\s+|\s*[-_]\s*)0\d{1,2}\s*$", "", title).strip()
 
@@ -156,10 +176,7 @@ def _resource_episode_number(task, filename):
     season = next(iter(seasons)) if len(seasons) == 1 else (1 if not seasons and years else None)
     if not name or not season:
         return None
-    stem = unicodedata.normalize("NFKC", filename.rsplit(".", 1)[0]).strip()
-    stem = re.sub(r"^\s*[\[【]\s*(?:0?[1-9]|1[0-2])月(?:新番)?\s*[\]】]\s*", "", stem)
-    stem = re.sub(r"\s*[\[【](?:完全无修版|无修版|未删减版|无删减版|修正版)[\]】]\s*$", "", stem)
-    stem = re.sub(r"(?:[ ._-]+|\s*[\[【(])(?:2160p|1080p|720p|4k)[\]】)]?\s*$", "", stem, flags=re.I)
+    stem = _resource_release_labels(filename.rsplit(".", 1)[0])
     prefix, number = "", None
     match = re.fullmatch(r"(.*?)s(\d{1,2})e(\d{1,3})", stem, re.I)
     if match:
@@ -630,7 +647,7 @@ class MagicRename:
 
     @classmethod
     def _strict_episode(cls, file_name):
-        stem = os.path.splitext(file_name)[0].strip()
+        stem = _resource_release_labels(os.path.splitext(file_name)[0])
         stem = re.sub(r"^\s*(?:[\[【](?:0?[1-9]|1[0-2])月(?:新番)?[\]】]\s*)+", "", stem)
         while True:
             clean = re.sub(
@@ -1371,6 +1388,7 @@ class Quark:
         title = task.get("taskname", "").strip()
         if not title:
             return {"success": False, "candidate": None, "code": "no_results", "error": "缺少资源名称"}
+        report_progress("search", task=title, source="历史资源记录", query=title)
         aliases = task.get("search_aliases", [])
         aliases = list(dict.fromkeys(alias.strip() for alias in aliases
                                     if isinstance(alias, str) and alias.strip() and len(alias) <= 200))[:8] if isinstance(aliases, list) else []
@@ -1381,6 +1399,7 @@ class Quark:
             if isinstance(entry, dict)
         }
         visited = set(exclude_candidates or ())
+        repair_context = {}
         history = [item for item in Config.resource_history(self.resource_history_path)
                    if resource_titles_match(title, item.get("taskname", ""), allow_missing_year=True, aliases=aliases)]
         history_result = None
@@ -1396,6 +1415,7 @@ class Quark:
             queries = _resource_search_queries(title, aliases)
             history_result = self._find_verified_resource(
                 task, history, seen, aliases, visited=visited, required_episodes=required_episodes,
+                repair_context=repair_context,
             )
             if history_result["success"]:
                 print("已从本地资源记录重新验证到可用分享")
@@ -1421,6 +1441,7 @@ class Quark:
                     interrupted = True
                     break
                 attempted.append(("web" if web else "index", query))
+                report_progress("search", task=title, source="网页搜索" if web else "网盘索引", query=query)
                 try:
                     # Reuse index caches; share validity is checked live below.
                     result = search_web_resources(query, config, refresh=False, failed_engines=failed_web_engines) if web else search_resources(
@@ -1477,13 +1498,15 @@ class Quark:
             focused = [f"{word} {episode:02d}" for word in web_queries]
             queries = list(dict.fromkeys(focused + web_queries
                                         + [f"{word} 第{episode}集" for word in web_queries] + queries))
-            web_queries = list(dict.fromkeys(focused + web_queries))
+            # 网页通常收录整季帖子，先用片名找到合集，再在真实文件中筛选缺集。
+            web_queries = list(dict.fromkeys(web_queries + focused))
         failures = [history_result] if history_result else []
         for web, words in ((False, queries), (True, web_queries)):
             try:
                 result = self._find_verified_resource(task, search_candidates(words, web), seen, aliases,
                                                       visited=visited, max_checked=(8 if web else 12) if required_episodes else (3 if web else 5),
-                                                      verify_index_title=not web, required_episodes=required_episodes)
+                                                      verify_index_title=not web, required_episodes=required_episodes,
+                                                      repair_context=repair_context)
             except (requests.RequestException, ValueError, TypeError) as exc:
                 record_error("网页搜索" if web else "索引搜索", type(exc).__name__)
                 result = {"success": False, "candidate": None, "code": "unavailable",
@@ -1508,11 +1531,14 @@ class Quark:
         return result
 
     def _find_verified_resource(self, task, candidates, seen, aliases, visited=None,
-                                max_checked=5, verify_index_title=True, required_episodes=None):
+                                max_checked=5, verify_index_title=True, required_episodes=None,
+                                repair_context=None):
         title = task["taskname"]
         checked, found_results, missing_in_candidates = 0, False, 0
         limited = False
         visited = visited if visited is not None else set()
+        repair_context = repair_context if repair_context is not None else {}
+        pending_paths = []
         name, seasons, years = _resource_title_parts(title)
         names = {name} | {_resource_title_parts(alias)[0] for alias in aliases}
         names |= {first + second for first in names for second in names if first != second}
@@ -1527,7 +1553,7 @@ class Quark:
         candidates = iter(candidates)
         while checked < max_checked:
             try:
-                candidate = next(candidates)
+                candidate, verified_path, path_depth = pending_paths.pop(0) if pending_paths else (next(candidates), [], 0)
             except StopIteration:
                 break
             found_results = True
@@ -1555,6 +1581,7 @@ class Quark:
                 continue
             visited.add(identity)
             checked += 1
+            report_progress("verify", task=title, source="夸克分享", query=f"候选 {checked}")
             try:
                 token = self.get_stoken(pwd_id, passcode)
                 stoken = (token.get("data") or {}).get("stoken")
@@ -1564,16 +1591,31 @@ class Quark:
                 files = (detail.get("data") or {}).get("list", [])
                 if detail.get("code") != 0 or not listing_is_complete(detail) or not files:
                     continue
-                directory_evidence = []
+                directory_evidence = list(verified_path)
                 share = detail["data"].get("share")
                 if isinstance(share, dict) and isinstance(share.get("title"), str):
                     directory_evidence.append(share["title"])
-                selected_fid, ambiguous = None, False
+                selected_fid, ambiguous, queued_groups = None, False, False
                 verified_pdir_fid = pdir_fid
                 base_title = re.sub(_RESOURCE_SEASON_PATTERN, " ", title, flags=re.I)
                 # Follow one verified path; sibling seasons are neither evidence nor a save target.
-                for _ in range(3):
+                for depth in range(path_depth, 3):
                     folders = [item for item in files if item.get("dir")]
+                    if len(folders) > 1 and not any(is_video_file(item) for item in files):
+                        grouped = [folder for folder in folders if
+                                   re.match(r"^[\[【][^\]】]+[\]】]", folder.get("file_name", ""))
+                                   and resource_titles_match(title, _resource_release_labels(folder["file_name"]),
+                                                             allow_missing_year=True, aliases=aliases)
+                                   and re.fullmatch(r"[A-Za-z0-9_]{32}", str(folder.get("fid", "")))]
+                        if len(grouped) == len(folders):
+                            # 发布组各自验证和补存，不能把不同组的视频混成一个目录。
+                            limited = limited or len(grouped) > 4
+                            for folder in grouped[:4]:
+                                child_url = urllib.parse.urlunsplit(parsed._replace(fragment=f"/list/share/{folder['fid']}"))
+                                pending_paths.append(({**candidate, "shareurl": child_url},
+                                                      directory_evidence + [_resource_release_labels(folder["file_name"])], depth + 1))
+                            queued_groups = True
+                            break
                     named_single_folder = len(folders) == 1 and not any(is_video_file(item) for item in files) and resource_titles_match(
                         title, folders[0]["file_name"], allow_missing_year=True, aliases=aliases)
                     if len(files) == 1 and files[0].get("dir"):
@@ -1619,7 +1661,7 @@ class Quark:
                 else:
                     if any(item.get("dir") for item in files) and not any(is_video_file(item) for item in files):
                         limited = True
-                if ambiguous or detail.get("code") != 0 or not listing_is_complete(detail) or not files:
+                if queued_groups or ambiguous or detail.get("code") != 0 or not listing_is_complete(detail) or not files:
                     continue
                 video_files = [item for item in files if is_video_file(item)]
                 if not video_files:
@@ -1659,11 +1701,30 @@ class Quark:
                     resource_titles_match(title, _resource_video_title(item["file_name"]), allow_missing_year=True, aliases=aliases)
                     for item in video_files
                 ]
+                if verified_path and not all(matched_videos):
+                    continue
                 consistent_videos = all(matched or numbered_episodes[index] or re.fullmatch(
                     r"\d{1,3}", _resource_video_title(video_files[index]["file_name"])
                 ) for index, matched in enumerate(matched_videos))
                 combined = combined or bool(years and path_years == years and any(matched_videos) and consistent_videos)
-                if not exact and not combined:
+                supplement_without_year = False
+                if (not exact and not combined and required_episodes and len(years) == 1
+                        and seasons in (set(), {1}) and task.get("resource_id")
+                        and task.get("resource_type") in ("anime", "tv") and task.get("shareurl")
+                        and not path_years and all(matched_videos)
+                        and all(_resource_episode_number(task, item["file_name"]) is not None for item in video_files)
+                        and all(not _resource_title_parts(value)[2] for value in evidence)
+                        and any(resource_titles_match(title, value, allow_missing_year=True, aliases=aliases)
+                                for value in directory_evidence)):
+                    if "primary_verified" not in repair_context:
+                        # 年份缺省只用于补集，且必须现场严格复验原分享；一次查找只复验一次。
+                        primary = self._find_verified_resource(
+                            task, [{"taskname": title, "shareurl": task["shareurl"]}], set(), aliases,
+                            max_checked=1, verify_index_title=False,
+                        )
+                        repair_context["primary_verified"] = primary["success"]
+                    supplement_without_year = repair_context["primary_verified"]
+                if not exact and not combined and not supplement_without_year:
                     continue
                 history_url = (urllib.parse.urlunsplit(parsed._replace(fragment=f"/list/share/{selected_fid}"))
                                if selected_fid else shareurl)
@@ -1676,6 +1737,8 @@ class Quark:
                         missing_in_candidates += 1
                         continue
                     pdir_fid = verified_pdir_fid
+                    if supplement_without_year:
+                        print("补集候选未标年份：原分享已通过年份验证；按候选视频完整片名和集号补集")
                 if selected_fid:
                     pdir_fid = verified_pdir_fid if required_episodes is not None else selected_fid
                     shareurl = urllib.parse.urlunsplit(parsed._replace(fragment=f"/list/share/{selected_fid}"))
@@ -1792,6 +1855,7 @@ class Quark:
             if not missing:
                 return
             print(f"🔎《{task['taskname']}》检测到中间缺集 {sorted(missing)[:20]}，查找其他同作品同季分享")
+            report_progress("gap", task=task["taskname"], query="缺少集数 " + ", ".join(map(str, sorted(missing)[:20])))
             remaining, attempted = set(missing), set()
             deadline = time.monotonic() + 120
             for _ in range(3):
@@ -1855,6 +1919,7 @@ class Quark:
             print(f"补集暂未完成（{type(exc).__name__}）；保留原订阅和已有文件")
 
     def do_save_task(self, task):
+        report_progress("verify", task=task.get("taskname", ""), source="当前分享")
         apply_media_rename_defaults(task)
         # Recheck historical bans: older versions also banned temporary login errors.
         repaired = False
@@ -1910,6 +1975,7 @@ class Quark:
 
         def visit(fid, path, depth=0, include=True):
             nonlocal count
+            report_progress("verify", task=task.get("taskname", ""), source="读取分享视频目录")
             if depth > 8 or len(visited) >= 100 or str(fid) in visited:
                 raise ValueError("目录检查达到限制")
             visited.add(str(fid))
@@ -2053,6 +2119,7 @@ class Quark:
                     planned_names.add(renamed)
             for offset in range(0, len(pending), 100):
                 batch = pending[offset:offset + 100]
+                report_progress("transfer", task=task["taskname"], source="夸克网盘", query=f"本批 {len(batch)} 个媒体文件")
                 response = self.save_file([item["fid"] for item in batch], [item["share_fid_token"] for item in batch],
                                           destination_fid, pwd_id, stoken)
                 if response.get("code") == 0:
@@ -2066,6 +2133,7 @@ class Quark:
         return tree
 
     def do_rename(self, tree, node_id=None, task=None):
+        report_progress("rename", task=(task or {}).get("taskname", ""), source="夸克网盘")
         for node in tree.all_nodes():
             file = node.data or {}
             if file.get("is_dir", True) or not file.get("file_name_re"):
@@ -2205,6 +2273,7 @@ def do_save(account, tasklist=[]):
 
     # 执行任务
     for index, task in enumerate(tasklist):
+        report_progress("task", task=task.get("taskname", ""), query=f"任务 {index + 1}/{len(tasklist)}")
         print()
         print(f"#{index+1}------------------")
         print(f"任务名称: {task['taskname']}")
@@ -2259,6 +2328,7 @@ def do_save(account, tasklist=[]):
                         plugin_name == "aria2" or (is_new_tree and plugin.is_active)
                     ):
                         options = {}
+                        report_progress("download" if plugin_name == "aria2" else "task", task=task["taskname"], source=plugin_name)
                         if plugin_name == "aria2":
                             options["shared_path"] = task["savepath"].rstrip("/") == "/cartoon" or sum(
                                 other.get("savepath", "").rstrip("/") == task["savepath"].rstrip("/")
@@ -2280,6 +2350,7 @@ def do_save(account, tasklist=[]):
 
 
 def main():
+    report_progress("start", task="读取配置")
     global CONFIG_DATA
     start_time = datetime.now()
     print(f"===============程序开始===============")
@@ -2342,6 +2413,7 @@ def main():
         for account in accounts:
             account.resource_history_path = history_path
     # 签到
+    report_progress("signin", task="账号检查与签到")
     print(f"===============签到任务===============")
     if tasklist_from_env:
         verify_account(accounts[0])
@@ -2376,6 +2448,7 @@ def main():
             Config.write_json(config_path, latest)
             CONFIG_DATA = latest
 
+    report_progress("finish")
     print(f"===============程序结束===============")
     duration = datetime.now() - start_time
     print(f"😃 运行时长: {round(duration.total_seconds(), 2)}s")

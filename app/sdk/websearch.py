@@ -17,10 +17,11 @@ from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
-from urllib3.exceptions import HTTPError as TransportError, NewConnectionError
+from urllib3.exceptions import HTTPError as TransportError, NewConnectionError, ProtocolError, ReadTimeoutError
 from urllib3.util.connection import create_connection
 
 from .common import SearchError, extract_share_urls, normalize_share_url
+from run_progress import report_progress
 
 
 MAX_BYTES = 1024 * 1024
@@ -143,12 +144,13 @@ class _Page(HTMLParser):
         self.text.append(text)
 
 
-class _GooglePage(_Page):
+class _SearchPage(_Page):
     def __init__(self, body):
         self.results = []
         self._result = None
         self._depth = 0
         self._heading = False
+        self._targets = set()
         super().__init__(body)
 
     def handle_starttag(self, tag, attrs):
@@ -158,10 +160,14 @@ class _GooglePage(_Page):
         if tag == "div":
             self._depth += 1
             classes = dict(attrs).get("class", "").split()
-            if self._result is None and {"MjjYud", "g", "Gx5Zad", "ezO2md"}.intersection(classes):
+            if self._result is None and {"MjjYud", "g", "Gx5Zad", "ezO2md", "vrwrap"}.intersection(classes):
                 self._result = (self._depth, len(self.links), len(self.text))
-        if tag == "h3" and self._anchor is not None:
+                self._targets = set()
+            if self._result and "ext_query" in classes and dict(attrs).get("data-url"):
+                self._targets.add(dict(attrs)["data-url"])
+        if tag == "h3":
             self._heading = True
+        if self._heading and self._anchor is not None and tag in ("h3", "a"):
             self._anchor["heading"] = []
 
     def handle_data(self, text):
@@ -179,7 +185,8 @@ class _GooglePage(_Page):
                 headings = [link for link in self.links[start_link:] if link.get("heading")]
                 # 多条结果共用的外层容器不能把其他作品的分享链接混进摘要。
                 if len(headings) == 1:
-                    self.results.append({**headings[0], "snippet": " ".join(self.text[start_text:])})
+                    self.results.append({**headings[0], "snippet": " ".join(self.text[start_text:]),
+                                         "target_url": next(iter(self._targets)) if len(self._targets) == 1 else ""})
                 self._result = None
             self._depth -= 1
 
@@ -203,6 +210,23 @@ def _page_links(text):
 
 
 def _search_results(engine, body, url):
+    if engine == "Meijusou":
+        if re.search(r"cf-chl-|captcha|verify you are human|访问过于频繁", body, re.I):
+            raise SearchError("美剧搜要求人工验证，请稍后重试")
+        page = _Page(body)
+        results, seen = [], set()
+        for item in page.links:
+            link = urljoin(url, item["url"])
+            parts = urlsplit(link)
+            # 搜索结果与侧栏热门作品分开，只读取公开帖子标题。
+            if ("line-clamp-2" in item["class"].split() and parts.hostname == "meijusou.com"
+                    and re.fullmatch(r"/post/[A-Za-z0-9_-]+", parts.path)
+                    and not parts.fragment and item["text"] and link not in seen):
+                seen.add(link)
+                results.append({"title": item["text"], "url": link, "snippet": ""})
+        if not results and not re.search(r"\b0\s*条结果", " ".join(page.text)):
+            raise SearchError("美剧搜页面格式已改变或需要验证")
+        return results[:10]
     if engine == "Bing":
         try:
             root = ElementTree.fromstring(body)
@@ -216,7 +240,7 @@ def _search_results(engine, body, url):
         if (urlsplit(url).hostname == "consent.google.com"
                 or re.search(r"captcha-form|g-recaptcha|unusual traffic|verify you are human|/sorry/|Before you continue to Google", body, re.I)):
             raise SearchError("Google 要求人工验证或同意页面，请稍后重试")
-        page = _GooglePage(body)
+        page = _SearchPage(body)
         results, seen = [], set()
         for item in page.results + [link for link in page.links if link.get("heading")]:
             link = urljoin(url, item["url"])
@@ -230,6 +254,16 @@ def _search_results(engine, body, url):
                                 "snippet": item.get("snippet", "")})
         if not results and not re.search(r"did not match any documents|No results found|找不到和|没有找到", " ".join(page.text), re.I):
             raise SearchError("Google 页面格式已改变或要求启用 JavaScript/人工验证")
+        return results[:10]
+    if engine == "Sogou":
+        if re.search(r"antispider|captcha|搜狗搜索访问异常|访问过于频繁|请输入验证码", body, re.I):
+            raise SearchError("搜狗要求人工验证，请稍后重试")
+        page = _SearchPage(body)
+        results = [{"title": "".join(item["heading"]).strip(),
+                    "url": urljoin(url, item["target_url"] or item["url"]), "snippet": item["snippet"]}
+                   for item in page.results]
+        if not results and not re.search(r"未找到与|没有找到|没有查询到", " ".join(page.text)):
+            raise SearchError("搜狗页面格式已改变或需要验证")
         return results[:10]
     if re.search(r"anomaly\.js|challenge-form|anomaly-modal|unusual traffic|verify you are human", body, re.I):
         raise SearchError("DuckDuckGo 要求人工验证，请稍后重试")
@@ -312,6 +346,18 @@ class WebSearch:
             except (requests.RequestException, TransportError, OSError, ValueError, LookupError) as error:
                 raise SearchError(f"网页请求失败 ({type(error).__name__})") from error
 
+    def _fetch_with_retry(self, url, deadline):
+        for attempt in range(2):
+            try:
+                return self._fetch(url, deadline)
+            except SearchError as error:
+                cause = error.__cause__
+                retryable = isinstance(cause, (requests.Timeout, requests.ConnectionError,
+                                               NewConnectionError, ProtocolError, ReadTimeoutError))
+                if (attempt or deadline - time.monotonic() < 5 or not retryable
+                        or isinstance(cause, requests.exceptions.SSLError)):
+                    raise
+
     def search(self, query, refresh=False, failed_engines=None):
         self.errors = []
         failed_engines = failed_engines if failed_engines is not None else set()
@@ -325,12 +371,16 @@ class WebSearch:
                 return [dict(item) for item in cached[1]]
         deadline = time.monotonic() + 32
         params = urlencode({"q": query + " 夸克"})
-        engines = [("DuckDuckGo", "https://html.duckduckgo.com/html/?" + params),
+        engines = [("Meijusou", "https://meijusou.com/search?" + urlencode({"q": query})),
+                   ("DuckDuckGo", "https://html.duckduckgo.com/html/?" + params),
                    ("Bing", "https://cn.bing.com/search?format=rss&mkt=zh-CN&" + params),
-                   ("Google", "https://www.google.com/search?gbv=1&num=10&" + params)]
+                   ("Google", "https://www.google.com/search?gbv=1&num=10&" + params),
+                   ("Sogou", "https://www.sogou.com/web?" + urlencode({"query": query + " 夸克"}))]
 
         def search_engine(engine, url):
-            body, final_url = self._fetch(url, deadline)
+            report_progress("search", source=f"网页搜索 {engine}", query=query)
+            fetch = self._fetch_with_retry if engine == "Meijusou" else self._fetch
+            body, final_url = fetch(url, deadline)
             return _search_results(engine, body, final_url)
 
         candidates, succeeded = [], 0
@@ -348,7 +398,8 @@ class WebSearch:
         if not succeeded:
             raise SearchError("；".join(self.errors) or "本次查找已跳过此前失败的网页搜索引擎")
 
-        candidates.sort(key=lambda item: ("夸克" in item["title"], "夸克" in item["snippet"]), reverse=True)
+        candidates.sort(key=lambda item: ("pan.quark.cn/s/" in item["snippet"], "网盘" in item["title"],
+                                          "网盘" in item["snippet"], "夸克" in item["title"]), reverse=True)
         results, pages, seen = [], [], set()
         for item in candidates:
             if time.monotonic() >= deadline:
@@ -370,8 +421,13 @@ class WebSearch:
         # 每个引擎先检查一个落地页，避免前一个引擎占满全部读取额度。
         selected_pages = list(first_pages.values())
         selected_pages.extend(item for item in pages if item not in selected_pages)
+
+        def fetch_page(item):
+            report_progress("search", source=f"网页搜索 {item['engine']} 落地页", query=query)
+            return self._fetch_with_retry(item["url"], deadline)
+
         with ThreadPoolExecutor(max_workers=2) as executor:
-            jobs = [(item, executor.submit(self._fetch, item["url"], deadline)) for item in selected_pages[:4]]
+            jobs = [(item, executor.submit(fetch_page, item)) for item in selected_pages[:max(4, len(first_pages))]]
             for item, future in jobs:
                 try:
                     body, final_url = future.result()

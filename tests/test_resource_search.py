@@ -305,6 +305,16 @@ class SharedSearchTests(unittest.TestCase):
 
 
 class WebAggregationTests(unittest.TestCase):
+    @patch("resource_search.report_progress")
+    @patch("resource_search.PanSou")
+    def test_source_progress_contains_label_and_query_without_credentials(self, pansou, progress):
+        pansou.return_value.search.return_value = [entry()]
+        config = {"source": {"pansou": {"server": "https://private.example", "token": "private-token"}}}
+        result = aggregate_search_resources("作品", config, include_web=False)
+        self.assertTrue(result["success"])
+        progress.assert_called_once_with("search", source="PanSou", query="作品")
+        self.assertNotIn("private", str(progress.call_args_list))
+
     @patch("resource_search.WebSearch")
     def test_failed_engines_are_shared_only_when_requested(self, web):
         failed_engines = {"Google"}
@@ -345,11 +355,13 @@ class WebAggregationTests(unittest.TestCase):
     @patch("resource_search.WebSearch")
     def test_all_engine_failures_remain_separate_in_web_and_aggregate_results(self, web):
         web.return_value.errors = ["DuckDuckGo: 网页域名解析失败", "Bing: 网页请求失败 (ProxyError)",
-                                  "Google: 要求人工验证"]
+                                  "Google: 要求人工验证", "Sogou: 搜狗要求人工验证", "Meijusou: 网页请求失败 (ReadTimeout)"]
         web.return_value.search.side_effect = SearchError("；".join(web.return_value.errors))
         expected = [{"source": "网页搜索 DuckDuckGo", "message": "DNS 域名解析失败"},
                     {"source": "网页搜索 Bing", "message": "代理连接失败"},
-                    {"source": "网页搜索 Google", "message": "需要人工验证"}]
+                    {"source": "网页搜索 Google", "message": "需要人工验证"},
+                    {"source": "网页搜索 Sogou", "message": "需要人工验证"},
+                    {"source": "网页搜索 Meijusou", "message": "请求超时"}]
         result = search_web_resources("作品", {})
         self.assertFalse(result["success"])
         self.assertEqual(result["errors"], expected)

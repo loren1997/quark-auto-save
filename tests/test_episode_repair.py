@@ -68,6 +68,84 @@ class EpisodeRepairTests(unittest.TestCase):
         self.assertIsNone(qas._resource_episode_number(task, "S01E02.mkv"))
         self.assertIsNone(qas._resource_episode_number({**task, "taskname": "黑色召唤师"}, "02.mkv"))
 
+    def test_release_groups_and_encoding_labels_preserve_real_episode_and_rename(self):
+        task = {**self.task, "replace": "{TASKNAME} S01E{EXX}.{EXT}"}
+        for filename in (
+            "[Group-A] Black Summoner - 02 [WebRip 1080p HEVC-10bit AAC].mkv",
+            "[Group-B] Black Summoner - 02 (ABEMA 1920x1080 AVC AAC MKV) [544C74F9].mkv",
+            "[Group-C] Black Summoner - 02 [HIDIVE WEB-DL 1080p AVC AAC].mkv",
+        ):
+            with self.subTest(filename=filename):
+                self.assertEqual(qas._resource_episode_number(task, filename), 2)
+                self.assertEqual(qas._episode_repair_files(task, [video(filename, "second")], {2}), {"second": 2})
+                mr = qas.MagicRename({})
+                mr.set_taskname(task["taskname"])
+                renamed = mr.media_name(task["pattern"], task["replace"], filename)
+                self.assertTrue(renamed.endswith(" S01E02.mkv"), renamed)
+        for filename in ("[2021] Black Summoner - 02.mkv", "[S02] Black Summoner - 02.mkv",
+                         "[Group] Other Show - 02 [WebRip 1080p HEVC].mkv",
+                         "[Group] Black Summoner - 02 [Mystery 2021].mkv",
+                         "[Group] Black Summoner - 02 [20212022].mkv",
+                         "[Group] Black Summoner - 01-02 [WebRip 1080p HEVC].mkv"):
+            with self.subTest(filename=filename):
+                self.assertIsNone(qas._resource_episode_number(task, filename))
+        numbered_title = {**task, "taskname": "86 (2021)", "search_aliases": []}
+        self.assertEqual(qas._resource_episode_number(numbered_title, "[Group] 86 - 02 [WebRip 1080p HEVC].mkv"), 2)
+
+    def test_missing_year_release_groups_require_current_strict_primary_and_keep_one_group(self):
+        self.task["replace"] = "{TASKNAME} S01E{EXX}.{EXT}"
+        groups = ["a" * 32, "b" * 32]
+        candidate = self.candidate("releasegroups")
+
+        def detail(share, _token, parent, **_kwargs):
+            if share == "original":
+                return {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [video("01.mkv")]}}
+            if str(parent) == "0":
+                return {"code": 0, "data": {"share": {"title": "黑色召唤师"}, "list": [
+                    {"fid": fid, "file_name": f"[Group-{index}] Black Summoner", "dir": True}
+                    for index, fid in enumerate(groups)]}}
+            number = 1 if parent == groups[0] else 2
+            return self.files([f"[Group] Black Summoner - {number:02d} [WebRip 1080p HEVC-10bit AAC].mkv"])
+
+        with patch("resource_search.search_resources", return_value={"success": True, "data": [candidate]}), \
+                patch("resource_search.search_web_resources", return_value={"success": True, "data": [], "errors": []}), \
+                patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}) as tokens, \
+                patch.object(self.account, "get_detail", side_effect=detail):
+            result = self.account.find_valid_resource(self.task, {}, required_episodes={2})
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["candidate"]["pdir_fid"], groups[1])
+        self.assertTrue(result["candidate"]["shareurl"].endswith(groups[1]))
+        self.assertEqual(list(result["candidate"]["episode_fids"].values()), [2])
+        self.assertEqual(sum(call.args[0] == "original" for call in tokens.call_args_list), 1)
+        self.assertIn("候选未标年份", self.output.getvalue())
+
+    def test_unknown_year_exception_is_only_for_verified_first_season_gap_videos(self):
+        ordinary = "[Group] Black Summoner - 02 [WebRip 1080p HEVC].mkv"
+        cases = [
+            ({}, ordinary, True, None),
+            ({"resource_id": ""}, ordinary, True, {2}),
+            ({"resource_type": "movie"}, ordinary, True, {2}),
+            ({"taskname": "黒の召喚士 第二季 (2022)"}, ordinary, True, {2}),
+            ({}, ordinary, False, {2}),
+            ({}, "02.mkv", True, {2}),
+            ({}, "[Group] Black Summoner (2021) - 02 [WebRip 1080p HEVC].mkv", True, {2}),
+            ({}, "[Group] Black Summoner S02E02 [WebRip 1080p HEVC].mkv", True, {2}),
+            ({}, "[Group] Other Show - 02 [WebRip 1080p HEVC].mkv", True, {2}),
+        ]
+        for changes, filename, primary_ok, required in cases:
+            task = {**self.task, **changes}
+            def detail(share, *_args, **_kwargs):
+                if share == "original":
+                    return {"code": 0, "data": {"share": {"title": self.task["taskname"] if primary_ok else "黑色召唤师 (2021)"},
+                                                "list": [video("01.mkv")]}}
+                return {"code": 0, "data": {"share": {"title": "黑色召唤师"}, "list": [video(filename)]}}
+            with self.subTest(changes=changes, filename=filename, primary_ok=primary_ok, required=required), \
+                    patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                    patch.object(self.account, "get_detail", side_effect=detail):
+                result = self.account._find_verified_resource(task, [self.candidate("unknownyear")], set(),
+                                                             task["search_aliases"], required_episodes=required)
+                self.assertFalse(result["success"], result)
+
     def test_actual_release_labels_and_spaces_detect_missing_two(self):
         task = {**self.task, "taskname": "黑暗召唤师在地下恋爱中（2026）",
                 "search_aliases": ["与暗黑召唤师秘密恋爱中"]}
@@ -146,6 +224,18 @@ class EpisodeRepairTests(unittest.TestCase):
                 self.assertTrue(result["success"])
                 self.assertEqual([call.args[0] for call in lookup.call_args_list],
                                  expected[:expected.index(successful_query) + 1])
+
+    def test_gap_web_search_tries_series_page_before_episode_keywords(self):
+        detail = self.files(["Black Summoner 02.mkv"])
+        detail["data"]["share"] = {"title": self.task["taskname"]}
+        with patch("resource_search.search_resources", return_value={"success": True, "data": []}) as index, \
+                patch("resource_search.search_web_resources", return_value={"success": True, "data": [self.candidate("webpack")]}) as web, \
+                patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "token"}}), \
+                patch.object(self.account, "get_detail", return_value=detail):
+            result = self.account.find_valid_resource(self.task, {}, required_episodes={2})
+        self.assertTrue(result["success"])
+        self.assertEqual(index.call_args_list[0].args[0], "黒の召喚士 02")
+        self.assertEqual(web.call_args_list[0].args[0], "黒の召喚士")
 
     def test_one_query_cannot_use_all_gap_candidate_slots(self):
         self.task["taskname"] = "黑色召唤师 (2022)"

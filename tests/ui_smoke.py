@@ -5,7 +5,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-from flask import Response, request
+from flask import jsonify, request
 from playwright.sync_api import sync_playwright
 from werkzeug.serving import make_server
 
@@ -49,11 +49,62 @@ def main():
     web.reload_tasks = lambda: True
     web.task_plugins_config_default = {"aria2": {"auto_download": False, "download_subdir": False}}
 
-    def fake_run():
-        runs.append(request.get_json())
-        return Response("data: 测试转存完成\n\ndata: [DONE]\n\n", content_type="text/event-stream")
+    records = []
+    hold_list = threading.Event()
+    list_started = threading.Event()
+    release_list = threading.Event()
+    hold_detail = threading.Event()
+    detail_started = threading.Event()
+    release_detail = threading.Event()
+    extra_lines = []
 
-    web.app.view_functions["run_script_now"] = fake_run
+    def fake_runs():
+        if request.method == "GET":
+            snapshot = json.loads(json.dumps(records))
+            if hold_list.is_set():
+                hold_list.clear()
+                list_started.set()
+                assert release_list.wait(10), "test did not release the delayed list response"
+            return jsonify(success=True, data=snapshot)
+        payload = request.get_json()
+        runs.append(payload)
+        record = dict(id=f"{len(runs):032x}", status="running", trigger="discovery" if "discovery_id" in payload else "manual",
+                      task="测试动漫" if payload.get("discovery_id") == item["id"] else "失败番剧" if "discovery_id" in payload else "测试动漫",
+                      stage="search", source="站内搜索 Meijusou", query="测试动漫 第2集",
+                      created_at="2026-11-10T01:00:00+08:00", started_at="2026-11-10T01:00:00+08:00",
+                      finished_at=None, error="", exit_code=None, discovery_id=payload.get("discovery_id", ""))
+        records.insert(0, record)
+        return jsonify(success=True, data=record), 202
+
+    def fake_detail(run_id):
+        record = next(record for record in records if record["id"] == run_id)
+        lines = ["正在查询站内来源", "正在验证候选分享中的第 2 集"]
+        if record["status"] == "failed":
+            lines.append("网页搜索：请求超时；未找到可验证的视频资源，订阅未创建")
+        elif record["status"] == "succeeded":
+            lines.append("测试转存完成，Aria2 已接收下载任务")
+            lines.extend(extra_lines)
+        after = int(request.args.get("after", "0"))
+        if hold_detail.is_set():
+            hold_detail.clear()
+            detail_started.set()
+            assert release_detail.wait(10), "test did not release delayed log response"
+        return jsonify(success=True, data=dict(record, cursor=len(lines), first_cursor=1, truncated=False,
+                       logs=[dict(cursor=i+1, text=line) for i, line in enumerate(lines) if i+1 > after]))
+
+    def finish_run():
+        record, payload = records[0], runs[-1]
+        if payload.get("discovery_id"):
+            with web.app.app_context():
+                response = web.subscribe_discovery_payload({"id": payload["discovery_id"]})
+                data = (response[0] if isinstance(response, tuple) else response).get_json()
+            record.update(status="succeeded" if data["success"] else "failed", error=data.get("message", "") if not data["success"] else "")
+        else:
+            record["status"] = "succeeded"
+        record.update(finished_at="2026-11-10T01:01:00+08:00", exit_code=0 if record["status"] == "succeeded" else 1)
+
+    web.app.view_functions["runs"] = fake_runs
+    web.app.view_functions["run_detail"] = fake_detail
     with tempfile.TemporaryDirectory() as folder:
         web.CONFIG_PATH = str(Path(folder) / "config.json")
         config = json.loads((ROOT / "quark_config.json").read_text(encoding="utf-8"))
@@ -88,40 +139,66 @@ def main():
                 assert page.get_by_role("group", name="更新星期").get_by_role("button").count() == 7
                 page.screenshot(path=str(output / "discovery-desktop.png"), full_page=True)
                 page.wait_for_function("!app.configModified")
+                page.wait_for_function("!app.runsLoading")
+                hold_list.set()
+                page.evaluate("void app.refreshRuns()")
+                assert list_started.wait(5)
                 page.get_by_role("button", name="一键订阅并转存").click()
-                page.wait_for_function("app.formData.tasklist.some(task => task.resource_id === 'bangumi:123')")
-                page.locator("#logModal").wait_for(state="visible")
-                page.wait_for_function("!app.modalLoading")
-                assert len(runs) == 1 and runs[0]["tasklist"][0]["resource_id"] == "bangumi:123"
+                page.wait_for_function("app.backgroundRun && !app.runRequestPending")
+                release_list.set()
+                page.wait_for_function("!app.runsLoading")
+                assert page.evaluate("app.backgroundRun.discovery_id") == "bangumi:123"
+                assert page.evaluate("app.activeTab") == "discovery"
+                assert page.locator("#logModal").count() == 0
+                assert runs == [{"discovery_id": "bangumi:123"}]
+                assert len(web.Config.read_json(web.CONFIG_PATH)["tasklist"]) == 1
+                page.get_by_role("button", name="查看日志", exact=True).click()
+                page.get_by_text("当前来源：", exact=False).wait_for()
+                assert "Meijusou" in page.locator("section[aria-labelledby='runs-heading']").inner_text()
+                page.get_by_label("运行日志内容").filter(has_text="第 2 集").wait_for()
+                # Browser refresh must restore the active job and its incremental log.
+                page.reload()
+                page.locator("a.nav-link").filter(has_text="运行日志").click()
+                page.get_by_label("运行日志内容").filter(has_text="第 2 集").wait_for()
+                assert len(runs) == 1
+                page.set_viewport_size({"width": 390, "height": 844})
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+                page.screenshot(path=str(output / "runs-mobile.png"), full_page=True)
+                page.set_viewport_size({"width": 1440, "height": 1000})
+                finish_run()
+                page.wait_for_function("!app.backgroundRun && app.formData.tasklist.some(task => task.resource_id === 'bangumi:123')")
+                page.get_by_label("运行日志内容").filter(has_text="Aria2 已接收").wait_for()
                 saved = web.Config.read_json(web.CONFIG_PATH)
                 assert len(saved["tasklist"]) == 2 and "NEVER_SAVE" not in json.dumps(saved)
-                page.locator("#logModal .close").click()
+                page.screenshot(path=str(output / "runs-desktop.png"), full_page=True)
+                page.get_by_role("link", name="热门追更").click()
+                page.get_by_role("button", name="动漫", exact=True).click()
+                page.get_by_role("button", name="周一", exact=True).click()
                 page.get_by_role("button", name="已订阅", exact=True).wait_for()
                 assert page.get_by_role("button", name="已订阅", exact=True).is_disabled()
                 page.get_by_role("button", name="周三", exact=True).click()
                 page.get_by_role("button", name="一键订阅并转存").click()
-                page.get_by_role("alert").filter(has_text="《失败番剧》：未找到可验证的视频资源").wait_for()
-                page.get_by_text("查看搜索详情", exact=True).click()
-                assert page.get_by_text("已尝试关键词：失败番剧、Test Anime", exact=True).is_visible()
-                assert page.get_by_text("网页搜索：请求超时", exact=True).is_visible()
+                page.wait_for_function("app.backgroundRun && !app.runRequestPending")
+                finish_run()
+                page.get_by_role("button", name="查看日志", exact=True).click()
+                page.get_by_label("运行日志内容").filter(has_text="未找到可验证的视频资源").wait_for()
                 assert len(web.Config.read_json(web.CONFIG_PATH)["tasklist"]) == 2
-                page.get_by_label("粘贴《失败番剧》的夸克链接订阅").fill("https://example.com/not-quark")
-                page.get_by_role("button", name="验证链接并订阅", exact=True).click()
-                page.get_by_role("alert").filter(has_text="请粘贴有效的夸克分享链接").wait_for()
-                assert not link_checks
-                page.set_viewport_size({"width": 390, "height": 844})
-                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
-                page.get_by_label("粘贴《失败番剧》的夸克链接订阅").fill("http://pan.quark.cn/s/direct123 提取码：abcd")
-                page.get_by_role("button", name="验证链接并订阅", exact=True).click()
-                page.wait_for_function("app.formData.tasklist.some(task => task.resource_id === 'bangumi:456')")
-                page.locator("#logModal").wait_for(state="visible")
-                page.wait_for_function("!app.modalLoading")
-                assert link_checks == [("失败番剧 (2026)", "https://pan.quark.cn/s/direct123?pwd=abcd")]
-                assert len(runs) == 2 and runs[1]["tasklist"][0]["resource_id"] == "bangumi:456"
-                assert len(web.Config.read_json(web.CONFIG_PATH)["tasklist"]) == 3
-                page.locator("#logModal .close").click()
-                assert page.locator("#discovery-share-url").count() == 0
-                page.set_viewport_size({"width": 1440, "height": 1000})
+                assert page.locator("#run-history option").count() == 2
+                # Previous completed runs remain readable without repeating a transfer.
+                page.locator("#run-history").select_option(records[1]["id"])
+                page.get_by_label("运行日志内容").filter(has_text="测试转存完成").wait_for()
+                page.wait_for_function("!app.runsLoading")
+                extra_lines.append("追加日志")
+                hold_detail.set()
+                page.evaluate("void app.refreshRuns()")
+                assert detail_started.wait(5)
+                page.locator("#run-history").select_option(records[0]["id"])
+                page.locator("#run-history").select_option(records[1]["id"])
+                release_detail.set()
+                page.get_by_label("运行日志内容").filter(has_text="追加日志").wait_for()
+                assert "正在查询站内来源" in page.get_by_label("运行日志内容").inner_text()
+                assert len(runs) == 2
+                page.get_by_role("link", name="热门追更").click()
                 page.get_by_role("button", name="周二", exact=True).click()
                 assert page.get_by_text("当天暂无已收录的更新", exact=False).first.is_visible()
                 page.set_viewport_size({"width": 390, "height": 844})
@@ -152,8 +229,7 @@ def main():
                 page.locator(".task").filter(has_text="测试动漫").get_by_title(
                     "运行此任务（失效时重试与自动换源）", exact=True
                 ).click()
-                page.locator("#logModal").wait_for(state="visible")
-                page.wait_for_function("!app.modalLoading")
+                page.wait_for_function("app.backgroundRun && !app.runRequestPending")
                 assert len(runs) == 3
                 retry = runs[2]["tasklist"][0]
                 assert retry["resource_id"] == "bangumi:123"
@@ -162,7 +238,8 @@ def main():
                     "save_path": "cartoon",
                 }
                 assert "ui-test-only-secret" not in json.dumps(runs)
-                page.locator("#logModal .close").click()
+                finish_run()
+                page.wait_for_function("!app.backgroundRun")
 
                 page.locator("a.nav-link").filter(has_text="任务列表").click()
                 page.locator('[data-target="#collapse_0"]').click()
@@ -170,7 +247,7 @@ def main():
                 page.get_by_text("PanSou: 搜索源暂时不可用", exact=True).wait_for()
                 assert not errors, errors
                 browser.close()
-            print("UI smoke passed: login, donghua/source groups, seven days, subscribe/run, dedup, mobile, direct link fallback/validation/run, enable existing Aria2 download/save/refresh/run, contextual search errors; no JS errors")
+            print("UI smoke passed: login, donghua/source groups, seven days, subscribe/run, dedup, mobile, background log, reload/reconnect/history/errors, enable existing Aria2 download/save/refresh/run, contextual search errors; no JS errors")
         finally:
             if errors:
                 print("Browser errors:", errors)

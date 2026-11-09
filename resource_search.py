@@ -9,6 +9,7 @@ from app.sdk.cloudsaver import CloudSaver
 from app.sdk.common import SearchError
 from app.sdk.pansou import PanSou
 from app.sdk.websearch import WebSearch
+from run_progress import report_progress
 
 
 DEFAULT_PANSOU_SERVER = "https://so.252035.xyz"
@@ -44,7 +45,7 @@ def search_error_reason(message):
 def _web_errors(messages):
     errors = []
     for message in messages:
-        match = re.match(r"^(Bing|DuckDuckGo|Google)(\s+落地页)?:\s*(.*)$", str(message), re.S)
+        match = re.match(r"^(Bing|DuckDuckGo|Google|Sogou|Meijusou)(\s+落地页)?:\s*(.*)$", str(message), re.S)
         source = "网页搜索" + (f" {match[1]}{match[2] or ''}" if match else "")
         error = {"source": source, "message": search_error_reason(match[3] if match else message)}
         if error not in errors:
@@ -159,6 +160,7 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
 
     def search_source(job):
         label, server, token = job
+        report_progress("search", source=label, query=query)
         if label == "网页搜索":
             response = search_web_resources(query, config, refresh=refresh)
             return response["data"], response["errors"], response["success"]

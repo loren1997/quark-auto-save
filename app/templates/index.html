@@ -47,6 +47,12 @@
                 <i class="bi bi-list-task"></i> 任务列表
               </a>
             </li>
+            <li class="nav-item">
+              <a class="nav-link" href="#" :class="{active: activeTab === 'runs'}" @click.prevent="changeTab('runs')">
+                <i class="bi bi-terminal"></i> 运行日志
+                <span v-if="backgroundRun" class="badge badge-primary ml-1">运行中</span>
+              </a>
+            </li>
             <h6 class="sidebar-heading px-3 mt-4 mb-1 text-muted">dashboard</h6>
             <li class="nav-item">
               <a class="nav-link" href="/logout">
@@ -72,6 +78,55 @@
 
       <main class="col-md-9 col-lg-10 ml-sm-auto">
         <form @submit.prevent="saveConfig" @keydown.enter.prevent>
+
+          <div v-if="backgroundRun && activeTab !== 'runs'" class="alert alert-info mt-3" role="status">
+            后台运行：{{ backgroundRun.task || '准备任务' }} · {{ runStageLabel(backgroundRun) }}
+            <button type="button" class="btn btn-sm btn-outline-primary ml-2" @click="openRun(backgroundRun.id)">查看日志</button>
+          </div>
+          <div v-if="runNotice && activeTab !== 'runs'" class="alert alert-secondary mt-3" role="status">
+            {{ runNotice }}
+            <button type="button" class="btn btn-sm btn-link" @click="changeTab('runs')">查看运行记录</button>
+            <button type="button" class="close" aria-label="关闭运行提示" @click="runNotice = ''"><span aria-hidden="true">&times;</span></button>
+          </div>
+
+          <section v-if="activeTab === 'runs'" aria-labelledby="runs-heading">
+            <div class="row title">
+              <div class="col"><h2 id="runs-heading"><i class="bi bi-terminal"></i> 运行日志</h2></div>
+              <div class="col-auto"><button type="button" class="btn btn-outline-primary" :disabled="runsLoading" @click="refreshRuns()">刷新日志</button></div>
+            </div>
+            <p class="text-muted">任务在后台执行，关闭页面不会中断。这里记录手动、订阅和定时运行；显示的下载阶段表示提交给下载器，实际进度请在 Aria2 查看。</p>
+            <div v-if="runsError" class="alert alert-warning" role="alert">{{ runsError }}</div>
+            <p v-if="!runs.length && !runsLoading" class="text-muted">暂无运行记录，启动任务后会自动显示。</p>
+            <div v-if="runs.length" class="form-group">
+              <label for="run-history">运行记录</label>
+              <select id="run-history" class="form-control" :value="selectedRunId" @change="selectRun($event.target.value)">
+                <option v-for="run in runs" :key="run.id" :value="run.id">{{ run.created_at | ts2date }} · {{ runTriggerLabel(run.trigger) }} · {{ run.task || '全部任务' }} · {{ runStatusLabel(run.status) }}</option>
+              </select>
+            </div>
+            <div v-if="runDetail" class="card mb-3">
+              <div class="card-body">
+                <div class="d-flex flex-wrap justify-content-between align-items-center">
+                  <h5 class="mb-2">{{ runDetail.task || '全部任务' }}</h5>
+                  <span class="badge mb-2" :class="isRunActive(runDetail) ? 'badge-primary' : runDetail.status === 'succeeded' ? 'badge-success' : 'badge-warning'">{{ runStatusLabel(runDetail.status) }}</span>
+                </div>
+                <div role="status" aria-live="polite">
+                  <strong>当前位置：</strong>{{ runStageLabel(runDetail) }}
+                  <span v-if="isRunActive(runDetail)" class="spinner-border spinner-border-sm ml-1" aria-hidden="true"></span>
+                </div>
+                <div v-if="isRunActive(runDetail) && runDetail.source"><strong>当前来源：</strong>{{ runDetail.source }}</div>
+                <div v-if="isRunActive(runDetail) && runDetail.query" style="overflow-wrap: anywhere;"><strong>当前查询或文件：</strong>{{ runDetail.query }}</div>
+                <div class="small text-muted mt-2">开始：{{ (runDetail.started_at || runDetail.created_at) | ts2date }}<span v-if="runDetail.finished_at"> · 结束：{{ runDetail.finished_at | ts2date }}</span></div>
+                <div v-if="runDetail.error" class="alert alert-warning mt-3 mb-0">{{ runDetail.error }}</div>
+                <div v-if="runDetail.warning" class="alert alert-warning mt-3 mb-0">本轮日志包含失败或未完成项，请查看下方具体原因。</div>
+                <p v-if="runDetail.status === 'succeeded'" class="small text-muted mb-0 mt-2">本轮已结束；是否补齐、转存或成功提交下载，请查看下方结果。</p>
+              </div>
+            </div>
+            <div v-if="runDetail" class="d-flex justify-content-between mb-2">
+              <span class="text-muted small">实时更新 · 仅保留最近的运行记录和日志</span>
+              <label class="small mb-0"><input type="checkbox" v-model="runFollow"> 跟随最新日志</label>
+            </div>
+            <pre v-if="runDetail" ref="runLogView" id="run-log-output" tabindex="0" aria-label="运行日志内容" class="border rounded p-3 bg-light" style="white-space: pre-wrap; overflow-wrap: anywhere; max-height: 65vh; overflow-y: auto;">{{ runLog || '正在等待任务输出…' }}</pre>
+          </section>
 
           <div v-if="activeTab === 'config'">
             <div class="row title">
@@ -320,7 +375,7 @@
               <label class="col-sm-2 col-form-label" for="websearch-enabled">网页搜索</label>
               <div class="col-sm-10">
                 <label><input id="websearch-enabled" type="checkbox" v-model="formData.source.websearch.enable"> 自动搜索公开网页中的夸克链接</label>
-                <small class="text-muted d-block">使用 DuckDuckGo、Bing 搜索并读取结果网页。一键订阅和失效换源在网盘索引未找到匹配资源时自动补搜；仍会检查分享中的真实文件。需要 NAS 能访问相应网站，验证码或网络故障会明确提示。</small>
+                <small class="text-muted d-block">查询公开资源站及搜狗、Google、Bing、DuckDuckGo，并读取结果网页中的夸克链接。一键订阅、失效换源和缺集补全都会检查分享中的真实视频文件。需要 NAS 能访问相应网站，验证码或网络故障会记录在运行日志中。</small>
               </div>
             </div>
 
@@ -382,7 +437,7 @@
                       </div>
                     </div>
                     <div class="card-footer bg-white">
-                      <button type="button" class="btn btn-primary btn-block" :disabled="!!subscribing || isSubscribed(item)" @click="subscribeDiscovery(item)">{{ isSubscribed(item) ? '已订阅' : subscribing === item.id ? '正在查找并验证资源…' : '一键订阅并转存' }}</button>
+                      <button type="button" class="btn btn-primary btn-block" :disabled="!!subscribing || !!backgroundRun || isSubscribed(item)" @click="subscribeDiscovery(item)">{{ isSubscribed(item) ? '已订阅' : backgroundRun && backgroundRun.discovery_id === item.id ? '后台查找并订阅中…' : subscribing === item.id ? '正在启动…' : '一键订阅并转存' }}</button>
                     </div>
                   </article>
                 </div>
@@ -584,32 +639,13 @@
             </div>
           </div>
 
-          <div class="bottom-buttons">
+          <div class="bottom-buttons" v-if="activeTab !== 'runs'">
             <button class="btn btn-success" data-toggle="tooltip" data-placement="top" title="保存 CTRL+S"><i class="bi bi-floppy2-fill"></i></button>
-            <button type="button" class="btn btn-primary" data-toggle="tooltip" data-placement="top" title="运行 CTRL+R" @click="runScriptNow()"><i class="bi bi-play-fill"></i></button>
+            <button type="button" class="btn btn-primary" data-toggle="tooltip" data-placement="top" title="后台运行 CTRL+R" :disabled="runRequestPending || !!backgroundRun" @click="runScriptNow()"><i class="bi bi-play-fill"></i></button>
             <button type="button" class="btn btn-info" data-toggle="tooltip" data-placement="top" title="单击回顶，双击到底" @click="scrollToX(0)" @dblclick="scrollToX()"><i class="bi bi-chevron-bar-up"></i></button>
           </div>
         </form>
       </main>
-    </div>
-
-    <!-- 模态框 运行日志 -->
-    <div class="modal" tabindex="-1" id="logModal">
-      <div class="modal-dialog">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h5 class="modal-title"><b>运行日志</b>
-              <div v-if="modalLoading" class="spinner-border spinner-border-sm m-1" role="status"></div>
-            </h5>
-            <button type="button" class="close" data-dismiss="modal" aria-label="Close">
-              <span aria-hidden="true">&times;</span>
-            </button>
-          </div>
-          <div class="modal-body">
-            <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">{{ run_log }}</pre>
-          </div>
-        </div>
-      </div>
     </div>
 
     <!-- 模态框 文件选择 -->
@@ -794,7 +830,18 @@
           ignore_extension: false,
           runweek: [1, 2, 3, 4, 5, 6, 7]
         },
-        run_log: "",
+        runs: [],
+        selectedRunId: '',
+        runDetail: null,
+        runCursor: 0,
+        runLog: '',
+        runFollow: true,
+        runNotice: '',
+        runsError: '',
+        runsLoading: false,
+          runRequestPending: false,
+          runsRevision: 0,
+        runsTimer: null,
         taskDirs: [""],
         taskDirSelected: "",
         taskNameFilter: "",
@@ -827,6 +874,11 @@
           sortOrder: "desc"
         },
       },
+      computed: {
+        backgroundRun() {
+          return this.runs.find(run => this.isRunActive(run));
+        },
+      },
       filters: {
         ts2date: function (value) {
           const date = new Date(value);
@@ -851,6 +903,10 @@
       },
       mounted() {
         this.fetchData();
+        this.refreshRuns();
+        this.runsTimer = setInterval(() => {
+          if (!document.hidden) this.refreshRuns();
+        }, 2000);
         this.checkNewVersion();
         $('[data-toggle="tooltip"]').tooltip();
         document.addEventListener('keydown', this.handleKeyDown);
@@ -862,12 +918,14 @@
         window.addEventListener('beforeunload', this.handleBeforeUnload);
       },
       beforeDestroy() {
+        clearInterval(this.runsTimer);
         window.removeEventListener('beforeunload', this.handleBeforeUnload);
       },
       methods: {
         changeTab(tab) {
           this.activeTab = tab;
           if (tab === 'discovery' && !this.calendar.days.length) this.loadDiscovery();
+          if (tab === 'runs') this.refreshRuns();
           if (window.innerWidth <= 768) {
             $('#sidebarMenu').collapse('toggle')
           }
@@ -911,24 +969,109 @@
             this.discoveryShareUrl = '';
           }
           try {
-            const payload = { id: item.id };
+            const payload = { discovery_id: item.id };
             if (shareurl) payload.shareurl = shareurl.trim();
-            const response = await axios.post('/api/discovery/subscribe', payload);
-            if (!response.data.success) throw new Error(response.data.message);
+            await this.startBackgroundRun(payload);
             this.discoveryFailedItem = null;
             this.discoveryShareUrl = '';
-            await this.fetchData();
-            this.showToast(response.data.message, 'success');
-            if (!response.data.existing) {
-              const index = this.formData.tasklist.findIndex(task => task.resource_id === item.id);
-              if (index >= 0) await this.runScriptNow(index);
-            }
           } catch (error) {
             this.discoveryError = `《${item.title}》：` + (error.response?.data?.message || error.message || '订阅失败，请重试');
             this.discoverySearchDetails = error.response?.data || {};
             this.discoveryFailedItem = item;
           } finally {
             this.subscribing = '';
+          }
+        },
+        isRunActive(run) {
+          return run && ['queued', 'running'].includes(run.status);
+        },
+        runStatusLabel(status) {
+          return {queued: '等待运行', running: '运行中', succeeded: '运行结束', failed: '运行失败', interrupted: '已中断'}[status] || status;
+        },
+        runTriggerLabel(trigger) {
+          return {manual: '手动运行', scheduled: '定时运行', discovery: '热门订阅'}[trigger] || '运行';
+        },
+        runStageLabel(run) {
+          if (!this.isRunActive(run)) return this.runStatusLabel(run.status);
+          return {start: '准备任务', signin: '检查账号与签到', task: '处理任务', search: '搜索资源', verify: '验证分享与视频', gap: '检查缺失集数', transfer: '转存媒体文件', rename: '按规则更名', download: '提交下载任务', finish: '保存运行结果'}[run.stage] || '等待任务输出';
+        },
+        async startBackgroundRun(payload) {
+          this.runRequestPending = true;
+          this.runNotice = '';
+          try {
+            const response = await axios.post('/api/runs', payload);
+            if (!response.data.success) throw new Error(response.data.message || '启动失败');
+            const run = response.data.data;
+            this.runsRevision++;
+            this.runs = [run, ...this.runs.filter(item => item.id !== run.id)].slice(0, 20);
+            this.selectedRunId = run.id;
+            this.runDetail = run;
+            this.runCursor = 0;
+            this.runLog = '';
+            await this.refreshRuns();
+          } catch (error) {
+            this.runNotice = error.response?.data?.message || error.message || '后台任务启动失败';
+            await this.refreshRuns();
+            throw error;
+          } finally {
+            this.runRequestPending = false;
+          }
+        },
+        selectRun(id) {
+          this.runsRevision++;
+          this.selectedRunId = id;
+          this.runDetail = this.runs.find(run => run.id === id) || null;
+          this.runCursor = 0;
+          this.runLog = '';
+          this.refreshRuns();
+        },
+        openRun(id) {
+          this.selectRun(id);
+          this.changeTab('runs');
+        },
+        async refreshRuns() {
+          if (this.runsLoading) return;
+          this.runsLoading = true;
+          const revision = this.runsRevision;
+          try {
+            const response = await axios.get('/api/runs');
+            if (revision !== this.runsRevision) return;
+            if (!response.data.success) throw new Error(response.data.message || '读取运行记录失败');
+            const previous = new Map(this.runs.map(run => [run.id, run.status]));
+            this.runs = response.data.data;
+            const finished = this.runs.find(run => ['queued', 'running'].includes(previous.get(run.id)) && !this.isRunActive(run));
+            if (finished) {
+              this.runNotice = `${finished.task || '任务'}：${this.runStatusLabel(finished.status)}，结果见运行日志`;
+              if (!this.configModified) await this.fetchData();
+            }
+            if (!this.runs.some(run => run.id === this.selectedRunId)) {
+              this.selectedRunId = this.runs.length ? this.runs[0].id : '';
+              this.runCursor = 0;
+              this.runLog = '';
+              this.runDetail = null;
+            }
+            const id = this.selectedRunId;
+            if (id) {
+              const detail = await axios.get(`/api/runs/${id}`, {params: {after: this.runCursor}});
+              if (!detail.data.success) throw new Error(detail.data.message || '读取日志失败');
+              if (id === this.selectedRunId && revision === this.runsRevision) {
+                const data = detail.data.data;
+                if (data.truncated) this.runLog = '较早日志已省略，以下显示当前保留的内容。\n';
+                this.runLog += (data.logs || []).map(line => line.text).join('\n') + ((data.logs || []).length ? '\n' : '');
+                this.runLog = this.runLog.split('\n').slice(-2000).join('\n');
+                this.runCursor = data.cursor;
+                this.runDetail = data;
+                if (this.runFollow && this.activeTab === 'runs') this.$nextTick(() => {
+                  const view = this.$refs.runLogView;
+                  if (view) view.scrollTop = view.scrollHeight;
+                });
+              }
+            }
+            this.runsError = '';
+          } catch (error) {
+            this.runsError = error.response?.data?.message || error.message || '读取日志失败，稍后自动重试';
+          } finally {
+            this.runsLoading = false;
           }
         },
         checkNewVersion() {
@@ -1154,76 +1297,21 @@
           this[target] = "";
         },
         async runScriptNow(task_index = null, test = false) {
-          body = {};
+          let body = {};
           if (test) {
-            body = {
-              "quark_test": true,
-              "cookie": this.formData.cookie,
-              "push_config": this.formData.push_config
-            };
+            body = {quark_test: true, cookie: this.formData.cookie, push_config: this.formData.push_config};
           } else if (task_index != null) {
-            task = { ...this.formData.tasklist[task_index] };
+            const task = {...this.formData.tasklist[task_index]};
             delete task.runweek;
             delete task.enddate;
-            body = {
-              "tasklist": [task]
-            };
-          } else if (this.configModified) {
-            if (!confirm('配置已修改但未保存，是否继续运行？')) {
-              return;
-            }
+            body = {tasklist: [task]};
+          } else if (this.configModified && !confirm('配置已修改但未保存，是否继续运行？')) {
+            return;
           }
-          $('#logModal').modal('toggle');
-          this.modalLoading = true;
-          this.run_log = '';
           try {
-            // 1. 发送 POST 请求
-            const response = await fetch(`/run_script_now`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify(body)
-            });
-            if (!response.ok) {
-              throw new Error(`HTTP error! Status: ${response.status}`);
-            }
-            // 2. 处理 SSE 流
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let partialData = '';
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) {
-                break;
-              }
-              partialData += decoder.decode(value);
-              const lines = partialData.split('\n').filter(line => line.trim() !== '');
-              for (const line of lines) {
-                if (line.startsWith('data:')) {
-                  const eventData = line.substring(5).trim();
-                  if (eventData === '[DONE]') {
-                    this.modalLoading = false;
-                    if (!this.configModified && !test) {
-                      this.fetchData();
-                    }
-                    break;
-                  }
-                  this.run_log += eventData + '\n';
-                  // 在更新 run_log 后将滚动条滚动到底部
-                  this.$nextTick(() => {
-                    const modalBody = document.querySelector('.modal-body');
-                    modalBody.scrollTop = modalBody.scrollHeight;
-                  });
-                } else {
-                  console.warn('Unexpected line:', line);
-                }
-              }
-              partialData = '';
-            }
+            await this.startBackgroundRun(body);
           } catch (error) {
-            this.modalLoading = false;
-            console.error('Error:', error);
+            // The inline notice retains the request error without interrupting other work.
           }
         },
         getParentDirectory(path) {

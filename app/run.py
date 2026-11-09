@@ -19,15 +19,16 @@ from sdk.discovery import get_calendar, get_search_aliases
 from sdk.common import normalize_share_url
 from copy import deepcopy
 from datetime import timedelta
-import subprocess
 import requests
 import hashlib
 import logging
-import traceback
 import base64
 import sys
 import os
 import re
+import threading
+
+from run_manager import RunManager, validate_payload
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
@@ -95,6 +96,8 @@ app.jinja_env.variable_start_string = "[["
 app.jinja_env.variable_end_string = "]]"
 
 scheduler = BackgroundScheduler()
+run_managers = {}
+run_manager_lock = threading.Lock()
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="[%(asctime)s][%(levelname)s] %(message)s",
@@ -258,55 +261,67 @@ def update():
         return jsonify({"success": False, "message": "配置更新失败"})
 
 
-# 处理运行脚本请求
+def get_run_manager():
+    key = (os.path.abspath(CONFIG_PATH), PYTHON_PATH, os.path.abspath(SCRIPT_PATH), TASK_TIMEOUT)
+    with run_manager_lock:
+        if key not in run_managers:
+            run_managers[key] = RunManager(*key)
+        return run_managers[key]
+
+
+def start_requested_run():
+    try:
+        if request.content_length and request.content_length > 256 * 1024:
+            return None, (jsonify(success=False, message="运行参数过大"), 413)
+        payload = validate_payload(request.get_json(silent=True))
+        if payload.get("shareurl"):
+            normalized = normalize_share_url(payload["shareurl"])
+            if not normalized:
+                raise ValueError("请提供有效的夸克分享链接")
+            payload["shareurl"] = normalized
+        started, record = get_run_manager().start(payload, trigger="discovery" if "discovery_id" in payload else "manual")
+        if not started:
+            return None, (jsonify(success=False, data=record, message="已有任务运行中，请在运行日志查看进度"), 409)
+        return record, None
+    except ValueError as exc:
+        return None, (jsonify(success=False, message=str(exc)), 400)
+    except OSError:
+        return None, (jsonify(success=False, message="无法启动后台任务，请检查配置目录权限"), 500)
+
+
+@app.route("/api/runs", methods=["GET", "POST"])
+def runs():
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    if request.method == "GET":
+        return jsonify(success=True, data=get_run_manager().list())
+    record, error = start_requested_run()
+    return error if error else (jsonify(success=True, data=record), 202)
+
+
+@app.route("/api/runs/<run_id>")
+def run_detail(run_id):
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    after = request.args.get("after", "0")
+    if not re.fullmatch(r"\d{1,12}", after):
+        return jsonify(success=False, message="日志游标必须是非负整数"), 400
+    record = get_run_manager().get(run_id, int(after))
+    if record is None:
+        return jsonify(success=False, message="运行记录不存在"), 404
+    return jsonify(success=True, data=record)
+
+
 @app.route("/run_script_now", methods=["POST"])
 def run_script_now():
     if not is_login():
-        return jsonify({"success": False, "message": "未登录"})
-    tasklist = request.json.get("tasklist", [])
-    command = [PYTHON_PATH, "-u", SCRIPT_PATH, CONFIG_PATH]
-    logging.info(
-        f">>> 手动运行任务 [{tasklist[0].get('taskname') if len(tasklist)>0 else 'ALL'}] 开始执行..."
-    )
-
-    def generate_output():
-        # 设置环境变量
-        process_env = os.environ.copy()
-        process_env["PYTHONIOENCODING"] = "utf-8"
-        if request.json.get("quark_test"):
-            process_env["QUARK_TEST"] = "true"
-            process_env["COOKIE"] = json.dumps(
-                request.json.get("cookie", []), ensure_ascii=False
-            )
-            process_env["PUSH_CONFIG"] = json.dumps(
-                request.json.get("push_config", {}), ensure_ascii=False
-            )
-        if tasklist:
-            process_env["TASKLIST"] = json.dumps(tasklist, ensure_ascii=False)
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=process_env,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        try:
-            for line in iter(process.stdout.readline, ""):
-                logging.info(line.strip())
-                yield f"data: {line}\n\n"
-            yield "data: [DONE]\n\n"
-        finally:
-            process.stdout.close()
-            process.wait()
-
-    return Response(
-        stream_with_context(generate_output()),
-        content_type="text/event-stream;charset=utf-8",
-    )
+        return jsonify(success=False, message="未登录"), 401
+    record, error = start_requested_run()
+    if error:
+        return error
+    return Response(stream_with_context(get_run_manager().stream(record["id"])),
+                    content_type="text/event-stream;charset=utf-8",
+                    headers={"X-Run-ID": record["id"], "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.route("/task_suggestions")
@@ -349,10 +364,13 @@ def discovery():
 
 @app.route("/api/discovery/subscribe", methods=["POST"])
 def subscribe_discovery():
-    global config_data
     if not is_login():
         return jsonify(success=False, message="未登录"), 401
-    payload = request.get_json(silent=True)
+    return subscribe_discovery_payload(request.get_json(silent=True))
+
+
+def subscribe_discovery_payload(payload):
+    global config_data
     if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
         return jsonify(success=False, message="缺少资源 ID"), 400
     shareurl = None
@@ -371,6 +389,8 @@ def subscribe_discovery():
     title = entry["search_title"]
     if re.fullmatch(r"\d{4}", str(entry.get("year", ""))):
         title += f" ({entry['year']})"
+    from run_progress import report_progress
+    report_progress("task", task=title)
     existing = existing_subscription(current.get("tasklist", []), entry["id"], title)
     if existing:
         return jsonify(success=True, existing=True, data=existing, message="已经订阅")
@@ -669,37 +689,12 @@ def add_task():
 
 # 定时任务执行的函数
 def run_python(args):
-    logging.info(f">>> 定时运行任务")
     try:
-        result = subprocess.run(
-            [PYTHON_PATH, *args],
-            timeout=TASK_TIMEOUT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        # 输出执行日志
-        if result.stdout:
-            for line in result.stdout.strip().split("\n"):
-                if line.strip():
-                    logging.info(line)
-
-        if result.returncode == 0:
-            logging.info(f">>> 任务执行成功")
-        else:
-            logging.error(f">>> 任务执行失败，返回码: {result.returncode}")
-            if result.stderr:
-                logging.error(f"错误信息: {result.stderr[:500]}")
-    except subprocess.TimeoutExpired as e:
-        logging.error(f">>> 任务执行超时(>{TASK_TIMEOUT}s)，强制终止")
-    except Exception as e:
-        logging.error(f">>> 任务执行异常: {str(e)}")
-        logging.error(traceback.format_exc())
-    finally:
-        # 确保函数能够正常返回
-        logging.debug(f">>> run_python 函数执行完成")
+        started, record = get_run_manager().start({}, trigger="scheduled")
+        logging.info("定时任务已后台启动" if started else "已有任务运行，本次定时检查合并到当前运行")
+        return record
+    except (OSError, ValueError):
+        logging.error("无法启动定时后台任务，请检查配置及日志目录")
 
 
 # 重新加载任务

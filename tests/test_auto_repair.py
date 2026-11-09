@@ -407,6 +407,44 @@ class AutoRepairTests(unittest.TestCase):
             self.account.repair_share(self.task)
         self.assertEqual(self.task["shareurl"], expected)
 
+    def test_release_group_collection_scopes_one_directory_without_mixing_works(self):
+        group_ids = ["a" * 32, "b" * 32]
+        root = {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [
+            {"fid": fid, "file_name": f"[Group-{index}] {self.task['taskname']}", "dir": True}
+            for index, fid in enumerate(group_ids)]}}
+
+        def detail(_share, _token, parent, **_kwargs):
+            if str(parent) == "0":
+                return root
+            titles = [self.task["taskname"] + " 02.mkv"]
+            if parent == group_ids[0]:
+                titles.append("另一部作品 (2024) 03.mkv")
+            return {"code": 0, "data": {"list": [{"fid": title, "file_name": title, "dir": False} for title in titles]}}
+
+        with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", side_effect=detail):
+            result = self.account.find_valid_resource(self.task, {})
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["candidate"]["pdir_fid"], group_ids[1])
+        self.assertTrue(result["candidate"]["shareurl"].endswith(group_ids[1]))
+
+    def test_release_group_traversal_is_bounded_and_does_not_trust_mixed_folders(self):
+        for mixed in (False, True):
+            folders = [{"fid": str(index).zfill(32), "file_name": f"[Group-{index}] {self.task['taskname']}", "dir": True}
+                       for index in range(6)]
+            if mixed:
+                folders[1]["file_name"] = "[Group] 另一部作品 (2024)"
+            root = {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": folders}}
+            def detail(_share, _token, parent, **_kwargs):
+                return root if str(parent) == "0" else {"code": 0, "data": {"list": []}}
+            with self.subTest(mixed=mixed), patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                    patch.object(self.account, "get_detail", side_effect=detail) as fetch:
+                result = self.account._find_verified_resource(self.task, [self.candidate()], set(), [], max_checked=12)
+            self.assertFalse(result["success"])
+            self.assertLessEqual(fetch.call_count, 1 if mixed else 5)
+            if not mixed:
+                self.assertTrue(result["validation_limited"])
+
     def test_pure_season_child_requires_exact_parent_name(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
         folders = {"code": 0, "data": {"list": [

@@ -3,6 +3,7 @@ import re
 import requests
 
 from media_files import is_media_file, is_video_file, media_title
+from run_progress import report_progress
 
 
 class Aria2:
@@ -159,6 +160,7 @@ class Aria2:
             print(f"Aria2下载: RPC 未连接，保留 {len(pending)} 个文件下次重试；请检查地址、密钥和网络")
             return task
         for fid, file_path in sorted(list(pending.items()), key=lambda item: item[1]):
+            report_progress("download", task=task.get("taskname", ""), source="Aria2", query=os.path.basename(file_path))
             try:
                 # 逐文件取临时直链，避免接口返回乱序/部分失败导致文件名与内容错配。
                 download_return, cookie = account.download([fid])
