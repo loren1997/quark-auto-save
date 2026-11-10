@@ -1,7 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from quark_auto_save import Quark, _resource_video_title
+from quark_auto_save import (Quark, _resource_episode_number, _resource_title_parts,
+                             _resource_video_title, resource_titles_match)
 
 
 TITLE = "黑暗召唤师在地下恋爱中 (2026)"
@@ -61,6 +62,32 @@ class ReleaseTitleTests(unittest.TestCase):
         ):
             with self.subTest(filename=filename):
                 self.assertEqual(_resource_video_title(filename), expected)
+
+    def test_traditional_release_title_and_five_labels_match_actual_episode(self):
+        title = "被放逐的作弊赋予魔术师享受随心所欲的第二人生。"
+        traditional = "被放逐的作弊賦予魔術師享受隨心所欲的第二人生。"
+        filename = f"[ANi] {traditional} - 02 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+        self.assertEqual(_resource_video_title(filename), traditional)
+        self.assertEqual(_resource_episode_number({"taskname": title + " (2026)"}, filename), 2)
+        self.assertTrue(self.verify(title + " (2026)", [filename], title=title + " (2026)", aliases=()))
+        self.assertEqual(_resource_title_parts("被流放的開挂魔術師讴歌随心所欲第二人生"),
+                         _resource_title_parts("被流放的开挂魔术师讴歌随心所欲第二人生"))
+
+    def test_script_normalization_keeps_identity_year_season_and_non_chinese_names(self):
+        self.assertTrue(resource_titles_match("魔术师 第二季 (2026)", "魔術師 第二季 (2026)"))
+        for other in ("魔術師 第二季 (2025)", "魔術師 第三季 (2026)", "魔術師的學生 第二季 (2026)"):
+            with self.subTest(other=other):
+                self.assertFalse(resource_titles_match("魔术师 第二季 (2026)", other))
+        japanese = "追放されたチート付与魔術師は気ままなセカンドライフを謳歌する"
+        self.assertEqual(_resource_title_parts(japanese), (japanese, set(), set()))
+        self.assertEqual(_resource_title_parts("Dark Summoner"), ("darksummoner", set(), set()))
+
+    def test_release_labels_keep_unknown_labels_and_declared_conflicts(self):
+        for label in ("另一部作品", "2025", "S02"):
+            filename = f"[ANi] {ALIAS} - 01 [{label}][Baha][WEB-DL][AAC AVC][CHT].mp4"
+            with self.subTest(label=label):
+                self.assertIn(label, _resource_video_title(filename))
+                self.assertFalse(self.verify("作品目录 (2026)", [filename]))
 
 
 if __name__ == "__main__":

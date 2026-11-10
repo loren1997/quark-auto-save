@@ -3,3 +3,4 @@ apscheduler
 requests
 treelib
 natsort
+opencc-python-reimplemented==0.1.7
