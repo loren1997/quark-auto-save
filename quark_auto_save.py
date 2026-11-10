@@ -1651,9 +1651,12 @@ class Quark:
                 continue
             pwd_id, passcode, pdir_fid, _ = self.extract_url(shareurl)
             identity = (pwd_id, pdir_fid, passcode)
-            if not pwd_id or pwd_id in seen or identity in visited:
+            # 三元组保留显式排除；同一分享后来取得有效正文证据时可再验证一次。
+            attempt_key = identity + (bool(_resource_source_post(task, candidate, aliases)),)
+            if (not pwd_id or pwd_id in seen or identity in visited
+                    or attempt_key in visited or identity + (True,) in visited):
                 continue
-            visited.add(identity)
+            visited.add(attempt_key)
             checked += 1
             report_progress("verify", task=title, source="夸克分享", query=f"候选 {checked}")
             try:
