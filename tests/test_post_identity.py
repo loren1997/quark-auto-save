@@ -13,7 +13,8 @@ POST = {"page_url": "https://meijusou.com/post/abc123", "title": NAME, "shareurl
 
 
 class PostIdentityTests(unittest.TestCase):
-    def verify(self, *, task=None, post=POST, folder=NAME, videos=None, history=None, required=None, groups=None):
+    def verify(self, *, task=None, post=POST, folder=NAME, videos=None, history=None, required=None, groups=None,
+               visited=None):
         task = task or {"taskname": NAME + " (2026)", "resource_type": "anime", "resource_id": "bangumi:123"}
         account = Quark()
         account.resource_history_path = history
@@ -34,8 +35,50 @@ class PostIdentityTests(unittest.TestCase):
         with patch.object(account, "get_stoken", return_value={"status": 200, "data": {"stoken": "test"}}), \
                 patch.object(account, "get_detail", side_effect=detail) as listing:
             result = account._find_verified_resource(task, [candidate], set(), [], verify_index_title=False,
-                                                     required_episodes=required)
+                                                     required_episodes=required, visited=visited)
         return result, listing.call_args_list
+
+    def test_valid_post_can_reverify_share_after_attempt_without_post(self):
+        visited = set()
+        self.assertFalse(self.verify(post=None, visited=visited)[0]["success"])
+        result, calls = self.verify(visited=visited)
+        self.assertTrue(result["success"], result)
+        self.assertTrue(calls)
+        for post in (POST, None):
+            repeated, calls = self.verify(post=post, visited=visited)
+            self.assertFalse(repeated["success"])
+            self.assertEqual(calls, [])
+
+    def test_invalid_post_does_not_repeat_share_validation(self):
+        visited = set()
+        self.assertFalse(self.verify(post=None, visited=visited)[0]["success"])
+        for post in ({**POST, "shareurl": "https://pan.quark.cn/s/another"},
+                     {**POST, "title": "另一部作品"},
+                     {**POST, "page_url": "https://meijusou.com.evil.test/post/abc"}):
+            with self.subTest(post=post):
+                result, calls = self.verify(post=post, visited=visited)
+                self.assertFalse(result["success"])
+                self.assertEqual(calls, [])
+
+    def test_valid_post_cannot_override_explicit_excluded_candidate(self):
+        account = Quark()
+        account.resource_history_path = None
+        task = {"taskname": NAME + " (2026)", "resource_type": "anime", "resource_id": "bangumi:123"}
+        pwd_id, passcode, pdir_fid, _ = account.extract_url(SHARE)
+        candidate = {"taskname": NAME, "shareurl": SHARE, "source_post": POST}
+        response = {"success": True, "data": [candidate]}
+        with patch.object(Config, "resource_history", return_value=[]), \
+                patch("resource_search.search_resources", return_value=response) as index, \
+                patch("resource_search.search_web_resources", return_value=response) as web, \
+                patch.object(account, "get_stoken") as token, \
+                patch.object(account, "get_detail") as listing:
+            result = account.find_valid_resource(task, {}, required_episodes={2},
+                                                 exclude_candidates={(pwd_id, pdir_fid, passcode)})
+        self.assertFalse(result["success"])
+        self.assertTrue(index.called)
+        self.assertTrue(web.called)
+        token.assert_not_called()
+        listing.assert_not_called()
 
     def test_named_subtitle_group_and_post_confirm_missing_year_without_touching_comics(self):
         result, calls = self.verify(required={2})
