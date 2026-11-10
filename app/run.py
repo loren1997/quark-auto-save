@@ -36,6 +36,9 @@ sys.path.insert(0, parent_dir)
 from quark_auto_save import Quark, Config, MagicRename, resource_titles_match, apply_media_rename_defaults
 from media_files import MEDIA_PATTERN, is_media_file, is_video_file
 from resource_search import search_resources
+from app.sdk.source_monitor import maintain_sources
+from app.sdk.channel_registry import ChannelRegistry
+from app.sdk.source_health import SourceHealth
 
 print(
     r"""
@@ -97,6 +100,7 @@ app.jinja_env.variable_start_string = "[["
 app.jinja_env.variable_end_string = "]]"
 
 scheduler = BackgroundScheduler()
+SOURCE_MONITOR_JOB = "source-monitor"
 run_managers = {}
 run_manager_lock = threading.Lock()
 logging.basicConfig(
@@ -129,6 +133,36 @@ def is_login():
         return True
     else:
         return False
+
+
+def source_option_enabled(config, source, option="enable"):
+    return str(((config.get("source") or {}).get(source) or {}).get(option, True)).lower() == "true"
+
+
+@app.route("/source_status")
+def source_status():
+    if not is_login():
+        return jsonify({"success": False, "message": "未登录"}), 401
+    try:
+        current = Config.read_json(CONFIG_PATH)
+        health_path = Config.search_health_path(CONFIG_PATH)
+        registry = ChannelRegistry(health_path).status()
+        # 只返回运行状态；配置中的 Cookie、访问令牌和服务器认证信息不进入响应。
+        channel_fields = ("name", "status", "reason", "last_checked", "next_check")
+        source_fields = ("host", "reason", "next_check", "status")
+        data = {
+            "monitor_enabled": source_option_enabled(current, "monitor"),
+            "auto_discover_enabled": source_option_enabled(current, "channelsearch", "auto_discover"),
+            "channel_search_enabled": source_option_enabled(current, "channelsearch"),
+            "registry": {key: registry.get(key) for key in ("last_discovery", "next_discovery", "discovery_reason")},
+            "sources": [{key: row.get(key) for key in source_fields} for row in SourceHealth(health_path).status()],
+        }
+        data["registry"]["channels"] = [{key: row.get(key) for key in channel_fields}
+                                         for row in registry.get("channels", [])]
+        return jsonify({"success": True, "data": data})
+    except (OSError, ValueError, TypeError):
+        logging.warning("无法读取渠道巡检状态")
+        return jsonify({"success": False, "message": "暂时无法读取渠道状态，请稍后刷新"}), 503
 
 
 # 设置icon
@@ -750,37 +784,54 @@ def run_python(args):
         logging.error("无法启动定时后台任务，请检查配置及日志目录")
 
 
+def run_source_monitor():
+    """独立后台巡检，不创建转存任务或运行历史。"""
+    try:
+        current = Config.read_json(CONFIG_PATH)
+        if source_option_enabled(current, "monitor"):
+            maintain_sources(current, Config.search_health_path(CONFIG_PATH))
+    except Exception as error:
+        # 网络和配置故障不能终止之后的巡检，也不将认证信息写入日志。
+        logging.warning("渠道巡检暂未完成 (%s)", type(error).__name__)
+
+
 # 重新加载任务
 def reload_tasks():
-    # 读取定时规则
-    if crontab := config_data.get("crontab"):
-        if scheduler.state == 1:
-            scheduler.pause()  # 暂停调度器
-        trigger = CronTrigger.from_crontab(crontab)
-        scheduler.remove_all_jobs()
+    crontab = config_data.get("crontab")
+    trigger = CronTrigger.from_crontab(crontab) if crontab else None
+    if scheduler.state == 1:
+        scheduler.pause()
+    if trigger:
         scheduler.add_job(
             run_python,
             trigger=trigger,
             args=[[SCRIPT_PATH, CONFIG_PATH]],
             id=SCRIPT_PATH,
-            max_instances=1,  # 最多允许1个实例运行
-            coalesce=True,  # 合并错过的任务，避免堆积
-            misfire_grace_time=300,  # 错过任务的宽限期(秒)，超过则跳过
-            replace_existing=True,  # 替换已存在的同ID任务
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300,
+            replace_existing=True,
         )
-        if scheduler.state == 0:
-            scheduler.start()
-        elif scheduler.state == 2:
-            scheduler.resume()
-        scheduler_state_map = {0: "停止", 1: "运行", 2: "暂停"}
-        logging.info(">>> 重载调度器")
-        logging.info(f"调度状态: {scheduler_state_map[scheduler.state]}")
-        logging.info(f"定时规则: {crontab}")
-        logging.info(f"现有任务: {scheduler.get_jobs()}")
-        return True
-    else:
-        logging.info(">>> no crontab")
-        return False
+    elif scheduler.get_job(SCRIPT_PATH):
+        scheduler.remove_job(SCRIPT_PATH)
+    monitor_job = scheduler.get_job(SOURCE_MONITOR_JOB)
+    if source_option_enabled(config_data, "monitor"):
+        if not monitor_job:
+            scheduler.add_job(
+                run_source_monitor, "interval", minutes=5,
+                id=SOURCE_MONITOR_JOB, max_instances=1, coalesce=True,
+                misfire_grace_time=300, next_run_time=datetime.now() + timedelta(seconds=25),
+            )
+    elif monitor_job:
+        scheduler.remove_job(SOURCE_MONITOR_JOB)
+    # 重载转存定时不会清除巡检任务，也不会推迟已经排好的下一次巡检。
+    if scheduler.state == 0 and scheduler.get_jobs():
+        scheduler.start()
+    elif scheduler.state == 2:
+        scheduler.resume()
+    logging.info(">>> 重载调度器，定时规则: %s，渠道巡检: %s", crontab or "未设置",
+                 "启用" if source_option_enabled(config_data, "monitor") else "停用")
+    return bool(crontab)
 
 
 def init():
@@ -818,7 +869,8 @@ def init():
         source.setdefault("pansou", {"enable": True, "server": "https://so.252035.xyz"})
         source.setdefault("cloudsaver", {"enable": False, "server": "", "username": "", "password": ""})
         source.setdefault("websearch", {"enable": True})
-        source.setdefault("channelsearch", {"enable": True,
+        source.setdefault("monitor", {"enable": True})
+        source.setdefault("channelsearch", {"enable": True, "auto_discover": True,
                                             "telegram_channels": ["guoman4K", "kuakedongman"],
                                             "qq_channels": ["pd26778899"]})
         if new_config and os.getenv("PANSOU_SERVER"):

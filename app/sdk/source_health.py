@@ -13,7 +13,8 @@ from .common import SearchError
 
 class SourceHealth:
     DURATIONS = {"HTTP 429": 300, "HTTP 403": 900, "需要人工验证": 1800, "请求超时": 60,
-                 "搜索源上游协议错误": 300}
+                 "搜索源上游协议错误": 300, "网络连接失败": 300, "响应格式异常": 1800,
+                 "HTTP 404": 900, "HTTP 410": 3600}
 
     def __init__(self, path=None):
         self.path = path
@@ -64,7 +65,6 @@ class SourceHealth:
                 pass
         try:
             with self._connect() as connection:
-                connection.execute("DELETE FROM cooldowns WHERE until <= ?", (now,))
                 connection.execute(
                     "INSERT INTO cooldowns VALUES (?, ?, ?) ON CONFLICT(host) DO UPDATE SET "
                     "reason=excluded.reason, until=MAX(cooldowns.until, excluded.until)",
@@ -73,3 +73,38 @@ class SourceHealth:
                 connection.execute("DELETE FROM cooldowns WHERE host NOT IN (SELECT host FROM cooldowns ORDER BY until DESC LIMIT 128)")
         except (sqlite3.Error, OSError) as error:
             logging.warning("搜索来源冷却记录写入失败 (%s)，下轮可能重新请求", type(error).__name__)
+
+    def status(self):
+        if not self.path:
+            return []
+        try:
+            with self._connect() as connection:
+                rows = connection.execute("SELECT host, reason, until FROM cooldowns ORDER BY until").fetchall()
+            output = []
+            for host, reason, until in rows:
+                try:
+                    until = float(until)
+                    valid = (isinstance(host, str) and 0 < len(host) <= 255 and not any(char in host for char in "/?@#\r\n")
+                             and reason in self.DURATIONS and math.isfinite(until))
+                except (TypeError, ValueError, OverflowError):
+                    valid = False
+                if valid:
+                    output.append({"host": host, "reason": reason, "next_check": until,
+                                   "status": "cooldown" if until > time.time() else "awaiting_probe"})
+            return output
+        except (sqlite3.Error, OSError) as error:
+            logging.warning("搜索来源状态读取失败 (%s)", type(error).__name__)
+            return []
+
+    def clear(self, url, checked_after=None):
+        if not self.path:
+            return False
+        try:
+            with self._connect() as connection:
+                # 较晚发生的新故障不能被较早启动的成功探测覆盖。
+                deleted = connection.execute("DELETE FROM cooldowns WHERE host = ? AND until <= ?",
+                                             (urlsplit(url).hostname, time.time() if checked_after is None else checked_after))
+                return bool(deleted.rowcount)
+        except (sqlite3.Error, OSError) as error:
+            logging.warning("搜索来源恢复状态写入失败 (%s)", type(error).__name__)
+            return False

@@ -217,7 +217,70 @@ class CalendarTests(unittest.TestCase):
         fetch.side_effect = many
         data = discovery.get_calendar()
         self.assertEqual(len(data["days"][0]["tv"]), discovery.TV_LIMIT)
-        self.assertEqual(sum("/akas" in call.args[0] for call in fetch.call_args_list), discovery.TV_LIMIT)
+        self.assertEqual(sum("/akas" in call.args[0] for call in fetch.call_args_list), 10)
+
+    @patch.object(discovery, "_get_json")
+    def test_tv_alias_batches_progress_after_refresh_without_caching_deferred_names(self, fetch):
+        failed = {15}
+        def sources(url):
+            if "/akas" in url:
+                key = int(url.split("/")[-2])
+                if key in failed:
+                    raise requests.Timeout("timeout")
+                return [{"name": f"剧目{key}", "country": {"code": "CN"}}]
+            if "2026-11-02" in url:
+                return [{"airdate": "2026-11-02", "season": 1, "number": 1,
+                         "show": {"id": key, "name": f"Drama {key}", "type": "Scripted", "weight": key}}
+                        for key in range(1, 16)]
+            return []
+        fetch.side_effect = sources
+        first = discovery.get_calendar()
+        self.assertEqual(len(first["days"][0]["tv"]), 15)
+        self.assertEqual(set(discovery._aliases), set(range(6, 15)))
+        self.assertEqual(first["days"][0]["tv"][-1]["title"], "Drama 1")
+        initial_calls = fetch.call_count
+        discovery.get_calendar()
+        self.assertEqual(fetch.call_count, initial_calls)
+        failed.clear()
+        discovery._expires = 0
+        fetch.reset_mock()
+        refreshed = discovery.get_calendar()
+        self.assertEqual(set(discovery._aliases), set(range(1, 16)))
+        self.assertEqual(refreshed["days"][0]["tv"][-1]["title"], "剧目1")
+        self.assertEqual({int(call.args[0].split("/")[-2]) for call in fetch.call_args_list if "/akas" in call.args[0]},
+                         {1, 2, 3, 4, 5, 15})
+
+    @patch.object(discovery, "_get_json")
+    def test_tv_subscription_fetches_deferred_aliases_once_and_keeps_season(self, fetch):
+        fetch.return_value = [{"name": "中文剧名", "country": {"code": "CN"}},
+                              {"name": "English Alias", "country": {"code": "US"}}]
+        aliases = discovery.get_search_aliases({"id": "tvmaze:42:s3", "title": "Drama 第3季", "series_title": "Drama"})
+        self.assertIn("中文剧名 第3季", aliases)
+        self.assertNotIn("中文剧名", aliases)
+        self.assertEqual(fetch.call_args.args[0], "https://api.tvmaze.com/shows/42/akas")
+        self.assertIn("deadline", fetch.call_args.kwargs)
+        self.assertEqual(discovery._aliases[42], ["中文剧名"])
+        cached = discovery.get_search_aliases({"id": "tvmaze:42:s2", "title": "Drama 第2季", "series_title": "Drama"})
+        self.assertIn("中文剧名 第2季", cached)
+        self.assertNotIn("中文剧名 第3季", cached)
+        self.assertEqual(fetch.call_count, 1)
+
+    @patch.object(discovery, "_get_json")
+    def test_failed_tv_subscription_alias_fetch_does_not_poison_cache(self, fetch):
+        entry = {"id": "tvmaze:42:s1", "title": "Drama", "series_title": "Drama"}
+        fetch.side_effect = requests.Timeout("timeout")
+        self.assertEqual(discovery.get_search_aliases(entry), ["Drama"])
+        self.assertNotIn(42, discovery._aliases)
+        fetch.side_effect = None
+        fetch.return_value = [{"name": "中文剧名", "country": {"code": "CN"}}]
+        self.assertIn("中文剧名", discovery.get_search_aliases(entry))
+
+    @patch.object(discovery, "_get_json")
+    def test_tvmaze_animation_year_season_is_not_added_to_subscription_aliases(self, fetch):
+        fetch.return_value = [{"name": "国漫译名", "country": {"code": "CN"}}]
+        aliases = discovery.get_search_aliases({"id": "tvmaze:42:s2026", "title": "国漫年番", "series_title": "国漫年番"})
+        self.assertIn("国漫译名", aliases)
+        self.assertNotIn("国漫译名 第2026季", aliases)
 
     @patch.object(discovery.requests, "get")
     def test_http_errors_and_invalid_payload_are_reported(self, get):
@@ -272,6 +335,33 @@ class CalendarTests(unittest.TestCase):
         self.assertIn("第2026季", items[0]["schedule_note"])
         self.assertEqual(items[0]["year"], "")
         self.assertEqual(items[0]["search_aliases"], ["国漫17"])
+
+    @patch.object(discovery, "_get_json")
+    def test_tv_calendar_expands_real_scheduled_dramas_with_a_visible_fifty_show_cap(self, fetch):
+        for count in (22, 55):
+            with self.subTest(count=count):
+                discovery._cache = None
+                discovery._aliases.clear()
+                def sources(url):
+                    if "/akas" in url:
+                        return [{"name": "电视剧" + url.split("/")[-2], "country": {"code": "CN"}}]
+                    if "/schedule/web" in url and "2026-11-02" in url:
+                        episodes = [{"airdate": "2026-11-02", "season": 1, "number": 3,
+                                     "_embedded": {"show": {"id": number, "name": f"Drama {number}",
+                                                            "type": "Scripted", "weight": number}}}
+                                    for number in range(1, count + 1)]
+                        return episodes + [episodes[-1], {**episodes[-1], "airdate": "2026-11-09"}]
+                    return []
+                fetch.side_effect = sources
+                calendar = discovery.get_calendar()
+                items = calendar["days"][0]["tv"]
+                self.assertEqual(len(items), min(count, 50))
+                self.assertEqual([item["heat"] for item in items], list(range(count, max(0, count - 50), -1)))
+                self.assertTrue(all(item["airdate"] == "2026-11-02" and item["episodes"] == [{"season": 1, "number": 3}]
+                                    for item in items))
+                self.assertTrue(all(not day["tv"] for day in calendar["days"][1:]))
+                self.assertEqual(any("电视剧 TVmaze 来源本周超过 50 部" in note for note in calendar["warnings"]), count > 50)
+                self.assertIn("本周热度前 50 部", " ".join(calendar["notes"]))
 
     @patch.object(discovery, "_get_json")
     def test_domestic_numbered_seasons_cannot_fall_back_to_unqualified_series_aliases(self, fetch):

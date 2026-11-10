@@ -96,10 +96,25 @@ def share_listing_complete(response):
 
 _RESOURCE_SEASON_PATTERN = r"第\s*([\d零一二三四五六七八九十两]+)\s*[季部]|\bseason\s*(\d{1,2})\b|(?<![a-z])s(\d{1,2})(?=e\d|\b)"
 _RESOURCE_CHINESE_CONVERTER = OpenCC("t2s")
+_RESOURCE_RELEASE_SUFFIX = re.compile(
+    r"[ ._-]+(?:2160p|1080p|720p|4k)[ ._-]+(?:WEB[- .]?DL|WEBRIP|BDRIP|BLURAY)"
+    r"[ ._-]+(?:HEVC|AVC|[hx]\.?26[45])"
+    r"(?:[ ._-]+(?:DDP?|E?AC3|AAC|FLAC|[2-9]Audios|10bit|8bit|HDR10|HDR|SDR|DV|CHS|CHT|ENG)){0,8}"
+    r"(?:-(?P<group>[A-Za-z][A-Za-z0-9]{1,31}))?\s*$", re.I,
+)
+
+
+def _resource_release_suffix(value):
+    """只识别完整的分辨率/来源/编码尾缀，不截断片名或未知标签。"""
+    match = _RESOURCE_RELEASE_SUFFIX.search(value)
+    group = (match.group("group") or "") if match else ""
+    if not match or re.search(_RESOURCE_SEASON_PATTERN, group, re.I) or re.search(r"(?:19|20)\d{2}", group):
+        return value
+    return value[:match.start()].rstrip()
 
 
 def _resource_title_parts(title):
-    title = unicodedata.normalize("NFKC", str(title)).casefold()
+    title = _resource_release_suffix(unicodedata.normalize("NFKC", str(title))).casefold()
     # 日文中的汉字保留原写法；这里只统一中文匹配，不改保存名称。
     if not re.search(r"[\u3040-\u30ff]", title):
         title = _RESOURCE_CHINESE_CONVERTER.convert(title)
@@ -147,7 +162,7 @@ def _resource_candidate_parts(expected, candidate):
 
 def _resource_release_labels(value):
     """只移除独立发布组和明确编码标签，保留年份、季数和片名数字。"""
-    value = unicodedata.normalize("NFKC", html.unescape(value)).strip()
+    value = _resource_release_suffix(unicodedata.normalize("NFKC", html.unescape(value)).strip())
     value = re.sub(r"^\s*[\[【]\s*(?:0?[1-9]|1[0-2])月(?:新番)?\s*[\]】]\s*", "", value)
     for _ in range(2):
         group = re.match(r"^[\[【]([^\]】]{1,60})[\]】]\s*(.+)$", value)

@@ -134,13 +134,13 @@ class ChannelSearchTests(unittest.TestCase):
         client._fetch = Mock(side_effect=fetch)
         with self.assertRaises(SearchError):
             client.search("目标作品", channel_config={})
-        self.assertEqual(len(deadlines), 8)
+        self.assertEqual(len(deadlines), 9)
         self.assertEqual(len(set(deadlines)), 1)
         self.assertEqual(maximum, 2)
         urls = [call.args[0] for call in client._fetch.call_args_list]
-        self.assertIn("meijusou.com", urls[0])
+        self.assertIn("panso.vip", urls[0])
         self.assertIn("t.me/s/guoman4K", urls[1])
-        self.assertIn("duckduckgo.com", urls[2])
+        self.assertIn("meijusou.com", urls[2])
         self.assertIn("t.me/s/kuakedongman", urls[3])
 
     @patch("app.sdk.websearch._validate_url")

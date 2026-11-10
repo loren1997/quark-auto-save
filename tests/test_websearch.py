@@ -16,6 +16,7 @@ URL = "https://pan.quark.cn/s/abc123"
 GOOGLE_EMPTY = '<div>Your search did not match any documents.</div>'
 SOGOU_EMPTY = '<div>没有找到相关结果</div>'
 MEIJUSOU_EMPTY = '<span>0</span> 条结果'
+PANSO_EMPTY = '<h1>盘搜VIP为您提供作品搜索结果0条</h1>'
 
 
 def response(body=b"<html></html>", status=200, headers=None):
@@ -32,6 +33,39 @@ class WebSearchTests(unittest.TestCase):
         _cache.clear()
         self.client = WebSearch()
         self.addCleanup(self.client.session.close)
+
+    def test_panso_search_keeps_quark_documents_and_prioritizes_video_over_books(self):
+        def entry(disk, doc, title, info, tag="article"):
+            return f'<{tag} class="search-item"><span class="search-item-logo" title="{disk}">{disk}</span><a class="search-item-title" href="{doc}">{title}</a><div class="search-item-info">{info}</div></{tag}>'
+        body = (entry("UC网盘", "/doc/uc1", "作品", "file:01.mp4")
+                + entry("夸克网盘", "/doc/book", "作品小说", "file:作品.txt")
+                + entry("夸克网盘", "/doc/video", "作品 (2026)", "file:作品 S01E02.mp4", "div")
+                + entry("夸克网盘", "https://evil.test/doc/other", "作品", "file:01.mp4")
+                + '<a class="search-item-title" href="/doc/sidebar">推荐作品</a>')
+        rows = _search_results("PansoVIP", body, "https://www.panso.vip/search?q=test")
+        self.assertEqual([item["url"] for item in rows], ["https://www.panso.vip/doc/video", "https://www.panso.vip/doc/book"])
+        self.assertNotIn("小说", rows[0]["snippet"])
+        self.assertEqual(_search_results("PansoVIP", PANSO_EMPTY, "https://www.panso.vip/search"), [])
+        self.assertEqual(_search_results("PansoVIP", entry("UC网盘", "/doc/uc1", "作品", ""), "https://www.panso.vip/search"), [])
+        for text in ("<html>unexpected page</html>", '<div id="cf-chl-widget">验证</div>' + body):
+            with self.subTest(text=text), self.assertRaises(SearchError):
+                _search_results("PansoVIP", text, "https://www.panso.vip/search")
+
+    @patch("app.sdk.websearch._validate_url", return_value="www.panso.vip")
+    def test_panso_automatic_lookup_only_uses_document_jump_link(self, validate):
+        def fetch(url, deadline):
+            if url.startswith("https://www.panso.vip/search?"):
+                return '<article class="search-item"><span class="search-item-logo" title="夸克网盘"></span><a class="search-item-title" href="/doc/video123">作品</a><div>file:作品 S01E02.mp4</div></article>', url
+            if url == "https://www.panso.vip/doc/video123":
+                return f'<title>作品</title><div><a class="jump-link" href="{URL}">查看分享</a> 提取码 AA11</div><aside><a href="https://pan.quark.cn/s/unrelated">推荐</a></aside>', url
+            raise SearchError("需要人工验证")
+        self.client._fetch = Mock(side_effect=fetch)
+        rows = self.client.search("作品", refresh=True)
+        self.assertEqual([item["shareurl"] for item in rows], [URL + "?pwd=AA11"])
+        self.assertEqual(rows[0]["channel"], "PansoVIP · www.panso.vip")
+        self.assertNotIn("source_post", rows[0])
+        from resource_search import _web_errors
+        self.assertEqual(_web_errors(["PansoVIP 落地页: HTTP 403"]), [{"source":"网页搜索 PansoVIP 落地页", "message":"HTTP 403"}])
 
     def test_parse_real_search_engine_shapes(self):
         html = '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fshow&amp;rut=x">作品 <b>第三季</b></a>'
@@ -90,6 +124,8 @@ class WebSearchTests(unittest.TestCase):
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_sogou_discovers_landing_page_share_and_progress_has_no_urls(self, validate, progress):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -128,6 +164,8 @@ class WebSearchTests(unittest.TestCase):
         landing = "https://example.com/show"
 
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com/search" in url:
                 return MEIJUSOU_EMPTY, url
             if "duckduckgo.com/html" in url:
@@ -178,13 +216,15 @@ class WebSearchTests(unittest.TestCase):
     @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
     def test_meijusou_empty_long_title_does_not_disable_alias_query(self, validate):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "q=%E9%95%BF%E7%89%87%E5%90%8D" in url:
                 return '<h2>没有找到相关帖子</h2><p>没有帖子包含「长片名」。试试更短的关键词。</p>', url
             if "/search?" in url:
                 return '<a class="line-clamp-2" href="/post/site">短别名</a>', url
             return f'<title>短别名</title><p>{URL}</p>', url
         self.client._fetch = Mock(side_effect=fetch)
-        failed = {"DuckDuckGo", "Bing", "Google", "Sogou"}
+        failed = {"PansoVIP", "DuckDuckGo", "Bing", "Google", "Sogou"}
         self.assertEqual(self.client.search("长片名", failed_engines=failed), [])
         self.assertNotIn("Meijusou", failed)
         self.assertEqual(self.client.search("短别名", failed_engines=failed)[0]["shareurl"], URL)
@@ -193,6 +233,8 @@ class WebSearchTests(unittest.TestCase):
     @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
     def test_meijusou_public_query_finds_share_when_general_searches_fail(self, validate, progress):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if url.startswith("https://meijusou.com/search?"):
                 from urllib.parse import parse_qs, urlsplit
                 self.assertEqual(parse_qs(urlsplit(url).query), {"q": ["作品"]})
@@ -223,11 +265,13 @@ class WebSearchTests(unittest.TestCase):
             <script>var link="{unrelated}";</script></article>
             <aside><p>{unrelated}</p></aside></html>'''
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "/search?" in url:
                 return f'<a class="line-clamp-2" href="{page_url}">作品 2026</a>', url
             return body, page_url
         self.client._fetch = Mock(side_effect=fetch)
-        rows = self.client.search("作品", failed_engines={"DuckDuckGo", "Bing", "Google", "Sogou"})
+        rows = self.client.search("作品", failed_engines={"PansoVIP", "DuckDuckGo", "Bing", "Google", "Sogou"})
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["shareurl"], URL + "?pwd=AA11")
         self.assertEqual(rows[0]["taskname"], "作品 2026")
@@ -250,11 +294,13 @@ class WebSearchTests(unittest.TestCase):
         for body, final_url in cases:
             with self.subTest(body=body, final_url=final_url):
                 def fetch(url, deadline):
+                    if "panso.vip" in url:
+                        return PANSO_EMPTY, url
                     if url.startswith("https://meijusou.com/search?"):
                         return f'<a class="line-clamp-2" href="{page_url}">作品 2026</a>', url
                     return body, final_url
                 self.client._fetch = Mock(side_effect=fetch)
-                rows = self.client.search("作品", refresh=True, failed_engines={"DuckDuckGo", "Bing", "Google", "Sogou"})
+                rows = self.client.search("作品", refresh=True, failed_engines={"PansoVIP", "DuckDuckGo", "Bing", "Google", "Sogou"})
                 self.assertTrue(rows)
                 self.assertTrue(all("source_post" not in row for row in rows))
 
@@ -262,20 +308,24 @@ class WebSearchTests(unittest.TestCase):
     def test_same_share_prefers_post_evidence_without_losing_snippet_password(self, validate):
         page_url = "https://meijusou.com/post/" + "a" * 32
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if url.startswith("https://meijusou.com/search?"):
                 return f'<a class="line-clamp-2" href="{page_url}">作品 2026</a>', url
             if "bing.com" in url:
                 return f'<rss><channel><item><title>作品</title><link>{URL}</link><description>作品 {URL} 提取码 AA11</description></item></channel></rss>', url
             return f'<h1>作品 2026</h1><article><h2>作品 2026</h2><p>{URL}</p></article>', page_url
         self.client._fetch = Mock(side_effect=fetch)
-        rows = self.client.search("作品", failed_engines={"DuckDuckGo", "Google", "Sogou"})
+        rows = self.client.search("作品", failed_engines={"PansoVIP", "DuckDuckGo", "Google", "Sogou"})
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["shareurl"], URL + "?pwd=AA11")
         self.assertEqual(rows[0]["source_post"], {"page_url": page_url, "title": "作品 2026", "shareurl": URL})
 
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
-    def test_all_five_sources_get_one_landing_page_with_a_bounded_budget(self, validate):
+    def test_all_six_sources_get_one_landing_page_with_a_bounded_budget(self, validate):
         def fetch(url, deadline):
+            if url.startswith("https://www.panso.vip/search?"):
+                return '<article class="search-item"><span class="search-item-logo" title="夸克网盘"></span><a class="search-item-title" href="/doc/panso">作品</a></article>', url
             if url.startswith("https://meijusou.com/search?"):
                 return '<a class="line-clamp-2" href="/post/site">作品</a>', url
             if "duckduckgo.com" in url:
@@ -292,8 +342,9 @@ class WebSearchTests(unittest.TestCase):
         self.client._fetch = Mock(side_effect=fetch)
         rows = self.client.search("作品")
         self.assertEqual(rows[0]["channel"], "Meijusou · meijusou.com")
-        self.assertEqual(self.client._fetch.call_count, 10)
+        self.assertEqual(self.client._fetch.call_count, 12)
         fetched = [call.args[0] for call in self.client._fetch.call_args_list]
+        self.assertIn("https://www.panso.vip/doc/panso", fetched)
         self.assertNotIn("https://example.com/duck1", fetched)
         for source in ("duck0", "bing", "google", "sogou"):
             self.assertIn("https://example.com/" + source, fetched)
@@ -304,6 +355,8 @@ class WebSearchTests(unittest.TestCase):
         query_deadlines, page_deadlines = [], []
 
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if url == "https://meijusou.com/post/site":
                 page_deadlines.append(deadline)
                 self.assertGreater(deadline, now[0])
@@ -329,6 +382,8 @@ class WebSearchTests(unittest.TestCase):
                 _cache.clear()
                 attempts = []
                 def fetch(url, deadline):
+                    if "panso.vip" in url:
+                        return PANSO_EMPTY, url
                     if "/search?" in url:
                         return '<a class="line-clamp-2" href="/post/site">作品</a>', url
                     attempts.append(deadline)
@@ -336,7 +391,7 @@ class WebSearchTests(unittest.TestCase):
                         raise SearchError("网页请求失败") from cause
                     return f'<title>作品</title><p>{URL}</p>', url
                 self.client._fetch = Mock(side_effect=fetch)
-                rows = self.client.search("作品", failed_engines={"DuckDuckGo", "Bing", "Google", "Sogou"})
+                rows = self.client.search("作品", failed_engines={"PansoVIP", "DuckDuckGo", "Bing", "Google", "Sogou"})
                 self.assertEqual(rows[0]["shareurl"], URL)
                 self.assertEqual(len(attempts), 2)
                 self.assertEqual(attempts[0], attempts[1])
@@ -351,6 +406,8 @@ class WebSearchTests(unittest.TestCase):
                 now = [100.0]
                 calls = []
                 def fetch(url, deadline):
+                    if "panso.vip" in url:
+                        return PANSO_EMPTY, url
                     if "/search?" in url:
                         return '<a class="line-clamp-2" href="/post/site">作品</a>', url
                     calls.append(url)
@@ -358,7 +415,7 @@ class WebSearchTests(unittest.TestCase):
                     raise SearchError("网页请求失败") from cause
                 self.client._fetch = Mock(side_effect=fetch)
                 with patch("app.sdk.websearch.time.monotonic", side_effect=lambda: now[0]):
-                    rows = self.client.search("作品", failed_engines={"DuckDuckGo", "Bing", "Google", "Sogou"})
+                    rows = self.client.search("作品", failed_engines={"PansoVIP", "DuckDuckGo", "Bing", "Google", "Sogou"})
                 self.assertEqual(rows, [])
                 self.assertEqual(len(calls), expected)
                 self.assertIn("Meijusou 落地页", self.client.errors[0])
@@ -367,6 +424,8 @@ class WebSearchTests(unittest.TestCase):
     def test_meijusou_query_retries_once_but_other_engines_do_not_retry(self, validate):
         attempts = []
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if url.startswith("https://meijusou.com/search?"):
                 attempts.append(deadline)
                 if len(attempts) == 1:
@@ -382,7 +441,7 @@ class WebSearchTests(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
         self.assertEqual(attempts[0], attempts[1])
         self.assertEqual(failed, {"DuckDuckGo", "Bing", "Google", "Sogou"})
-        self.assertEqual(self.client._fetch.call_count, 7)
+        self.assertEqual(self.client._fetch.call_count, 8)
 
     def test_meijusou_query_no_retry_for_short_budget_http_or_verification(self):
         for cause, remaining, expected in ((requests.ReadTimeout(), 20, 2), (requests.ReadTimeout(), 4, 1),
@@ -393,7 +452,7 @@ class WebSearchTests(unittest.TestCase):
                     now[0] = deadline - remaining
                     raise SearchError("网页请求失败" if cause else "要求人工验证") from cause
                 self.client._fetch = Mock(side_effect=fetch)
-                failed = {"DuckDuckGo", "Bing", "Google", "Sogou"}
+                failed = {"PansoVIP", "DuckDuckGo", "Bing", "Google", "Sogou"}
                 with patch("app.sdk.websearch.time.monotonic", side_effect=lambda: now[0]), self.assertRaises(SearchError):
                     self.client.search("作品", failed_engines=failed)
                 self.assertEqual(self.client._fetch.call_count, expected)
@@ -443,6 +502,17 @@ class WebSearchTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"], {"Cookie": "", "Authorization": None})
 
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
+    def test_json_response_requires_explicit_opt_in(self, validate):
+        for allowed in (False, True):
+            with self.subTest(allow_json=allowed):
+                self.client.session.get = Mock(return_value=response(b'{"items": []}', headers={"Content-Type": "application/json; charset=utf-8"}))
+                if allowed:
+                    self.assertEqual(self.client._fetch("https://example.com/api", time.monotonic() + 5, allow_json=True), ('{"items": []}', "https://example.com/api"))
+                else:
+                    with self.assertRaisesRegex(SearchError, "不是文本网页"):
+                        self.client._fetch("https://example.com/api", time.monotonic() + 5)
+
+    @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_response_size_and_redirect_limits(self, validate):
         self.client.session.get = Mock(return_value=response(b"a" * (MAX_BYTES + 1)))
         with self.assertRaisesRegex(SearchError, "上限"):
@@ -465,6 +535,8 @@ class WebSearchTests(unittest.TestCase):
         duck = ''.join(f'<a class="result__a" href="https://example.com/{number}">作品 第三季 页面{number}</a>' for number in range(7))
         bing = "<rss><channel><item><title>无关网页</title><link>https://other.example/ignore</link></item></channel></rss>"
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -484,15 +556,17 @@ class WebSearchTests(unittest.TestCase):
         self.assertEqual(results[0]["taskname"], "真实作品页面 0")
         self.assertEqual(results[0]["page_url"], "https://example.com/0")
         self.assertEqual(results[0]["channel"], "DuckDuckGo · example.com")
-        self.assertEqual(self.client._fetch.call_count, 9)
+        self.assertEqual(self.client._fetch.call_count, 10)
         results[0]["taskname"] = "changed"
         cached = self.client.search("作品 第3季")
         self.assertEqual(cached[0]["taskname"], "真实作品页面 0")
-        self.assertEqual(self.client._fetch.call_count, 9)
+        self.assertEqual(self.client._fetch.call_count, 10)
 
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_one_engine_failure_keeps_other_results_and_all_failures_raise(self, validate):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -512,6 +586,8 @@ class WebSearchTests(unittest.TestCase):
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_failed_engine_is_skipped_for_aliases_but_next_lookup_retries(self, validate):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -537,6 +613,8 @@ class WebSearchTests(unittest.TestCase):
         cached = (time.monotonic(), [{"taskname": "作品", "shareurl": URL}], [])
         _cache["作品"] = cached
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -552,11 +630,11 @@ class WebSearchTests(unittest.TestCase):
     def test_all_skipped_engines_make_no_requests_and_default_call_retries(self):
         self.client._fetch = Mock(side_effect=SearchError("连接超时"))
         with self.assertRaisesRegex(SearchError, "跳过"):
-            self.client.search("作品", failed_engines={"Google", "Bing", "DuckDuckGo", "Sogou", "Meijusou"})
+            self.client.search("作品", failed_engines={"PansoVIP", "Google", "Bing", "DuckDuckGo", "Sogou", "Meijusou"})
         self.client._fetch.assert_not_called()
         with self.assertRaisesRegex(SearchError, "连接超时"):
             self.client.search("作品")
-        self.assertEqual(self.client._fetch.call_count, 5)
+        self.assertEqual(self.client._fetch.call_count, 6)
 
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_landing_page_403_keeps_snippet_share_and_other_page_results(self, validate):
@@ -568,6 +646,8 @@ class WebSearchTests(unittest.TestCase):
             <a class="result__snippet" href="https://example.com/working">作品 B 提取码 BB22</a>
         '''
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -595,6 +675,8 @@ class WebSearchTests(unittest.TestCase):
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_failed_empty_search_is_retried_without_refresh(self, validate):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -610,10 +692,12 @@ class WebSearchTests(unittest.TestCase):
         self.assertEqual(self.client.search("作品"), [])
         self.assertNotIn("作品", _cache)
         self.assertEqual(self.client.search("作品"), [])
-        self.assertEqual(self.client._fetch.call_count, 12)
+        self.assertEqual(self.client._fetch.call_count, 14)
 
     def test_successful_empty_search_is_cached(self):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -625,11 +709,13 @@ class WebSearchTests(unittest.TestCase):
         self.client._fetch = Mock(side_effect=fetch)
         self.assertEqual(self.client.search("作品"), [])
         self.assertEqual(self.client.search("作品"), [])
-        self.assertEqual(self.client._fetch.call_count, 5)
+        self.assertEqual(self.client._fetch.call_count, 6)
 
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_google_still_checks_landing_page_after_other_engine_uses_slots(self, validate):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:
@@ -648,11 +734,13 @@ class WebSearchTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["shareurl"], URL)
         self.assertEqual(rows[0]["channel"], "Google · example.com")
-        self.assertEqual(self.client._fetch.call_count, 9)
+        self.assertEqual(self.client._fetch.call_count, 10)
 
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_google_snippet_survives_blocked_landing_page_and_failed_other_engines(self, validate):
         def fetch(url, deadline):
+            if "panso.vip" in url:
+                return PANSO_EMPTY, url
             if "meijusou.com" in url:
                 return MEIJUSOU_EMPTY, url
             if "sogou.com" in url:

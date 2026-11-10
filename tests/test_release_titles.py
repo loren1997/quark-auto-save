@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from quark_auto_save import (Quark, _resource_episode_number, _resource_title_parts,
+from quark_auto_save import (MagicRename, Quark, _resource_episode_number, _resource_title_parts,
                              _resource_video_title, resource_titles_match)
 
 
@@ -10,9 +10,9 @@ ALIAS = "与暗黑召唤师秘密恋爱中"
 
 
 class ReleaseTitleTests(unittest.TestCase):
-    def verify(self, folder, filenames, title=TITLE, aliases=(ALIAS,)):
+    def verify(self, folder, filenames, title=TITLE, aliases=(ALIAS,), folder_id="folder"):
         account = Quark()
-        root = {"code": 0, "data": {"list": [{"dir": True, "fid": "folder", "file_name": folder}]}}
+        root = {"code": 0, "data": {"list": [{"dir": True, "fid": folder_id, "file_name": folder}]}}
         files = {"code": 0, "data": {"list": [
             {"dir": False, "fid": str(i), "file_name": name, "obj_category": "video"}
             for i, name in enumerate(filenames)
@@ -88,6 +88,44 @@ class ReleaseTitleTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIn(label, _resource_video_title(filename))
                 self.assertFalse(self.verify("作品目录 (2026)", [filename]))
+
+    def test_dot_separated_bilingual_release_requires_catalogue_alias_and_exact_metadata(self):
+        title = "庆余年 第二季 (2024)"
+        folder = "[庆余年 第二季].Joy.of.Life.2024.S02.2160p.WEB-DL.HEVC.DDP.2Audios-QHstudIo"
+        filename = folder.replace(".S02.", ".S02E36.") + ".mp4"
+        self.assertEqual(_resource_title_parts(folder), ("庆余年joyoflife", {2}, {"2024"}))
+        self.assertFalse(resource_titles_match(title, folder))
+        self.assertTrue(resource_titles_match(title, folder, aliases=["Joy of Life"]))
+        self.assertTrue(self.verify(folder, [filename], title=title, aliases=["Joy of Life"]))
+        self.assertFalse(self.verify(folder, [filename, filename.replace("Joy.of.Life", "Other.Show")],
+                                     title=title, aliases=["Joy of Life"], folder_id="a" * 32))
+        task = {"taskname": title, "search_aliases": ["Joy of Life"]}
+        self.assertEqual(_resource_episode_number(task, filename), 36)
+        rename = MagicRename({})
+        rename.set_taskname(title)
+        output = rename.media_name(r"(?i).*\.(?:mp4|mkv)$", "{TASKNAME} S02E{EXX}.{EXT}", filename)
+        self.assertEqual(_resource_episode_number(task, output), 36)
+        self.assertTrue(output.endswith(" S02E36.mp4"), output)
+
+    def test_release_tail_does_not_hide_unknown_words_or_identity_conflicts(self):
+        title = "庆余年 第二季 (2024)"
+        folder = "[庆余年 第二季].Joy.of.Life.2024.S02.2160p.WEB-DL.HEVC.DDP.2Audios-QHstudIo"
+        candidates = [
+            folder.replace("Joy.of.Life", "Other.Show"),
+            folder.replace("2024", "2025"),
+            folder.replace(".S02.", ".S03."),
+            folder.replace(".HEVC.", ".UnknownCodec."),
+            folder + ".UnknownSuffix", folder + ".Another.Show", folder + " 另一部作品",
+            folder.replace("-QHstudIo", "-S03"),
+            folder.replace("-QHstudIo", "-QH2025Studio"),
+            "[庆余年 第二季].Another.Show.2024.S02.2160p.WEB-DL.HEVC.DDP.2Audios-QHstudIo",
+        ]
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(resource_titles_match(title, candidate, aliases=["Joy of Life"]))
+                self.assertIsNone(_resource_episode_number(
+                    {"taskname": title, "search_aliases": ["Joy of Life"]},
+                    candidate.replace(".S02.", ".S02E36.") + ".mp4"))
 
 
 if __name__ == "__main__":

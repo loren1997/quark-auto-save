@@ -218,6 +218,39 @@ class _MeijusouPost(HTMLParser):
         return None
 
 
+class _PansoSearchPage(_Page):
+    def __init__(self, body):
+        self.results, self.items_seen = [], 0
+        self._depth, self._item, self._disk = 0, None, ""
+        super().__init__(body)
+
+    def handle_starttag(self, tag, attrs):
+        super().handle_starttag(tag, attrs)
+        if self._skip:
+            return
+        attrs = dict(attrs)
+        classes = attrs.get("class", "").split()
+        if tag in ("article", "div"):
+            self._depth += 1
+            if "search-item" in classes and self._item is None:
+                self._item = (self._depth, len(self.links), len(self.text))
+                self._disk = ""
+                self.items_seen += 1
+        if self._item and "search-item-logo" in classes:
+            self._disk = (attrs.get("title") or attrs.get("alt") or "").strip().casefold()
+
+    def handle_endtag(self, tag):
+        super().handle_endtag(tag)
+        if tag in ("article", "div") and not self._skip:
+            if self._item and self._item[0] == self._depth:
+                _, start_link, start_text = self._item
+                titles = [item for item in self.links[start_link:] if "search-item-title" in item["class"].split()]
+                if len(titles) == 1 and self._disk in ("夸克网盘", "夸克", "quark"):
+                    self.results.append({**titles[0], "snippet": " ".join(self.text[start_text:])})
+                self._item = None
+            self._depth -= 1
+
+
 class _SearchPage(_Page):
     def __init__(self, body):
         self.results = []
@@ -284,6 +317,24 @@ def _page_links(text):
 
 
 def _search_results(engine, body, url):
+    if engine == "PansoVIP":
+        if re.search(r"cf-chl-|captcha|verify you are human|访问过于频繁", body, re.I):
+            raise SearchError("盘搜VIP要求人工验证，请稍后重试")
+        page = _PansoSearchPage(body)
+        results, seen = [], set()
+        for item in page.results:
+            link = urljoin(url, item["url"])
+            parts = urlsplit(link)
+            if (parts.scheme == "https" and parts.netloc == "www.panso.vip"
+                    and re.fullmatch(r"/doc/[A-Za-z0-9]{1,100}", parts.path)
+                    and not parts.query and not parts.fragment and item["text"] and link not in seen):
+                seen.add(link)
+                results.append({"title": item["text"], "url": link, "snippet": item["snippet"]})
+        if not page.items_seen and not re.search(r"搜索结果\s*0\s*条|没有找到相关资源|暂无搜索结果", " ".join(page.text)):
+            raise SearchError("盘搜VIP页面格式已改变或需要验证")
+        # 同名小说、音频较多；先读取已列出视频文件的文档，实际身份仍由夸克目录验证。
+        results.sort(key=lambda item: bool(re.search(r"\.(?:mkv|mp4|ts|avi|mov)\b", item["snippet"], re.I)), reverse=True)
+        return results[:10]
     if engine == "Meijusou":
         if re.search(r"cf-chl-|captcha|verify you are human|访问过于频繁", body, re.I):
             raise SearchError("美剧搜要求人工验证，请稍后重试")
@@ -375,7 +426,7 @@ class WebSearch:
         self.session.headers["User-Agent"] = "Mozilla/5.0 (compatible; QuarkAutoSave/3; public-page-reader)"
         self.errors = []
 
-    def _fetch(self, url, deadline):
+    def _fetch(self, url, deadline, allow_json=False):
         for redirect in range(3):
             _validate_url(url)
             self.health.check(url)
@@ -395,7 +446,9 @@ class WebSearch:
                         self.health.record(url, f"HTTP {response.status_code}", response.headers.get("Retry-After"))
                     response.raise_for_status()
                     content_type = response.headers.get("Content-Type", "").lower()
-                    if not any(kind in content_type for kind in ("text/", "application/xml", "application/rss+xml", "application/xhtml+xml")):
+                    text_types = ("text/", "application/xml", "application/rss+xml", "application/xhtml+xml")
+                    is_json = content_type.split(";", 1)[0].strip() == "application/json"
+                    if not any(kind in content_type for kind in text_types) and not (allow_json and is_json):
                         raise SearchError("搜索落地地址不是文本网页")
                     if int(response.headers.get("Content-Length", "0")) > MAX_BYTES:
                         raise SearchError("网页超过 1 MiB 读取上限")
@@ -452,7 +505,8 @@ class WebSearch:
         deadline = time.monotonic() + 32
         query_deadline = deadline - 8  # 给已发现的正文页留时间，不增加总预算。
         params = urlencode({"q": query + " 夸克"})
-        engines = [("Meijusou", "https://meijusou.com/search?" + urlencode({"q": query})),
+        engines = [("PansoVIP", "https://www.panso.vip/search?" + urlencode({"q": query})),
+                   ("Meijusou", "https://meijusou.com/search?" + urlencode({"q": query})),
                    ("DuckDuckGo", "https://html.duckduckgo.com/html/?" + params),
                    ("Bing", "https://cn.bing.com/search?format=rss&mkt=zh-CN&" + params),
                    ("Google", "https://www.google.com/search?gbv=1&num=10&" + params),
@@ -461,12 +515,16 @@ class WebSearch:
 
         def search_engine(engine, url):
             report_progress("search", source=f"网页搜索 {engine}", query=query)
+            checked_after = time.time()
             fetch = self._fetch_with_retry if engine == "Meijusou" else self._fetch
             body, final_url = fetch(url, query_deadline)
             try:
                 if engine.startswith(("Telegram @", "腾讯频道 ")):
-                    return channel_results(engine, body, final_url, query)
-                return _search_results(engine, body, final_url)
+                    items = channel_results(engine, body, final_url, query)
+                else:
+                    items = _search_results(engine, body, final_url)
+                self.health.clear(url, checked_after=checked_after)
+                return items
             except SearchError as error:
                 if "人工验证" in str(error):
                     self.health.record(final_url, "需要人工验证")
@@ -535,7 +593,15 @@ class WebSearch:
                         if parsed_post.title:
                             post = parsed_post.title
                             title, text = post, "".join(parsed_post.page.text)
-                    for url in _page_links(text):
+                    links = _page_links(text)
+                    if item["engine"] == "PansoVIP":
+                        if parts.netloc != "www.panso.vip" or not re.fullmatch(r"/doc/[A-Za-z0-9]{1,100}", parts.path):
+                            raise SearchError("盘搜VIP文档地址格式异常")
+                        allowed = {urlsplit(link).path for anchor in page.links
+                                   if "jump-link" in anchor["class"].split()
+                                   and (link := normalize_share_url(anchor["url"]))}
+                        links = [link for link in links if urlsplit(link).path in allowed]
+                    for url in links:
                         source_post = {"page_url": final_url, "title": post, "shareurl": url} if post else None
                         results.append(self._entry(item, url, title, text.replace("\x1e", "\n")[:1000], final_url, source_post))
                 except (SearchError, ValueError) as error:

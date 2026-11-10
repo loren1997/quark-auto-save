@@ -16,7 +16,7 @@ import requests
 
 CHINA_TZ = timezone(timedelta(hours=8))
 USER_AGENT = "quark-auto-save/1.0 (+https://github.com/Cp0204/quark-auto-save)"
-TV_LIMIT = 10
+TV_LIMIT = 50
 DONGHUA_LIMIT = 60
 BILIBILI_CALENDAR = "https://api.bilibili.com/pgc/web/timeline/v2?season_type=4&day_before=6&day_after=6"
 BILIBILI_SEASON = "https://api.bilibili.com/pgc/view/web/season?season_id="
@@ -43,7 +43,7 @@ def _request_json(url, deadline=None):
         except (requests.Timeout, requests.ConnectionError) as exc:
             if deadline is None or attempt or isinstance(exc, requests.exceptions.SSLError):
                 raise
-            logging.info("Bangumi 别名连接暂时失败，在剩余时限内重试一次")
+            logging.info("作品别名连接暂时失败，在剩余时限内重试一次")
 
 
 def _get_json(url, deadline=None):
@@ -137,6 +137,14 @@ def _prefer_official_bilibili(days, warnings):
                for _, _, season, identity in pairs)
 
 
+def _chinese_aliases(entries):
+    return list(dict.fromkeys(item["name"] for item in entries if isinstance(item, dict)
+                              and isinstance(item.get("name"), str)
+                              and re.search(r"[\u4e00-\u9fff]", item["name"])
+                              and (not item.get("country") or isinstance(item["country"], dict)
+                                   and item["country"].get("code") == "CN")))
+
+
 def get_search_aliases(entry):
     """Fetch trusted names on subscription, including the same-named source book."""
     known = entry.get("search_aliases")
@@ -171,6 +179,19 @@ def get_search_aliases(entry):
                     aliases[1:1] = book_names[:3]
         except (requests.RequestException, ValueError) as exc:
             logging.warning("Bangumi aliases unavailable for %s: %s", key, exc)
+    elif (match := re.fullmatch(r"tvmaze:(\d+):s(\d+|unknown)", key)):
+        show_id, season = int(match[1]), match[2]
+        try:
+            if show_id not in _aliases:
+                entries = _get_json(f"https://api.tvmaze.com/shows/{show_id}/akas", deadline=monotonic() + 10)
+                fallback = entry.get("series_title") or re.sub(r"\s*第\d+季$", "", entry.get("title") or "")
+                _aliases[show_id] = _chinese_aliases(entries) or [fallback]
+            numbered_season = season.isdigit() and int(season) > 1 and (
+                int(season) < 1900 or str(entry.get("search_title") or entry.get("title") or "").endswith(f"第{season}季"))
+            suffix = f" 第{season}季" if numbered_season else ""
+            aliases.extend(name + suffix for name in _aliases[show_id])
+        except (requests.RequestException, ValueError) as exc:
+            logging.warning("TVmaze aliases unavailable for %s: %s", key, exc)
     return list(dict.fromkeys(value.strip() for value in aliases
                               if isinstance(value, str) and value.strip() and len(value) <= 200))[:8]
 
@@ -274,30 +295,29 @@ def _tv_items(results, days, warnings, resource_id=None):
             if any(value is not None and not isinstance(value, int) for value in (season, number)):
                 continue
             episodes.setdefault((entry["airdate"], show_id), set()).add((season, number))
-    # shortcut: show the week's top 10 dramas; add pagination if a full catalogue is needed.
-    popular = sorted((key for key in shows if shows[key]["type"] == "Scripted"),
-                     key=lambda key: (-_number(shows[key].get("weight")), key))[:TV_LIMIT]
+    dramas = sorted((key for key in shows if shows[key]["type"] == "Scripted"),
+                    key=lambda key: (-_number(shows[key].get("weight")), key))
+    popular = dramas[:TV_LIMIT]
+    alias_pending = [key for key in popular if key not in _aliases][:10]
+    if len(dramas) > TV_LIMIT:
+        warnings.append(f"电视剧 TVmaze 来源本周超过 {TV_LIMIT} 部，已展示热度最高的 {TV_LIMIT} 部")
     animations = sorted((key for key in shows if shows[key]["type"] == "Animation"
                          and shows[key].get("language") in (None, "Chinese", "Mandarin", "Cantonese")),
                         key=lambda key: (-_number(shows[key].get("weight")), key))
     popular += animations[:DONGHUA_LIMIT]
+    alias_pending += [key for key in animations[:DONGHUA_LIMIT] if key not in _aliases]
     if len(animations) > DONGHUA_LIMIT:
         warnings.append(f"国漫 TVmaze 来源本周超过 {DONGHUA_LIMIT} 部，已展示热度最高的 {DONGHUA_LIMIT} 部")
     aliases, failures = _fetch_many({
-        key: f"https://api.tvmaze.com/shows/{key}/akas" for key in popular if key not in _aliases
+        key: f"https://api.tvmaze.com/shows/{key}/akas" for key in alias_pending
     })
     for key, entries in aliases.items():
-        chinese = [item.get("name") for item in entries if isinstance(item, dict)
-                   and isinstance(item.get("name"), str)
-                   and re.search(r"[\u4e00-\u9fff]", item["name"])
-                   and (not item.get("country") or
-                        isinstance(item["country"], dict) and item["country"].get("code") == "CN")]
-        _aliases[key] = list(dict.fromkeys(chinese)) if chinese else [shows[key]["name"]]
+        _aliases[key] = _chinese_aliases(entries) or [shows[key]["name"]]
     if failures:
         warnings.append(f"{len(failures)} 部作品的中文别名暂不可用，已保留原名")
     untranslated = sum(not re.search(r"[\u4e00-\u9fff]", _aliases.get(key, [shows[key]["name"]])[0]) for key in popular)
     if untranslated:
-        warnings.append(f"{untranslated} 部作品尚无可用中文名，显示原名；搜索资源时可修改关键词")
+        warnings.append(f"{untranslated} 部作品尚无可用中文名，先显示原名；订阅会使用可获取的官方别名")
     for day in days:
         for key in popular:
             aired = episodes.get((day["date"], key))
