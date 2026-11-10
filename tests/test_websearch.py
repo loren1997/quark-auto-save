@@ -122,6 +122,37 @@ class WebSearchTests(unittest.TestCase):
         self.assertNotIn("BB22", rows[0]["snippet"])
         self.assertNotIn("AA11", rows[1]["snippet"])
 
+    @patch("app.sdk.websearch._validate_url", return_value="example.com")
+    def test_completed_snippet_survives_other_engine_exhausting_budget(self, validate):
+        now = [0.0]
+        landing = "https://example.com/show"
+
+        def fetch(url, deadline):
+            if "meijusou.com/search" in url:
+                return MEIJUSOU_EMPTY, url
+            if "duckduckgo.com/html" in url:
+                return (f'<a class="result__a" href="{landing}">作品</a>'
+                        f'<a class="result__snippet" href="{landing}">{URL} 提取码 AA11</a>'), url
+            if "bing.com/search" in url:
+                return "<rss><channel/></rss>", url
+            if "google.com/search" in url:
+                now[0] = 40.0  # 模拟系统 DNS 等调用超出整个 32 秒预算。
+                raise SearchError("网页搜索已达到本次时间上限")
+            if "sogou.com/web" in url:
+                return SOGOU_EMPTY, url
+            self.fail("预算耗尽后不应请求落地页")
+
+        self.client._fetch = fetch
+        with patch("app.sdk.websearch.time.monotonic", side_effect=lambda: now[0]):
+            rows = self.client.search("作品", refresh=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["shareurl"], URL + "?pwd=AA11")
+        self.assertEqual(rows[0]["page_url"], landing)
+        self.assertEqual(rows[0]["taskname"], "作品")
+        validate.assert_called_once_with(landing)
+        self.assertTrue(any("时间预算" in error for error in self.client.errors))
+        self.assertNotIn("作品", _cache)
+
     def test_meijusou_results_exclude_sidebar_and_do_not_reuse_page_snippets(self):
         html = f'''<title>搜索「作品」 · 美剧搜</title><span>1</span> 条结果
             <a class="line-clamp-2 rounded-sm" href="/post/tg_123"><mark>作品</mark> 更新至3集</a>
@@ -180,6 +211,68 @@ class WebSearchTests(unittest.TestCase):
         progress.assert_any_call("search", source="网页搜索 Meijusou 落地页", query="作品")
         self.assertNotIn("http", str(progress.call_args_list))
 
+    @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
+    def test_meijusou_post_binds_primary_heading_and_body_password_only(self, validate):
+        page_url = "https://meijusou.com/post/" + "a" * 32
+        unrelated = "https://pan.quark.cn/s/other123"
+        body = f'''<html><title>作品 2026 · 美剧搜</title><h1 class="sr-only">作品 2026</h1>
+            <article><h2>作品 <span>2026</span></h2><p><a href="{URL}">夸克下载</a> 提取码 AA11</p>
+            <aside><h2>推荐</h2><p>{unrelated}</p></aside>
+            <section id="comments"><p>{unrelated}</p></section>
+            <section aria-label="相关资源"><p>{unrelated}</p></section>
+            <script>var link="{unrelated}";</script></article>
+            <aside><p>{unrelated}</p></aside></html>'''
+        def fetch(url, deadline):
+            if "/search?" in url:
+                return f'<a class="line-clamp-2" href="{page_url}">作品 2026</a>', url
+            return body, page_url
+        self.client._fetch = Mock(side_effect=fetch)
+        rows = self.client.search("作品", failed_engines={"DuckDuckGo", "Bing", "Google", "Sogou"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["shareurl"], URL + "?pwd=AA11")
+        self.assertEqual(rows[0]["taskname"], "作品 2026")
+        self.assertEqual(rows[0]["source_post"], {"page_url": page_url, "title": "作品 2026", "shareurl": URL + "?pwd=AA11"})
+        self.assertNotIn(unrelated, rows[0]["content"])
+
+    @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
+    def test_meijusou_ambiguous_or_unknown_markup_cannot_supply_identity(self, validate):
+        page_url = "https://meijusou.com/post/" + "a" * 32
+        good = f'<h1>作品 2026</h1><article><h2>作品 2026</h2><p>{URL}</p></article>'
+        cases = [
+            (good.replace("<h2>作品 2026", "<h2>另一部 2026"), page_url),
+            (good + "<h1>另一部 2025</h1>", page_url),
+            (good + "<article><h2>推荐</h2></article>", page_url),
+            (good.replace("</article>", ""), page_url),
+            (f"<title>作品 2026</title><p>{URL}</p>", page_url),
+            (good, "https://example.com/post/" + "a" * 32),
+            (good, "https://meijusou.com/search?q=作品"),
+        ]
+        for body, final_url in cases:
+            with self.subTest(body=body, final_url=final_url):
+                def fetch(url, deadline):
+                    if url.startswith("https://meijusou.com/search?"):
+                        return f'<a class="line-clamp-2" href="{page_url}">作品 2026</a>', url
+                    return body, final_url
+                self.client._fetch = Mock(side_effect=fetch)
+                rows = self.client.search("作品", refresh=True, failed_engines={"DuckDuckGo", "Bing", "Google", "Sogou"})
+                self.assertTrue(rows)
+                self.assertTrue(all("source_post" not in row for row in rows))
+
+    @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
+    def test_same_share_prefers_post_evidence_without_losing_snippet_password(self, validate):
+        page_url = "https://meijusou.com/post/" + "a" * 32
+        def fetch(url, deadline):
+            if url.startswith("https://meijusou.com/search?"):
+                return f'<a class="line-clamp-2" href="{page_url}">作品 2026</a>', url
+            if "bing.com" in url:
+                return f'<rss><channel><item><title>作品</title><link>{URL}</link><description>作品 {URL} 提取码 AA11</description></item></channel></rss>', url
+            return f'<h1>作品 2026</h1><article><h2>作品 2026</h2><p>{URL}</p></article>', page_url
+        self.client._fetch = Mock(side_effect=fetch)
+        rows = self.client.search("作品", failed_engines={"DuckDuckGo", "Google", "Sogou"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["shareurl"], URL + "?pwd=AA11")
+        self.assertEqual(rows[0]["source_post"], {"page_url": page_url, "title": "作品 2026", "shareurl": URL})
+
     @patch("app.sdk.websearch._validate_url", return_value="example.com")
     def test_all_five_sources_get_one_landing_page_with_a_bounded_budget(self, validate):
         def fetch(url, deadline):
@@ -204,6 +297,30 @@ class WebSearchTests(unittest.TestCase):
         self.assertNotIn("https://example.com/duck1", fetched)
         for source in ("duck0", "bing", "google", "sogou"):
             self.assertIn("https://example.com/" + source, fetched)
+
+    @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
+    def test_slow_engines_leave_time_to_read_discovered_meijusou_page(self, validate):
+        now = [100.0]
+        query_deadlines, page_deadlines = [], []
+
+        def fetch(url, deadline):
+            if url == "https://meijusou.com/post/site":
+                page_deadlines.append(deadline)
+                self.assertGreater(deadline, now[0])
+                return f'<title>作品 合集</title><p>{URL} 提取码 AA11</p>', url
+            query_deadlines.append(deadline)
+            if url.startswith("https://meijusou.com/search?"):
+                return '<a class="line-clamp-2" href="/post/site">作品</a>', url
+            now[0] = deadline
+            raise SearchError("网页搜索已达到本次时间上限")
+
+        self.client._fetch = Mock(side_effect=fetch)
+        with patch("app.sdk.websearch.time.monotonic", side_effect=lambda: now[0]):
+            rows = self.client.search("作品", refresh=True)
+        self.assertEqual(rows[0]["shareurl"], URL + "?pwd=AA11")
+        self.assertEqual(page_deadlines, [132.0])
+        self.assertTrue(all(deadline < page_deadlines[0] for deadline in query_deadlines))
+        self.assertTrue(any("Google" in error for error in self.client.errors))
 
     @patch("app.sdk.websearch._validate_url", return_value="meijusou.com")
     def test_discovered_page_retries_transient_failure_once_with_same_budget(self, validate):

@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from natsort import natsorted
+from opencc import OpenCC
 from media_files import MEDIA_PATTERN, is_media_file, is_video_file, media_title
 from run_progress import report_progress
 
@@ -94,10 +95,14 @@ def share_listing_complete(response):
 
 
 _RESOURCE_SEASON_PATTERN = r"第\s*([\d零一二三四五六七八九十两]+)\s*[季部]|\bseason\s*(\d{1,2})\b|(?<![a-z])s(\d{1,2})(?=e\d|\b)"
+_RESOURCE_CHINESE_CONVERTER = OpenCC("t2s")
 
 
 def _resource_title_parts(title):
     title = unicodedata.normalize("NFKC", str(title)).casefold()
+    # 日文中的汉字保留原写法；这里只统一中文匹配，不改保存名称。
+    if not re.search(r"[\u3040-\u30ff]", title):
+        title = _RESOURCE_CHINESE_CONVERTER.convert(title)
     seasons = []
 
     def season_number(match):
@@ -150,9 +155,9 @@ def _resource_release_labels(value):
             break
         value = group[2].strip()
     label = (r"完全无修版|无修版|未删减版|无删减版|修正版|WEB[- .]?DL|WEBRIP|BDRIP|BLURAY|"
-             r"ABEMA|HIDIVE|2160p|1080p|720p|4k|1920x1080|1280x720|3840x2160|"
+             r"ABEMA|HIDIVE|BAHA|2160p|1080p|720p|4k|1920x1080|1280x720|3840x2160|"
              r"HEVC|AVC|[hx]\.?26[45]|AAC|FLAC|E?AC3|DDP?|MKV|MP4|10bit|8bit|CHS|CHT|ENG|JPN|(?=[a-f0-9]*[a-f])[a-f0-9]{8}")
-    for _ in range(4):
+    for _ in range(8):
         suffix = re.search(r"\s*[\[【(]([^\]】)]{1,120})[\]】)]\s*$", value)
         if not suffix or re.sub(r"[\s._+\-]+", "", re.sub(label, "", suffix[1], flags=re.I)):
             break
@@ -275,6 +280,36 @@ def resource_titles_match(expected, candidate, allow_missing_year=False, aliases
     return bool(name and title_matches and _resource_seasons_match(seasons, other_seasons, years)
                 and len(seasons) <= 1 and (not years or years == other_years
                 or (allow_missing_year and not other_years)))
+
+
+def _resource_source_post(task, candidate, aliases):
+    """只接受解析器从同一公开帖正文绑定的片名与分享，不使用推荐或发布日期。"""
+    from app.sdk.common import normalize_share_url
+
+    post = candidate.get("source_post")
+    if not isinstance(post, dict) or not isinstance(post.get("title"), str) or not 1 <= len(post["title"]) <= 300:
+        return None
+    try:
+        page = urllib.parse.urlsplit(post.get("page_url", ""))
+        if (page.scheme != "https" or page.netloc != "meijusou.com" or page.query or page.fragment
+                or not re.fullmatch(r"/post/[A-Za-z0-9_-]{1,100}", page.path)):
+            return None
+        source = normalize_share_url(post.get("shareurl", ""))
+        target = normalize_share_url(candidate.get("shareurl", ""))
+        if not source or not target or urllib.parse.urlsplit(source).path != urllib.parse.urlsplit(target).path:
+            return None
+    except (TypeError, ValueError):
+        return None
+    title = task["taskname"]
+    _, seasons, years = _resource_title_parts(title)
+    _, post_seasons, post_years = _resource_title_parts(post["title"])
+    if (post_years and years != post_years) or (post_seasons and not _resource_seasons_match(seasons, post_seasons, years)):
+        return None
+    # 双语主标题中允许一个完整名称独立出现，不接受片名子串。
+    if not any(resource_titles_match(title, value, allow_missing_year=True, aliases=aliases)
+               for value in [post["title"], *re.split(r"\s+", post["title"])]):
+        return None
+    return {"page_url": page.geturl(), "title": post["title"], "shareurl": source}
 
 
 def apply_media_rename_defaults(task):
@@ -457,6 +492,18 @@ class Config:
                                                      if isinstance(value, str) and value.strip() and len(value) <= 200))[:8]
                         if aliases:
                             record["search_aliases"] = aliases
+                    post = _resource_source_post(task, task, aliases if isinstance(aliases, list) else [])
+                    if not post:
+                        for previous in old:
+                            old_title, old_link = previous.get("taskname"), previous.get("shareurl")
+                            if (isinstance(old_title, str) and len(old_title) <= 200
+                                    and old_title.strip().casefold() == key[0]
+                                    and isinstance(old_link, str) and len(old_link) <= 4096
+                                    and normalize_share_url(old_link) == link):
+                                post = _resource_source_post(task, previous, aliases if isinstance(aliases, list) else [])
+                                break
+                    if post:
+                        record["source_post"] = post
                     records.append(record)
                     if len(records) == 256:
                         break
@@ -1552,7 +1599,7 @@ class Quark:
         if source_errors or interrupted:
             summary = "；".join(f"{error['source']}：{error['message']}" for error in source_errors[:3])
             prefix = f"部分来源查询失败（{summary}）" if summary else "索引查询已达到时间预算，部分关键词尚未查询"
-            result["error"] = prefix + "；已查询的来源未找到可验证的匹配资源，可稍后重试或手动选择链接"
+            result["error"] = prefix + "；本轮未找到可验证的匹配资源"
             if result["code"] == "no_results":
                 result["code"] = "unavailable"
         return result
@@ -1628,13 +1675,22 @@ class Quark:
                 # Follow one verified path; sibling seasons are neither evidence nor a save target.
                 for depth in range(path_depth, 3):
                     folders = [item for item in files if item.get("dir")]
-                    if len(folders) > 1 and not any(is_video_file(item) for item in files):
+                    if folders and not any(is_video_file(item) for item in files):
+                        parent_named = any(resource_titles_match(title, value, allow_missing_year=True, aliases=aliases)
+                                           for value in directory_evidence)
                         grouped = [folder for folder in folders if
                                    re.match(r"^[\[【][^\]】]+[\]】]", folder.get("file_name", ""))
-                                   and resource_titles_match(title, _resource_release_labels(folder["file_name"]),
-                                                             allow_missing_year=True, aliases=aliases)
+                                   and (resource_titles_match(title, _resource_release_labels(folder["file_name"]),
+                                                              allow_missing_year=True, aliases=aliases)
+                                        or (parent_named and re.fullmatch(
+                                            r"(?:\[[^\]\r\n]{1,60}\]){2,6}(?:[（(]\d{1,4}[）)])?",
+                                            folder["file_name"])
+                                            and re.search(r"1080|720|2160|4K|简|繁|CHS|CHT", folder["file_name"], re.I)))
                                    and re.fullmatch(r"[A-Za-z0-9_]{32}", str(folder.get("fid", "")))]
-                        if len(grouped) == len(folders):
+                        if grouped and (len(grouped) == len(folders) or parent_named and not any(
+                            re.match(r"^[\[【][^\]】]+[\]】]", folder.get("file_name", ""))
+                            for folder in folders if folder not in grouped
+                        )):
                             # 发布组各自验证和补存，不能把不同组的视频混成一个目录。
                             limited = limited or len(grouped) > 4
                             for folder in grouped[:4]:
@@ -1740,6 +1796,17 @@ class Quark:
                 )
                 combined = combined or bool(years and path_years == years and consistent_videos
                                             and (any(matched_videos) or named_directory))
+                source_post = _resource_source_post(task, candidate, aliases)
+                post_identity = bool(
+                    source_post and task.get("resource_type") == "anime"
+                    and str(task.get("resource_id", "")).startswith("bangumi:")
+                    and len(years) == 1 and seasons in (set(), {1})
+                    and not path_years and all(matched_videos)
+                    and all(not _resource_title_parts(value)[2] for value in evidence)
+                    and all(_resource_episode_number(task, item["file_name"]) is not None for item in video_files)
+                    and any(resource_titles_match(title, value, allow_missing_year=True, aliases=aliases)
+                            for value in directory_evidence)
+                )
                 supplement_without_year = False
                 if (not exact and not combined and required_episodes and len(years) == 1
                         and seasons in (set(), {1}) and task.get("resource_id")
@@ -1757,11 +1824,14 @@ class Quark:
                         )
                         repair_context["primary_verified"] = primary["success"]
                     supplement_without_year = repair_context["primary_verified"]
-                if not exact and not combined and not supplement_without_year:
+                if not exact and not combined and not supplement_without_year and not post_identity:
                     continue
                 # 历史保留验证入口，复查时才能重新取得祖先年份与作品目录；任务仍限定所选子目录。
                 Config.remember_resources(self.resource_history_path, [{"taskname": title, "shareurl": shareurl,
-                                                                       "search_aliases": aliases}])
+                                                                       "search_aliases": aliases,
+                                                                       **({"source_post": source_post} if source_post else {})}])
+                if post_identity and not exact and not combined:
+                    print("分享未注明年份：同一资源帖、目录和全部视频完整片名及首季信息一致；年份未确认")
                 episode_fids = None
                 if required_episodes is not None:
                     episode_fids = _episode_repair_files(task, video_files, required_episodes)

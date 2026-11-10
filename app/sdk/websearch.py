@@ -147,6 +147,77 @@ class _Page(HTMLParser):
         self.text.append(text)
 
 
+class _MeijusouPost(HTMLParser):
+    """Only a complete, unambiguous post body may supply a share's title."""
+    _void = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self, body):
+        super().__init__(convert_charrefs=True)
+        self.page = _Page("")
+        self._stack, self._h1, self._h2 = [], [], []
+        self._heading = None
+        self._article = None
+        self._articles = self._complete = 0
+        self._valid = True
+        self.feed(body)
+        self.close()
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        excluded = bool(self._stack and self._stack[-1][1]) or tag in {"script", "style", "template", "noscript", "aside", "nav", "footer"}
+        labels = " ".join(attrs.get(key, "") or "" for key in ("id", "class", "aria-label"))
+        excluded = excluded or bool(re.search(r"(?:^|[\s_-])(?:comments?|recommendations?|related|hot)(?:$|[\s_-])|评论|推荐|相关|热门", labels, re.I))
+        if tag not in self._void:
+            self._stack.append((tag, excluded))
+        if excluded:
+            return
+        if tag == "article":
+            self._articles += 1
+            if self._article is not None:
+                self._valid = False
+            self._article = len(self._stack)
+        if tag == "h1" or (tag == "h2" and self._article is not None):
+            if self._heading is not None:
+                self._valid = False
+            self._heading = [tag, []]
+        if self._article is not None:
+            self.page.handle_starttag(tag, list(attrs.items()))
+
+    def handle_endtag(self, tag):
+        if tag in self._void:
+            return
+        if not self._stack or self._stack[-1][0] != tag:
+            self._valid = False
+            return
+        if not self._stack[-1][1]:
+            if self._heading and tag == self._heading[0]:
+                title = re.sub(r"\s+", " ", "".join(self._heading[1])).strip()
+                (self._h1 if tag == "h1" else self._h2).append(title)
+                self._heading = None
+            if self._article is not None:
+                self.page.handle_endtag(tag)
+            if tag == "article" and len(self._stack) == self._article:
+                self._article = None
+                self._complete += 1
+        self._stack.pop()
+
+    def handle_data(self, text):
+        if self._stack and self._stack[-1][1]:
+            return
+        if self._heading is not None:
+            self._heading[1].append(text)
+        if self._article is not None:
+            self.page.handle_data(text)
+
+    @property
+    def title(self):
+        if (self._valid and self._articles == self._complete == 1 and self._article is None
+                and self._heading is None and len(self._h1) == len(self._h2) == 1
+                and self._h1[0] == self._h2[0] and self._h1[0]):
+            return self._h1[0]
+        return None
+
+
 class _SearchPage(_Page):
     def __init__(self, body):
         self.results = []
@@ -379,6 +450,7 @@ class WebSearch:
                 self.errors = list(cached[2])
                 return [dict(item) for item in cached[1]]
         deadline = time.monotonic() + 32
+        query_deadline = deadline - 8  # 给已发现的正文页留时间，不增加总预算。
         params = urlencode({"q": query + " 夸克"})
         engines = [("Meijusou", "https://meijusou.com/search?" + urlencode({"q": query})),
                    ("DuckDuckGo", "https://html.duckduckgo.com/html/?" + params),
@@ -390,7 +462,7 @@ class WebSearch:
         def search_engine(engine, url):
             report_progress("search", source=f"网页搜索 {engine}", query=query)
             fetch = self._fetch_with_retry if engine == "Meijusou" else self._fetch
-            body, final_url = fetch(url, deadline)
+            body, final_url = fetch(url, query_deadline)
             try:
                 if engine.startswith(("Telegram @", "腾讯频道 ")):
                     return channel_results(engine, body, final_url, query)
@@ -419,9 +491,6 @@ class WebSearch:
                                           "网盘" in item["snippet"], "夸克" in item["title"]), reverse=True)
         results, pages, seen = [], [], set()
         for item in candidates:
-            if time.monotonic() >= deadline:
-                self.errors.append("网页搜索已达到本次时间预算")
-                break
             try:
                 _validate_url(item["url"])
             except SearchError as error:
@@ -432,6 +501,10 @@ class WebSearch:
             if item["url"] not in seen and urlsplit(item["url"]).hostname != "pan.quark.cn":
                 seen.add(item["url"])
                 pages.append(item)
+        # 慢来源不能丢弃已收到的摘要直链；预算只停止后续落地页请求。
+        if pages and time.monotonic() >= deadline:
+            self.errors.append("网页搜索已达到本次时间预算")
+            pages = []
         first_pages = {}
         for item in pages:
             first_pages.setdefault(item["engine"], item)
@@ -455,8 +528,16 @@ class WebSearch:
                     page = _Page(body)
                     title = "".join(page.title).strip() or item["title"]
                     text = "".join(page.text)
+                    post = None
+                    parts = urlsplit(final_url)
+                    if parts.hostname == "meijusou.com" and re.fullmatch(r"/post/[a-fA-F0-9]{32}/?", parts.path):
+                        parsed_post = _MeijusouPost(body)
+                        if parsed_post.title:
+                            post = parsed_post.title
+                            title, text = post, "".join(parsed_post.page.text)
                     for url in _page_links(text):
-                        results.append(self._entry(item, url, title, text.replace("\x1e", "\n")[:1000], final_url))
+                        source_post = {"page_url": final_url, "title": post, "shareurl": url} if post else None
+                        results.append(self._entry(item, url, title, text.replace("\x1e", "\n")[:1000], final_url, source_post))
                 except (SearchError, ValueError) as error:
                     self.errors.append(f"{item['engine']} 落地页: {error}")
         unique = {}
@@ -464,8 +545,12 @@ class WebSearch:
             parts = urlsplit(item["shareurl"])
             key = (parts.path, parts.fragment)
             old = unique.get(key)
-            if old is None or (not urlsplit(old["shareurl"]).query and parts.query):
+            if old is None or (not old.get("source_post") and item.get("source_post")):
+                if old and not parts.query and urlsplit(old["shareurl"]).query:
+                    item = {**item, "shareurl": old["shareurl"]}
                 unique[key] = item
+            elif not urlsplit(old["shareurl"]).query and parts.query:
+                unique[key] = {**old, "shareurl": item["shareurl"]}
         output = list(unique.values())
         # 跳过或失败的引擎不构成完整查询，也不能覆盖已有完整缓存。
         if not failed_engines:
@@ -479,9 +564,12 @@ class WebSearch:
         return [dict(item) for item in output]
 
     @staticmethod
-    def _entry(item, url, title, content, page_url):
+    def _entry(item, url, title, content, page_url, source_post=None):
         page_url = item.get("page_url") or page_url
-        return {"taskname": title, "shareurl": url, "content": content, "datetime": "",
+        entry = {"taskname": title, "shareurl": url, "content": content, "datetime": "",
                 "source": "频道索引" if item["engine"].startswith(("Telegram @", "腾讯频道 ")) else "网页搜索",
                 "channel": f"{item['engine']} · {urlsplit(page_url).hostname}",
                 "page_url": page_url}
+        if source_post:
+            entry["source_post"] = source_post
+        return entry
