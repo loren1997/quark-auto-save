@@ -36,11 +36,15 @@
     "savepath": "/cartoon"
   },
   "source": {
+    "monitor": {
+      "enable": true
+    },
     "websearch": {
       "enable": true
     },
     "channelsearch": {
       "enable": true,
+      "auto_discover": true,
       "telegram_channels": ["guoman4K", "kuakedongman"],
       "qq_channels": ["pd26778899"]
     },

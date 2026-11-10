@@ -400,11 +400,44 @@
               <label class="col-sm-2 col-form-label" for="channelsearch-enabled">公开频道索引</label>
               <div class="col-sm-10">
                 <label><input id="channelsearch-enabled" type="checkbox" v-model="formData.source.channelsearch.enable"> 搜索 Telegram、腾讯公开频道</label>
+                <label class="d-block"><input id="channel-discovery-enabled" type="checkbox" v-model="formData.source.channelsearch.auto_discover"> 自动发现并验证新的公开频道</label>
                 <label class="d-block" for="telegram-channels">Telegram 频道名</label>
                 <textarea id="telegram-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.telegram_channels" placeholder="guoman4K, kuakedongman"></textarea>
                 <label class="d-block mt-2" for="qq-channels">腾讯频道 ID</label>
                 <textarea id="qq-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.qq_channels" placeholder="pd26778899"></textarea>
                 <small class="text-muted d-block">多个频道用逗号或换行分隔。Telegram 查询公开消息；腾讯频道读取可访问的公开帖子，覆盖范围受页面限制。登录限制、验证码或连接失败会记录在日志中。</small>
+                <small class="text-muted d-block">自动发现需要同时开启频道索引和渠道巡检。新频道按固定格式解析，验证存在影视夸克链接后才接入；不安装陌生网站代码，不修改上方自定义频道。</small>
+              </div>
+            </div>
+            <div class="form-group row ml-3">
+              <label class="col-sm-2 col-form-label" for="source-monitor-enabled">渠道巡检</label>
+              <div class="col-sm-10">
+                <label><input id="source-monitor-enabled" type="checkbox" v-model="formData.source.monitor.enable"> 每 5 分钟后台巡检</label>
+                <small class="text-muted d-block">保存配置后生效。故障来源冷却到期后自动复查，遇到验证码继续使用其他可用来源；停用的搜索源不会主动探测。巡检不占用转存队列。</small>
+                <button id="source-status-refresh" type="button" class="btn btn-outline-secondary btn-sm mt-2" @click="loadSourceStatus" :disabled="sourceStatusLoading">{{ sourceStatusLoading ? '读取中…' : (sourceStatus ? '刷新渠道状态' : '查看渠道状态') }}</button>
+                <div v-if="sourceStatusError" class="alert alert-warning mt-2" role="alert">{{ sourceStatusError }}</div>
+                <section v-if="sourceStatus" class="mt-2" aria-label="渠道巡检状态" aria-live="polite">
+                  <p class="small text-muted mb-1">已保存设置：巡检{{ sourceStatus.monitor_enabled ? '开启' : '关闭' }}；频道索引{{ sourceStatus.channel_search_enabled ? '开启' : '关闭' }}；自动发现{{ sourceStatus.auto_discover_enabled ? '开启' : '关闭' }}。此处仅在点击按钮时刷新。</p>
+                  <p class="small mb-1">上次发现：{{ formatSourceTime(sourceStatus.registry.last_discovery) }}；下次发现：{{ formatSourceTime(sourceStatus.registry.next_discovery) }}<span v-if="sourceStatus.registry.discovery_reason">；{{ sourceStatus.registry.discovery_reason }}</span></p>
+                  <div class="table-responsive">
+                    <table class="table table-sm table-bordered mb-2">
+                      <caption class="small">已记录故障来源。没有记录不代表所有来源均可用；到期后在下一轮巡检复查。</caption>
+                      <thead><tr><th>来源</th><th>状态</th><th>原因</th><th>复查时间</th></tr></thead>
+                      <tbody>
+                        <tr v-for="source in sourceStatus.sources" :key="source.host"><td>{{ source.host }}</td><td>{{ sourceStateLabel(source.status) }}</td><td>{{ source.reason }}</td><td>{{ formatSourceTime(source.next_check) }}</td></tr>
+                        <tr v-if="!sourceStatus.sources.length"><td colspan="4">暂无故障记录</td></tr>
+                      </tbody>
+                    </table>
+                    <table class="table table-sm table-bordered">
+                      <caption class="small">自动发现的公开频道。停用巡检或自动发现后，下面的时间不代表仍会执行；公开链接可用也不保证包含需要的剧集。</caption>
+                      <thead><tr><th>频道</th><th>状态</th><th>原因</th><th>上次检查</th><th>复查时间</th></tr></thead>
+                      <tbody>
+                        <tr v-for="channel in sourceStatus.registry.channels" :key="channel.name"><td>{{ channel.name }}</td><td>{{ sourceStateLabel(channel.status) }}</td><td>{{ channel.reason || '—' }}</td><td>{{ formatSourceTime(channel.last_checked) }}</td><td>{{ formatSourceTime(channel.next_check) }}</td></tr>
+                        <tr v-if="!sourceStatus.registry.channels.length"><td colspan="5">尚无自动发现的频道</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
               </div>
             </div>
 
@@ -824,7 +857,8 @@
           magic_regex: {},
           source: {
             websearch: { enable: true },
-            channelsearch: { enable: true, telegram_channels: 'guoman4K,kuakedongman', qq_channels: 'pd26778899' },
+            monitor: { enable: true },
+            channelsearch: { enable: true, auto_discover: true, telegram_channels: 'guoman4K,kuakedongman', qq_channels: 'pd26778899' },
             net: {
               enable: ""
             },
@@ -840,6 +874,9 @@
           },
         },
         toasts: [],
+        sourceStatus: null,
+        sourceStatusLoading: false,
+        sourceStatusError: '',
         calendar: { days: [], warnings: [], notes: [] },
         discoveryLoading: false,
         discoveryError: '',
@@ -956,6 +993,27 @@
         window.removeEventListener('beforeunload', this.handleBeforeUnload);
       },
       methods: {
+        async loadSourceStatus() {
+          if (this.sourceStatusLoading) return;
+          this.sourceStatusLoading = true;
+          this.sourceStatusError = '';
+          try {
+            const response = await axios.get('/source_status');
+            if (!response.data.success) throw new Error(response.data.message || '读取渠道状态失败');
+            this.sourceStatus = response.data.data;
+          } catch (error) {
+            this.sourceStatusError = error.response?.data?.message || error.message || '读取渠道状态失败，请稍后刷新';
+          } finally {
+            this.sourceStatusLoading = false;
+          }
+        },
+        formatSourceTime(value) {
+          if (!Number.isFinite(Number(value)) || Number(value) <= 0) return '尚未安排';
+          return new Date(Number(value) * 1000).toLocaleString('zh-CN', { hour12: false });
+        },
+        sourceStateLabel(status) {
+          return { active: '可用', standby: '备用', cooldown: '冷却中', awaiting_probe: '等待复查', pending: '等待验证', disabled: '已停用' }[status] || status;
+        },
         changeTab(tab) {
           this.activeTab = tab;
           if (tab === 'discovery' && !this.calendar.days.length) this.loadDiscovery();
@@ -1166,8 +1224,11 @@
                 config_data.source = {};
               }
               if (!config_data.source.websearch) config_data.source.websearch = { enable: true };
+              if (!config_data.source.monitor) config_data.source.monitor = { enable: true };
+              if (config_data.source.monitor.enable === undefined) config_data.source.monitor.enable = true;
               if (!config_data.source.channelsearch) config_data.source.channelsearch = { enable: true, telegram_channels: ['guoman4K', 'kuakedongman'], qq_channels: ['pd26778899'] };
               if (config_data.source.channelsearch.enable === undefined) config_data.source.channelsearch.enable = true;
+              if (config_data.source.channelsearch.auto_discover === undefined) config_data.source.channelsearch.auto_discover = true;
               for (const key of ['telegram_channels', 'qq_channels']) {
                 if (config_data.source.channelsearch[key] === undefined) config_data.source.channelsearch[key] = key === 'telegram_channels' ? ['guoman4K', 'kuakedongman'] : ['pd26778899'];
                 if (Array.isArray(config_data.source.channelsearch[key])) config_data.source.channelsearch[key] = config_data.source.channelsearch[key].join('\n');

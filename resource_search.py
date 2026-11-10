@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
 import re
+import time
 from urllib.parse import urlsplit
 
 from app.sdk.cloudsaver import CloudSaver
@@ -20,7 +21,7 @@ MAX_PANSOU_SERVERS = 3
 def search_error_reason(message):
     """Only fixed diagnostic categories may leave a transport exception."""
     message = str(message)
-    cooldown = re.fullmatch(r"来源冷却中：(HTTP (?:403|429)|需要人工验证|请求超时|搜索源上游协议错误)（剩余 (\d{1,8}) 秒）", message)
+    cooldown = re.fullmatch(r"来源冷却中：(HTTP (?:403|404|410|429)|需要人工验证|请求超时|搜索源上游协议错误|网络连接失败|响应格式异常)（剩余 (\d{1,8}) 秒）", message)
     if cooldown:
         return cooldown.group(0)
     if message == "搜索源上游协议错误":
@@ -54,7 +55,7 @@ def search_error_reason(message):
 def _web_errors(messages):
     errors = []
     for message in messages:
-        match = re.match(r"^(Bing|DuckDuckGo|Google|Sogou|Meijusou|Telegram @[A-Za-z][A-Za-z0-9_]{3,31}|腾讯频道 pd\d{5,20})(\s+落地页)?:\s*(.*)$", str(message), re.S)
+        match = re.match(r"^(Bing|DuckDuckGo|Google|Sogou|Meijusou|PansoVIP|Telegram @[A-Za-z][A-Za-z0-9_]{3,31}|腾讯频道 pd\d{5,20})(\s+落地页)?:\s*(.*)$", str(message), re.S)
         source = ("频道索引" if match and match[1].startswith(("Telegram @", "腾讯频道 ")) else "网页搜索") + (f" {match[1]}{match[2] or ''}" if match else "")
         error = {"source": source, "message": search_error_reason(match[3] if match else message)}
         if error not in errors:
@@ -90,6 +91,10 @@ def _selection(value, label):
 
 def search_web_resources(query, config, refresh=False, failed_engines=None, health_path=None):
     """自动订阅在网盘索引未找到可验证资源时，单独查询公开网页。"""
+    from app.sdk.channel_registry import ChannelRegistry
+    from app.sdk.channel_search import DEFAULT_TELEGRAM_CHANNELS, channel_queries
+    from app.sdk.source_monitor import record_web_failures
+
     sources = config.get("source") or {}
     source = sources.get("websearch") or {}
     channels = sources.get("channelsearch") or {}
@@ -99,14 +104,24 @@ def search_web_resources(query, config, refresh=False, failed_engines=None, heal
         return {"success": False, "data": [], "errors": [], "message": "搜索词必须是 200 字以内的文本"}
     client = WebSearch(health_path=health_path)
     try:
+        channel_queries(channels, query)  # 先校验用户名单，自动发现不能掩盖配置错误。
+        if _enabled(channels) and str(channels.get("auto_discover", True)).lower() == "true":
+            configured = channels.get("telegram_channels", DEFAULT_TELEGRAM_CHANNELS)
+            if isinstance(configured, str):
+                configured = [item.lstrip("@") for item in re.split(r"[,，\s]+", configured.strip()) if item]
+            extra = ChannelRegistry(health_path).active_channels(configured)
+            if extra:
+                channels = {**channels, "telegram_channels": list(dict.fromkeys(configured + extra))[:6]}
         options = {"failed_engines": failed_engines} if failed_engines is not None else {}
         entries = client.search(query.strip(), refresh=refresh, channel_config=channels, include_engines=_enabled(source), **options)
         errors = _web_errors(client.errors)
+        record_web_failures(errors, health_path)
         return {"success": True, "data": entries, "errors": errors,
                 "message": "；".join(f"{error['source']}：{error['message']}" for error in errors)}
     except (SearchError, ValueError) as error:
         messages = client.errors if isinstance(client.errors, list) and client.errors else [error]
         errors = _web_errors(messages)
+        record_web_failures(errors, health_path)
         return {"success": False, "data": [], "errors": errors,
                 "message": "；".join(f"{item['source']}：{item['message']}" for item in errors)}
     finally:
@@ -177,6 +192,7 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
             return response["data"], response["errors"], response["success"]
         client = CloudSaver(server) if label == "CloudSaver" else PanSou(server, token=token)
         health = SourceHealth(health_path)
+        checked_after = time.time()
         try:
             health.check(server)
             if label == "CloudSaver":
@@ -184,8 +200,11 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
                 response = client.auto_login_search(query)
                 if not response.get("success"):
                     raise SearchError(response.get("message", "搜索失败"))
-                return client.clean_search_results(response.get("data", [])), [], True
-            return client.search(query, refresh=refresh, **selection), [], True
+                entries = client.clean_search_results(response.get("data", []))
+            else:
+                entries = client.search(query, refresh=refresh, **selection)
+            health.clear(server, checked_after=checked_after)
+            return entries, [], True
         except SearchError as error:
             reason = search_error_reason(error)
             if reason in SourceHealth.DURATIONS:
