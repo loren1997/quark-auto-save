@@ -93,39 +93,93 @@ def search_web_resources(query, config, refresh=False, failed_engines=None, heal
     """自动订阅在网盘索引未找到可验证资源时，单独查询公开网页。"""
     from app.sdk.channel_registry import ChannelRegistry
     from app.sdk.channel_search import DEFAULT_TELEGRAM_CHANNELS, channel_queries
-    from app.sdk.source_monitor import record_web_failures
+    from app.sdk.source_monitor import record_telegram_failures, record_web_failures
 
     sources = config.get("source") or {}
     source = sources.get("websearch") or {}
     channels = sources.get("channelsearch") or {}
+    account_enabled = (_enabled(channels)
+                       and str((sources.get("telegram") or {}).get("enable", False)).lower() == "true")
     if not _enabled(source) and not _enabled(channels):
         return {"success": True, "data": [], "errors": [], "message": ""}
     if not isinstance(query, str) or not query.strip() or len(query) > 200:
         return {"success": False, "data": [], "errors": [], "message": "搜索词必须是 200 字以内的文本"}
     client = WebSearch(health_path=health_path)
+    entries, errors, successful = [], [], False
+    deadline = time.monotonic() + 32
     try:
         channel_queries(channels, query)  # 先校验用户名单，自动发现不能掩盖配置错误。
+        configured = channels.get("telegram_channels", DEFAULT_TELEGRAM_CHANNELS) if _enabled(channels) else []
+        if isinstance(configured, str):
+            configured = [item.lstrip("@") for item in re.split(r"[,，\s]+", configured.strip()) if item]
+        registry = ChannelRegistry(health_path)
+        available = registry.available_channels(configured)
+        if _enabled(channels) and available != configured:
+            channels = {**channels, "telegram_channels": available}
+        configured = available
+        account_channels = list(configured)
         if _enabled(channels) and str(channels.get("auto_discover", True)).lower() == "true":
-            configured = channels.get("telegram_channels", DEFAULT_TELEGRAM_CHANNELS)
-            if isinstance(configured, str):
-                configured = [item.lstrip("@") for item in re.split(r"[,，\s]+", configured.strip()) if item]
-            extra = ChannelRegistry(health_path).active_channels(configured)
+            extra = registry.active_channels(configured)
             if extra:
                 channels = {**channels, "telegram_channels": list(dict.fromkeys(configured + extra))[:6]}
+            if account_enabled:
+                account_channels += registry.active_channels(configured, check_health=False)
+        account_channels = list(dict.fromkeys(account_channels))
+        if len(account_channels) > 6:
+            offset = int(time.time() // 300) % len(account_channels)
+            account_channels = (account_channels[offset:] + account_channels[:offset])[:6]
         options = {"failed_engines": failed_engines} if failed_engines is not None else {}
-        entries = client.search(query.strip(), refresh=refresh, channel_config=channels, include_engines=_enabled(source), **options)
-        errors = _web_errors(client.errors)
-        record_web_failures(errors, health_path)
-        return {"success": True, "data": entries, "errors": errors,
-                "message": "；".join(f"{error['source']}：{error['message']}" for error in errors)}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            web = executor.submit(client.search, query.strip(), refresh=refresh, channel_config=channels,
+                                  include_engines=_enabled(source), **options)
+            native = None
+            native_started = time.time()
+            if account_enabled and account_channels and (failed_engines is None or "Telegram账号" not in failed_engines):
+                from app.sdk.telegram_account import TelegramAccount
+                native = executor.submit(TelegramAccount(health_path).search, query.strip(), account_channels,
+                                         limit=20, deadline=deadline)
+            try:
+                entries.extend(web.result())
+                successful = True
+                errors.extend(_web_errors(client.errors))
+            except (SearchError, ValueError) as error:
+                messages = client.errors if isinstance(client.errors, list) and client.errors else [error]
+                errors.extend(_web_errors(messages))
+            record_web_failures(errors, health_path)
+            if native is not None:
+                try:
+                    result = native.result()
+                except Exception:
+                    result = {"ok": False, "code": "QUERY_FAILED"}
+                native_errors = list(result.get("errors") or [])
+                native_ok = bool(result.get("ok")) and (bool(result.get("candidates")) or not native_errors
+                                                        or len(native_errors) < len(account_channels))
+                successful = successful or native_ok or bool(result.get("candidates"))
+                entries.extend(result.get("candidates") or [])
+                if not result.get("ok") and not native_errors:
+                    native_errors = [{"source": "Telegram账号", "code": result.get("code"),
+                                      "retry_after": result.get("retry_after")}]
+                record_telegram_failures(native_errors, health_path, account_channels,
+                                         result.get("unavailable_channels") or [])
+                registry.record_account_results(account_channels, result.get("candidates") or [], native_started)
+                reasons = {"CHANNEL_UNAVAILABLE": "频道不可访问或已失效", "CHANNEL_RESTRICTED": "频道受限，已跳过",
+                           "FLOOD_WAIT": "Telegram 请求过于频繁，稍后自动重试", "ACCOUNT_REVOKED": "Telegram 登录已失效",
+                           "ACCOUNT_BANNED": "Telegram 账号受限", "AUTH_REQUIRED": "Telegram 账号未登录",
+                           "SDK_MISSING": "Telegram 账号组件未安装", "TIMEOUT": "请求超时",
+                           "NETWORK_ERROR": "网络连接失败", "BUSY": "Telegram 账号繁忙，稍后自动重试"}
+                for error in native_errors:
+                    label = str(error.get("source") or "")
+                    label = "Telegram账号 · " + label if re.fullmatch(r"Telegram @[A-Za-z][A-Za-z0-9_]{3,31}", label) else "Telegram账号"
+                    message = reasons.get(error.get("code"), "Telegram 账号查询失败")
+                    errors.append({"source": label, "message": message})
+                if not native_ok and failed_engines is not None:
+                    failed_engines.add("Telegram账号")
     except (SearchError, ValueError) as error:
-        messages = client.errors if isinstance(client.errors, list) and client.errors else [error]
-        errors = _web_errors(messages)
-        record_web_failures(errors, health_path)
-        return {"success": False, "data": [], "errors": errors,
-                "message": "；".join(f"{item['source']}：{item['message']}" for item in errors)}
+        errors.extend(_web_errors([error]))
     finally:
         client.session.close()
+    return {"success": successful, "data": entries, "errors": errors,
+            "message": "；".join(f"{error['source']}：{error['message']}" for error in errors)}
 
 
 def search_resources(query, config, refresh=False, include_web=True, failed_sources=None, health_path=None):

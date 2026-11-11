@@ -48,6 +48,27 @@ def record_web_failures(errors, health_path):
         health.record(url, reason)
 
 
+def record_telegram_failures(errors, health_path, known_channels=(), unavailable_channels=()):
+    from .channel_registry import ChannelRegistry
+
+    reasons = {"CHANNEL_UNAVAILABLE": "频道不可访问", "CHANNEL_RESTRICTED": "频道不可访问",
+               "TIMEOUT": "请求超时", "NETWORK_ERROR": "网络连接失败"}
+    registry = ChannelRegistry(health_path)
+    known = {name.casefold() for name in known_channels if isinstance(name, str)}
+    for error in errors:
+        match = re.fullmatch(r"Telegram @([A-Za-z][A-Za-z0-9_]{3,31})", str(error.get("source", "")))
+        reason = reasons.get(error.get("code"))
+        if match and reason:
+            # MTProto 可用性与 t.me 网页的冷却互不替代。
+            registry.record_failure(match[1], reason, check_health=False,
+                                    register=reason == "频道不可访问" and match[1].casefold() in known)
+    for item in unavailable_channels:
+        name = item.get("name")
+        if isinstance(name, str) and name.casefold() in known:
+            registry.record_failure(name, "频道不可访问", check_health=False, register=True,
+                                    retry_after=item.get("retry_after"))
+
+
 def maintain_sources(config, health_path):
     from resource_search import DEFAULT_PANSOU_SERVER, MAX_PANSOU_SERVERS, _server_url, search_error_reason
     from .channel_registry import ChannelRegistry

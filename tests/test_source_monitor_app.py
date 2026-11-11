@@ -102,6 +102,28 @@ class SourceMonitorAppTests(unittest.TestCase):
         self.assertEqual(data["registry"]["channels"], [])
         self.maintain.assert_not_called()
 
+    def test_status_origins_are_bounded_and_expose_only_valid_public_fields(self):
+        registry = self.patch("ChannelRegistry")
+        directory = {"kind": "directory", "last_checked": 1, "next_check": 2, "reason": ""}
+        folder = {"kind": "folder", "last_checked": 3, "next_check": 4, "reason": "需要连接 Telegram 账号"}
+        registry.return_value.status.return_value = {
+            "last_discovery": 10, "next_discovery": 20, "discovery_reason": "", "channels": [],
+            "origins": [None, "private-title", {"kind": "private-kind", "reason": "private-secret"},
+                        {**directory, "url": "private-directory-url", "secret": "private-secret"},
+                        *[{**folder, "url": "private-folder-url", "slug": "private-slug",
+                           "origin": "private-hash", "phone": "private-phone"} for _ in range(8)]],
+        }
+        response = self.client.get("/source_status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["data"]["registry"]["origins"], [directory, folder, folder, folder])
+        self.assertEqual(response.json["data"]["registry"]["last_discovery"], 10)
+        self.assertNotIn("private-", response.get_data(as_text=True))
+        for invalid in (None, "not-a-list", {"kind": "folder"}):
+            registry.return_value.status.return_value["origins"] = invalid
+            self.assertEqual(self.client.get("/source_status").json["data"]["registry"]["origins"], [])
+        self.maintain.assert_not_called()
+        self.run_manager.assert_not_called()
+
     def test_status_config_error_does_not_leak_credentials(self):
         with patch.object(web.Config, "read_json", side_effect=ValueError("private-cookie")):
             response = self.client.get("/source_status")

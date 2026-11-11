@@ -403,10 +403,51 @@
                 <label class="d-block"><input id="channel-discovery-enabled" type="checkbox" v-model="formData.source.channelsearch.auto_discover"> 自动发现并验证新的公开频道</label>
                 <label class="d-block" for="telegram-channels">Telegram 频道名</label>
                 <textarea id="telegram-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.telegram_channels" placeholder="guoman4K, kuakedongman"></textarea>
+                <label class="d-block mt-2" for="telegram-folders">Telegram 频道文件夹</label>
+                <textarea id="telegram-folders" class="form-control" rows="2" v-model="formData.source.channelsearch.telegram_folders" placeholder="https://t.me/addlist/…（每行一个）"></textarea>
+                <small class="text-muted d-block">保存后自动读取文件夹中的公开频道，验证影视夸克资源后逐步加入搜索。读取完整名单需要下方 Telegram 账号连接，不会自动加入频道。</small>
                 <label class="d-block mt-2" for="qq-channels">腾讯频道 ID</label>
                 <textarea id="qq-channels" class="form-control" rows="2" v-model="formData.source.channelsearch.qq_channels" placeholder="pd26778899"></textarea>
                 <small class="text-muted d-block">多个频道用逗号或换行分隔。Telegram 查询公开消息；腾讯频道读取可访问的公开帖子，覆盖范围受页面限制。登录限制、验证码或连接失败会记录在日志中。</small>
                 <small class="text-muted d-block">自动发现需要同时开启频道索引和渠道巡检。新频道按固定格式解析，验证存在影视夸克链接后才接入；不安装陌生网站代码，不修改上方自定义频道。</small>
+              </div>
+            </div>
+            <div class="form-group row ml-3" aria-label="Telegram 账号连接">
+              <label class="col-sm-2 col-form-label" for="telegram-account-enabled">Telegram 账号</label>
+              <div class="col-sm-10">
+                <label><input id="telegram-account-enabled" type="checkbox" v-model="formData.source.telegram.enable"> 启用账号搜索与文件夹发现</label>
+                <div class="mb-2">
+                  <button id="telegram-status" type="button" class="btn btn-outline-secondary btn-sm" @click="loadTelegramStatus" :disabled="telegramBusy">查看连接状态</button>
+                  <span v-if="telegramStatus" class="ml-2 small" role="status">{{ telegramStateLabel(telegramStatus.state) }}</span>
+                </div>
+                <p v-if="telegramStatus && telegramStatus.reason" class="small text-muted" role="status">{{ telegramStatus.reason }}<span v-if="telegramStatus.retry_after > 0">；约 {{ Math.ceil(telegramStatus.retry_after) }} 秒后重试</span></p>
+                <div v-if="telegramError" class="alert alert-warning" role="alert">{{ telegramError }}</div>
+                <template v-if="!telegramStatus || !telegramStatus.authorized">
+                  <div v-if="!telegramStatus || !['waiting_code', 'waiting_password'].includes(telegramStatus.state)">
+                    <small class="text-muted d-block mb-2">在 <a href="https://my.telegram.org/apps" target="_blank" rel="noopener noreferrer">Telegram 官方应用管理</a> 获取用户账号 API ID / API Hash。首次连接需输入 Telegram 登录验证码，开启两步验证的账号还需输入密码。</small>
+                    <label class="d-block" for="telegram-api-id">API ID</label>
+                    <input id="telegram-api-id" class="form-control mb-2" inputmode="numeric" maxlength="12" v-model="telegramLogin.api_id" autocomplete="off">
+                    <label class="d-block" for="telegram-api-hash">API Hash</label>
+                    <input id="telegram-api-hash" type="password" class="form-control mb-2" maxlength="64" v-model="telegramLogin.api_hash" autocomplete="new-password">
+                    <label class="d-block" for="telegram-phone">手机号（含国家区号）</label>
+                    <input id="telegram-phone" type="tel" class="form-control mb-2" maxlength="24" v-model="telegramLogin.phone" placeholder="+86…" autocomplete="off">
+                    <label class="d-block" for="telegram-proxy">连接代理（可选）</label>
+                    <input id="telegram-proxy" type="password" class="form-control mb-2" maxlength="2048" v-model="telegramLogin.proxy" placeholder="http://… 或 socks5://…" autocomplete="new-password">
+                    <button id="telegram-send-code" type="button" class="btn btn-outline-primary" @click="requestTelegramCode" :disabled="telegramBusy">发送登录验证码</button>
+                  </div>
+                  <div v-if="telegramStatus && telegramStatus.state === 'waiting_code'">
+                    <label class="d-block" for="telegram-code">Telegram 登录验证码</label>
+                    <input id="telegram-code" class="form-control mb-2" inputmode="numeric" maxlength="12" v-model="telegramLogin.code" autocomplete="one-time-code">
+                    <button id="telegram-submit-code" type="button" class="btn btn-primary" @click="signInTelegram(false)" :disabled="telegramBusy">验证并连接</button>
+                  </div>
+                  <div v-if="telegramStatus && telegramStatus.state === 'waiting_password'">
+                    <label class="d-block" for="telegram-password">Telegram 两步验证密码</label>
+                    <input id="telegram-password" type="password" class="form-control mb-2" maxlength="1024" v-model="telegramLogin.password" autocomplete="current-password">
+                    <button id="telegram-submit-password" type="button" class="btn btn-primary" @click="signInTelegram(true)" :disabled="telegramBusy">验证并连接</button>
+                  </div>
+                </template>
+                <button v-if="telegramStatus && (telegramStatus.authorized || formData.source.telegram.enable || ['waiting_code', 'waiting_password'].includes(telegramStatus.state))" id="telegram-disconnect" type="button" class="btn btn-outline-secondary mt-2" @click="disconnectTelegram" :disabled="telegramBusy">{{ telegramStatus.authorized || formData.source.telegram.enable ? '断开账号' : '取消登录' }}</button>
+                <small class="text-muted d-block mt-2">账号仅用于读取公开频道与文件夹。会话单独保存在 NAS 配置目录；验证码和两步验证密码不保存。不会加入频道、发送消息或使用付费全网搜索。</small>
               </div>
             </div>
             <div class="form-group row ml-3">
@@ -420,6 +461,13 @@
                   <p class="small text-muted mb-1">已保存设置：巡检{{ sourceStatus.monitor_enabled ? '开启' : '关闭' }}；频道索引{{ sourceStatus.channel_search_enabled ? '开启' : '关闭' }}；自动发现{{ sourceStatus.auto_discover_enabled ? '开启' : '关闭' }}。此处仅在点击按钮时刷新。</p>
                   <p class="small mb-1">上次发现：{{ formatSourceTime(sourceStatus.registry.last_discovery) }}；下次发现：{{ formatSourceTime(sourceStatus.registry.next_discovery) }}<span v-if="sourceStatus.registry.discovery_reason">；{{ sourceStatus.registry.discovery_reason }}</span></p>
                   <div class="table-responsive">
+                    <table v-if="sourceStatus.registry.origins && sourceStatus.registry.origins.length" class="table table-sm table-bordered mb-2">
+                      <caption class="small">频道名单来源。文件夹需先连接 Telegram 账号；此处不显示邀请地址。</caption>
+                      <thead><tr><th>来源</th><th>上次读取</th><th>下次检查</th><th>状态</th></tr></thead>
+                      <tbody>
+                        <tr v-for="(origin, index) in sourceStatus.registry.origins" :key="index"><td>{{ origin.kind === 'folder' ? 'Telegram 频道文件夹' : '公开频道目录' }}</td><td>{{ formatSourceTime(origin.last_checked) }}</td><td>{{ formatSourceTime(origin.next_check) }}</td><td>{{ origin.reason || (origin.last_checked ? '已读取' : '等待读取') }}</td></tr>
+                      </tbody>
+                    </table>
                     <table class="table table-sm table-bordered mb-2">
                       <caption class="small">已记录故障来源。没有记录不代表所有来源均可用；到期后在下一轮巡检复查。</caption>
                       <thead><tr><th>来源</th><th>状态</th><th>原因</th><th>复查时间</th></tr></thead>
@@ -862,7 +910,8 @@
           source: {
             websearch: { enable: true },
             monitor: { enable: true },
-            channelsearch: { enable: true, auto_discover: true, telegram_channels: 'guoman4K,kuakedongman', qq_channels: 'pd26778899' },
+            channelsearch: { enable: true, auto_discover: true, telegram_channels: 'guoman4K,kuakedongman', telegram_folders: '', qq_channels: 'pd26778899' },
+            telegram: { enable: false },
             net: {
               enable: ""
             },
@@ -881,6 +930,10 @@
         sourceStatus: null,
         sourceStatusLoading: false,
         sourceStatusError: '',
+        telegramStatus: null,
+        telegramBusy: false,
+        telegramError: '',
+        telegramLogin: { api_id: '', api_hash: '', phone: '', proxy: '', code: '', password: '' },
         calendar: { days: [], warnings: [], notes: [], refreshing: false, stale: false },
         discoveryLoading: false,
         discoveryLoadError: '',
@@ -979,6 +1032,7 @@
       },
       mounted() {
         this.fetchData();
+        this.loadTelegramStatus();
         this.refreshRuns();
         this.runsTimer = setInterval(() => {
           if (!document.hidden) {
@@ -1001,6 +1055,59 @@
         window.removeEventListener('beforeunload', this.handleBeforeUnload);
       },
       methods: {
+        telegramStateLabel(state) {
+          return { disconnected: '未连接', waiting_code: '等待登录验证码', waiting_password: '等待两步验证密码', authorized: '已连接', reauthorize: '需要重新登录', suspended: '账号暂不可用', unavailable: '连接组件不可用' }[state] || '待检查';
+        },
+        async telegramRequest(method, url, data, syncEnabled = false) {
+          if (this.telegramBusy) return;
+          this.telegramBusy = true;
+          this.telegramError = '';
+          try {
+            const response = await axios({ method, url, data });
+            const result = response.data;
+            if (result.data) this.telegramStatus = result.data;
+            if (result.config_revision) {
+              if (result.previous_config_revision === this.formData.config_revision) {
+                this.formData.config_revision = result.config_revision;
+              } else {
+                this.telegramError = 'Telegram 状态已更新，但后台配置也有变更；请先保留未保存的编辑，重新加载配置后再保存。';
+              }
+            }
+            if (syncEnabled && result.data && typeof result.data.enabled === 'boolean') this.formData.source.telegram.enable = result.data.enabled;
+            if (!result.success) this.telegramError = [this.telegramError, result.data?.reason || result.message || 'Telegram 操作未完成'].filter(Boolean).join(' ');
+          } catch (error) {
+            if (error.response?.data?.data) this.telegramStatus = error.response.data.data;
+            this.telegramError = error.response?.data?.message || 'Telegram 连接暂不可用，请稍后重试';
+          } finally {
+            this.telegramBusy = false;
+          }
+        },
+        loadTelegramStatus() {
+          return this.telegramRequest('get', '/api/telegram/status');
+        },
+        async requestTelegramCode() {
+          const data = { api_id: Number(this.telegramLogin.api_id), api_hash: this.telegramLogin.api_hash.trim(), phone: this.telegramLogin.phone.trim(), proxy: this.telegramLogin.proxy.trim() || null };
+          try {
+            await this.telegramRequest('post', '/api/telegram/code', data);
+          } finally {
+            this.telegramLogin.api_hash = '';
+            this.telegramLogin.proxy = '';
+            if (this.telegramStatus?.state === 'waiting_code') this.telegramLogin.phone = '';
+          }
+        },
+        async signInTelegram(usePassword) {
+          const data = usePassword ? { password: this.telegramLogin.password } : { code: this.telegramLogin.code.trim() };
+          try {
+            await this.telegramRequest('post', '/api/telegram/signin', data, true);
+          } finally {
+            this.telegramLogin.code = '';
+            this.telegramLogin.password = '';
+          }
+        },
+        async disconnectTelegram() {
+          await this.telegramRequest('delete', '/api/telegram/session', {}, true);
+          this.telegramLogin = { api_id: '', api_hash: '', phone: '', proxy: '', code: '', password: '' };
+        },
         async loadSourceStatus() {
           if (this.sourceStatusLoading) return;
           this.sourceStatusLoading = true;
@@ -1238,6 +1345,10 @@
               if (!config_data.source.channelsearch) config_data.source.channelsearch = { enable: true, telegram_channels: ['guoman4K', 'kuakedongman'], qq_channels: ['pd26778899'] };
               if (config_data.source.channelsearch.enable === undefined) config_data.source.channelsearch.enable = true;
               if (config_data.source.channelsearch.auto_discover === undefined) config_data.source.channelsearch.auto_discover = true;
+              if (!config_data.source.telegram) config_data.source.telegram = { enable: false };
+              if (config_data.source.telegram.enable === undefined) config_data.source.telegram.enable = false;
+              if (config_data.source.channelsearch.telegram_folders === undefined) config_data.source.channelsearch.telegram_folders = [];
+              if (Array.isArray(config_data.source.channelsearch.telegram_folders)) config_data.source.channelsearch.telegram_folders = config_data.source.channelsearch.telegram_folders.join('\n');
               for (const key of ['telegram_channels', 'qq_channels']) {
                 if (config_data.source.channelsearch[key] === undefined) config_data.source.channelsearch[key] = key === 'telegram_channels' ? ['guoman4K', 'kuakedongman'] : ['pd26778899'];
                 if (Array.isArray(config_data.source.channelsearch[key])) config_data.source.channelsearch[key] = config_data.source.channelsearch[key].join('\n');

@@ -28,6 +28,7 @@ import os
 import re
 import threading
 import uuid
+from urllib.parse import urlsplit
 
 from run_manager import RunManager, validate_payload
 
@@ -39,6 +40,10 @@ from resource_search import search_resources
 from app.sdk.source_monitor import maintain_sources
 from app.sdk.channel_registry import ChannelRegistry
 from app.sdk.source_health import SourceHealth
+try:
+    from app.sdk.telegram_account import TelegramAccount
+except ImportError:
+    TelegramAccount = None
 
 print(
     r"""
@@ -103,6 +108,7 @@ scheduler = BackgroundScheduler()
 SOURCE_MONITOR_JOB = "source-monitor"
 run_managers = {}
 run_manager_lock = threading.Lock()
+telegram_account_lock = threading.Lock()
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="[%(asctime)s][%(levelname)s] %(message)s",
@@ -159,10 +165,134 @@ def source_status():
         }
         data["registry"]["channels"] = [{key: row.get(key) for key in channel_fields}
                                          for row in registry.get("channels", [])]
+        origins = registry.get("origins", [])
+        data["registry"]["origins"] = []
+        # 一个固定目录和最多三个用户文件夹；不返回邀请地址或内部标识。
+        for row in origins if isinstance(origins, list) else []:
+            if not isinstance(row, dict) or row.get("kind") not in ("directory", "folder"):
+                continue
+            data["registry"]["origins"].append({
+                key: row.get(key) for key in ("kind", "last_checked", "next_check", "reason")})
+            if len(data["registry"]["origins"]) == 4:
+                break
         return jsonify({"success": True, "data": data})
     except (OSError, ValueError, TypeError):
         logging.warning("无法读取渠道巡检状态")
         return jsonify({"success": False, "message": "暂时无法读取渠道状态，请稍后刷新"}), 503
+
+
+def telegram_payload(action):
+    origin = request.headers.get("Origin")
+    if request.headers.get("Sec-Fetch-Site") == "cross-site" or (
+            origin is not None and origin != request.host_url.rstrip("/")):
+        return None, (jsonify(success=False, message="不允许跨站账户操作"), 403)
+    if not request.is_json:
+        return None, (jsonify(success=False, message="账户参数必须是 JSON 对象"), 400)
+    if request.content_length and request.content_length > 8192:
+        return None, (jsonify(success=False, message="账户参数过大"), 413)
+    raw = request.stream.read(8193)
+    if len(raw) > 8192:
+        return None, (jsonify(success=False, message="账户参数过大"), 413)
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeError):
+        payload = None
+    valid = isinstance(payload, dict)
+    if valid and action == "code":
+        valid = (set(payload) <= {"api_id", "api_hash", "phone", "proxy"}
+                 and type(payload.get("api_id")) is int and 0 < payload["api_id"] <= 2147483647
+                 and isinstance(payload.get("api_hash"), str)
+                 and re.fullmatch(r"[0-9a-fA-F]{32}", payload["api_hash"]) is not None
+                 and isinstance(payload.get("phone"), str)
+                 and re.fullmatch(r"\+[1-9][0-9]{6,14}", payload["phone"]) is not None)
+        proxy = payload.get("proxy")
+        if valid and proxy not in (None, ""):
+            try:
+                parsed = urlsplit(proxy) if isinstance(proxy, str) and len(proxy) <= 2048 else None
+                valid = bool(parsed and parsed.scheme in ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+                             and parsed.hostname and parsed.path in ("", "/") and not parsed.query and not parsed.fragment
+                             and (parsed.port is None or 0 < parsed.port <= 65535)
+                             and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in proxy))
+            except ValueError:
+                valid = False
+        if valid and proxy == "":
+            payload["proxy"] = None
+    elif valid and action == "signin":
+        valid = (set(payload) == {"code"} and isinstance(payload["code"], str)
+                 and re.fullmatch(r"[0-9]{5,8}", payload["code"]) is not None) or (
+                     set(payload) == {"password"} and isinstance(payload["password"], str)
+                     and 1 <= len(payload["password"]) <= 1024)
+    elif valid and action == "logout":
+        valid = not payload
+    if not valid:
+        return None, (jsonify(success=False, message="账户参数格式错误，请检查必填项、类型和长度"), 400)
+    return payload, None
+
+
+def telegram_api(action):
+    global config_data
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    payload = {}
+    if action != "status":
+        payload, error = telegram_payload(action)
+        if error:
+            return error
+    try:
+        if TelegramAccount is None:
+            current = Config.read_json(CONFIG_PATH)
+            enabled = str(current.get("source", {}).get("telegram", {}).get("enable", False)).lower() == "true"
+            return jsonify(success=False, message="当前安装未提供 Telegram 账户组件",
+                           data={"available": False, "authorized": False, "state": "unavailable",
+                                 "reason": "当前安装未提供 Telegram 账户组件", "retry_after": 0, "enabled": enabled}), 503
+        with telegram_account_lock:
+            account = TelegramAccount(Config.search_health_path(CONFIG_PATH))
+            methods = {"status": account.status, "code": account.request_code,
+                       "signin": account.sign_in, "logout": account.logout}
+            result = methods[action](**payload)
+            data = {key: result.get(key) for key in ("available", "authorized", "state", "reason", "retry_after")}
+            revision = previous_revision = None
+            enable = True if action == "signin" and result.get("ok", True) and result.get("authorized") is True else (
+                False if action == "logout" and result.get("authorized") is False
+                and (result.get("ok") is True or result.get("state") == "disconnected") else None)
+            with Config.locked(CONFIG_PATH):
+                current = Config.read_json(CONFIG_PATH)
+                if enable is not None:
+                    previous_revision = config_revision(current)
+                    current.setdefault("source", {}).setdefault("telegram", {})["enable"] = enable
+                    Config.write_json(CONFIG_PATH, current)
+                    config_data = current
+                    revision = config_revision(current)
+                data["enabled"] = str(current.get("source", {}).get("telegram", {}).get("enable", False)).lower() == "true"
+            response = {"success": bool(result.get("ok", True)), "data": data}
+            if revision is not None:
+                response["config_revision"] = revision
+                response["previous_config_revision"] = previous_revision
+            return jsonify(response)
+    except Exception:
+        # SDK/网络异常可能携带手机号、代理密码或会话资料，禁止回显原始异常。
+        logging.warning("Telegram 账户操作暂未完成")
+        return jsonify(success=False, message="Telegram 账户操作暂未完成，请稍后重试"), 503
+
+
+@app.route("/api/telegram/status")
+def telegram_status():
+    return telegram_api("status")
+
+
+@app.route("/api/telegram/code", methods=["POST"])
+def telegram_code():
+    return telegram_api("code")
+
+
+@app.route("/api/telegram/signin", methods=["POST"])
+def telegram_signin():
+    return telegram_api("signin")
+
+
+@app.route("/api/telegram/session", methods=["DELETE"])
+def telegram_session():
+    return telegram_api("logout")
 
 
 # 设置icon
@@ -870,9 +1000,11 @@ def init():
         source.setdefault("cloudsaver", {"enable": False, "server": "", "username": "", "password": ""})
         source.setdefault("websearch", {"enable": True})
         source.setdefault("monitor", {"enable": True})
+        source.setdefault("telegram", {}).setdefault("enable", False)
         source.setdefault("channelsearch", {"enable": True, "auto_discover": True,
                                             "telegram_channels": ["guoman4K", "kuakedongman"],
                                             "qq_channels": ["pd26778899"]})
+        source["channelsearch"].setdefault("telegram_folders", [])
         if new_config and os.getenv("PANSOU_SERVER"):
             source["pansou"]["server"] = os.environ["PANSOU_SERVER"]
 

@@ -70,10 +70,21 @@ class BackgroundCalendarTests(unittest.TestCase):
 
     def test_cold_page_is_immediate_and_anime_publishes_before_slow_tv(self):
         started_tv = Event()
+        submitted = []
+        original_submit = discovery.ThreadPoolExecutor.submit
+        def record_submit(executor, function, *args, **kwargs):
+            submitted.append(args[0])
+            return original_submit(executor, function, *args, **kwargs)
+        submit = patch.object(discovery.ThreadPoolExecutor, "submit", new=record_submit)
+        submit.start()
+        self.addCleanup(submit.stop)
         def sources(url, **kwargs):
             if "/schedule" in url:
                 started_tv.set()
                 self.assertTrue(self.release.wait(3))
+            if url == discovery.BILIBILI_CALENDAR:
+                return [{"date_ts": int(datetime(2026, 11, 2, tzinfo=discovery.CHINA_TZ).timestamp()),
+                         "episodes": [{"season_id": 99, "title": "测试国创", "follows": "1万追番"}]}]
             return self.sources(url, **kwargs)
         self.fetch.side_effect = sources
         before = monotonic()
@@ -82,13 +93,17 @@ class BackgroundCalendarTests(unittest.TestCase):
         self.assertTrue(first["refreshing"])
         self.assertFalse(first["stale"])
         self.assertTrue(started_tv.wait(2))
-        self.wait_for(lambda: bool(discovery.get_calendar(background=True)["days"][0]["anime"]))
+        def both_ready():
+            day = discovery.get_calendar(background=True)["days"][0]
+            return bool(day["anime"] and day["donghua"])
+        self.wait_for(both_ready)
+        self.assertFalse(self.release.is_set())
         for _ in range(10):
             snapshot = discovery.get_calendar(background=True)
             self.assertTrue(snapshot["refreshing"])
             self.assertFalse(snapshot["days"][0]["tv"])
-        self.assertEqual(set(call.args[0] for call in self.fetch.call_args_list[:2]),
-                         {"https://api.bgm.tv/calendar", discovery.BILIBILI_CALENDAR})
+        # Submission order is deterministic; worker entry/Mock recording order is not.
+        self.assertEqual(submitted[:2], ["https://api.bgm.tv/calendar", discovery.BILIBILI_CALENDAR])
         self.assertLessEqual(self.fetch.call_count, 4)
         self.assertIsNone(discovery._cache)
 

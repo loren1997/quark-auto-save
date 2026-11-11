@@ -46,7 +46,11 @@
       "enable": true,
       "auto_discover": true,
       "telegram_channels": ["guoman4K", "kuakedongman"],
+      "telegram_folders": [],
       "qq_channels": ["pd26778899"]
+    },
+    "telegram": {
+      "enable": false
     },
     "pansou": {
       "enable": true,

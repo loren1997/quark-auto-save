@@ -601,7 +601,8 @@ class AppIntegrationTests(unittest.TestCase):
             current["source"]["channelsearch"] = {"enable": False, "telegram_channels": ["my_channel"]}
             web.Config.write_json(self.config_path, current)
             web.init()
-        self.assertEqual(self.saved_config()["source"]["channelsearch"], {"enable": False, "telegram_channels": ["my_channel"]})
+        self.assertEqual(self.saved_config()["source"]["channelsearch"],
+                         {"enable": False, "telegram_channels": ["my_channel"], "telegram_folders": []})
 
     def test_download_setting_change_reaches_pending_subscription(self):
         self.config["plugins"] = {"aria2": {"host_port": "192.0.2.1:6800", "secret": "private-rpc", "dir": "/downloads"}}
