@@ -1,10 +1,12 @@
 import contextlib
 import copy
+import base64
 import io
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
 
@@ -34,6 +36,12 @@ class TelegramAppTests(unittest.TestCase):
         self.account.request_code.return_value = self.state("waiting_code")
         self.account.sign_in.return_value = self.state("authorized", authorized=True)
         self.account.logout.return_value = self.state("disconnected")
+        self.qr_id = "0123456789abcdef0123456789abcdef"
+        self.qr_url = "tg://login?token=MockLoginToken0123456789"
+        self.account.request_qr.return_value = self.state(
+            "waiting_qr", ok=True, credentials_saved=True, qr_id=self.qr_id,
+            qr_url=self.qr_url, expires_at=1900000000)
+        self.account.poll_qr.return_value = self.account.request_qr.return_value
         self.manager = self.patch("get_run_manager")
         self.manager.return_value.list.return_value = []
         self.reload = self.patch("reload_tasks")
@@ -61,22 +69,31 @@ class TelegramAppTests(unittest.TestCase):
 
     def test_all_routes_authenticate_before_parsing_or_calling_sdk(self):
         client = web.app.test_client()
-        for path, method in (("status", "get"), ("code", "post"), ("signin", "post"), ("session", "delete")):
+        for path, method in (("status", "get"), ("code", "post"), ("signin", "post"), ("session", "delete"),
+                             ("qr", "post"), ("qr/poll", "post")):
             with self.subTest(path=path):
                 response = getattr(client, method)("/api/telegram/" + path, data="not-json")
                 self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.account_class.assert_not_called()
 
     def test_status_is_read_only_and_returns_only_state_fields(self):
         self.config["source"]["telegram"]["enable"] = True
         web.Config.write_json(self.config_path, self.config)
         self.account.status.return_value = self.state("authorized", authorized=True, api_hash="private-hash",
-                                                    phone="private-phone", session="private-session", code="private-code")
+                                                    phone="private-phone", session="private-session", code="private-code",
+                                                    credentials_saved=True, qr_url=self.qr_url, qr_id=self.qr_id)
         response = self.client.get("/api/telegram/status")
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
         self.assertTrue(response.json["success"])
         self.assertEqual(set(response.json["data"]),
-                         {"available", "authorized", "state", "reason", "retry_after", "enabled"})
+                         {"available", "authorized", "state", "reason", "retry_after", "credentials_saved", "enabled"})
+        self.assertTrue(response.json["data"]["credentials_saved"])
+        self.assertNotIn("qr", response.json)
+        self.assertNotIn(self.qr_id, response.get_data(as_text=True))
+        self.assertNotIn(self.qr_url, response.get_data(as_text=True))
         self.assertTrue(response.json["data"]["enabled"])
         self.assertEqual(self.saved(), self.config)
         self.account.request_code.assert_not_called()
@@ -110,7 +127,8 @@ class TelegramAppTests(unittest.TestCase):
 
     def test_mutations_require_same_origin_json_and_limit_body(self):
         for path, method, payload in (("code", "post", self.credentials), ("signin", "post", {"code": "12345"}),
-                                     ("session", "delete", {})):
+                                     ("session", "delete", {}), ("qr", "post", {}),
+                                     ("qr/poll", "post", {"id": self.qr_id})):
             send = getattr(self.client, method)
             with self.subTest(path=path):
                 self.assertEqual(send("/api/telegram/" + path, data="{}").status_code, 400)
@@ -123,6 +141,103 @@ class TelegramAppTests(unittest.TestCase):
                 self.assertEqual(send("/api/telegram/" + path, data="{broken",
                                       content_type="application/json").status_code, 400)
         self.account_class.assert_not_called()
+
+    def test_qr_requires_optional_paired_credentials_and_poll_requires_nonce(self):
+        invalid = ({"api_id": 12345}, {"api_hash": "a" * 32}, {"api_id": True, "api_hash": "a" * 32},
+                   {"phone": "+15550001111"}, {"qr_url": "https://other.example"}, {"proxy": "file:///tmp/token"},
+                   {"api_id": 12345, "api_hash": "a" * 31}, {"id": self.qr_id})
+        for payload in invalid:
+            self.assertEqual(self.client.post("/api/telegram/qr", json=payload).status_code, 400)
+        for payload in ({}, {"id": "short"}, {"id": 123}, {"id": "a" * 129}, {"id": "x/" + "a" * 32},
+                        {"id": self.qr_id, "api_hash": "a" * 32}, {"qr_id": self.qr_id}):
+            self.assertEqual(self.client.post("/api/telegram/qr/poll", json=payload).status_code, 400)
+        self.account_class.assert_not_called()
+
+    def test_qr_create_reuses_credentials_and_renders_only_local_svg(self):
+        response = self.client.post("/api/telegram/qr", json={})
+        self.assertEqual(response.status_code, 200)
+        self.account.request_qr.assert_called_once_with()
+        self.assertTrue(response.json["success"])
+        self.assertTrue(response.json["data"]["credentials_saved"])
+        qr = response.json["qr"]
+        self.assertEqual(set(qr), {"id", "image", "expires_at"})
+        self.assertEqual(qr["id"], self.qr_id)
+        prefix, encoded = qr["image"].split(",", 1)
+        self.assertEqual(prefix, "data:image/svg+xml;base64")
+        svg = base64.b64decode(encoded)
+        self.assertEqual(ET.fromstring(svg).tag, "{http://www.w3.org/2000/svg}svg")
+        self.assertNotIn(self.qr_url.encode(), svg)
+        self.assertNotIn(self.qr_url, response.get_data(as_text=True))
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(self.saved(), self.config)
+        self.account.request_code.assert_not_called()
+        self.manager.assert_not_called()
+
+    def test_qr_first_credentials_stay_out_of_config_and_poll_can_rotate_image(self):
+        credentials = {key: self.credentials[key] for key in ("api_id", "api_hash")}
+        initial = self.client.post("/api/telegram/qr", json=credentials).json
+        self.account.request_qr.assert_called_once_with(**credentials)
+        self.account.poll_qr.return_value = self.state(
+            "waiting_qr", ok=True, credentials_saved=True, qr_id=self.qr_id,
+            qr_url="tg://login?token=RotatedMockToken0123456789", expires_at=1900000030)
+        polled = self.client.post("/api/telegram/qr/poll", json={"id": self.qr_id})
+        self.account.poll_qr.assert_called_once_with(qr_id=self.qr_id)
+        self.assertEqual(polled.json["qr"]["id"], initial["qr"]["id"])
+        self.assertNotEqual(polled.json["qr"]["image"], initial["qr"]["image"])
+        self.assertEqual(polled.json["qr"]["expires_at"], 1900000030)
+        self.assertNotIn("config_revision", polled.json)
+        self.assertEqual(self.saved(), self.config)
+
+    def test_qr_background_start_returns_nonce_before_token_is_ready(self):
+        self.account.request_qr.return_value = self.state(
+            "waiting_qr", ok=True, credentials_saved=True, qr_id=self.qr_id, qr_url="", expires_at=0)
+        started = self.client.post("/api/telegram/qr", json={})
+        self.assertEqual(started.status_code, 200)
+        self.assertEqual(started.json["qr"], {"id": self.qr_id, "image": "", "expires_at": 0})
+        polled = self.client.post("/api/telegram/qr/poll", json={"id": started.json["qr"]["id"]})
+        self.assertEqual(polled.status_code, 200)
+        self.assertTrue(polled.json["qr"]["image"].startswith("data:image/svg+xml;base64,"))
+        self.assertEqual(self.saved(), self.config)
+
+    def test_qr_poll_authorization_and_already_authorized_create_use_revision_guard(self):
+        for action, payload, operation in (("qr/poll", {"id": self.qr_id}, self.account.poll_qr),
+                                           ("qr", {}, self.account.request_qr)):
+            with self.subTest(action=action):
+                web.Config.write_json(self.config_path, self.config)
+                original_revision = web.config_revision(self.config)
+                operation.return_value = self.state("authorized", authorized=True, ok=True, credentials_saved=True)
+                response = self.client.post("/api/telegram/" + action, json=payload)
+                self.assertTrue(response.json["data"]["enabled"])
+                self.assertEqual(response.json["previous_config_revision"], original_revision)
+                self.assertEqual(response.json["config_revision"], web.config_revision(self.saved()))
+                self.assertNotIn("qr", response.json)
+                self.assertTrue(self.saved()["source"]["telegram"]["enable"])
+        self.manager.assert_not_called()
+
+    def test_qr_poll_password_challenge_and_expired_nonce_never_enable_or_return_new_code(self):
+        for result in (self.state("waiting_password", ok=True),
+                       self.state("waiting_qr", ok=False, reason="二维码已失效")):
+            self.account.poll_qr.return_value = result
+            response = self.client.post("/api/telegram/qr/poll", json={"id": self.qr_id})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json["success"], result["ok"])
+            self.assertEqual(response.json["data"]["state"], result["state"])
+            self.assertNotIn("qr", response.json)
+            self.assertNotIn("config_revision", response.json)
+            self.assertEqual(self.saved(), self.config)
+
+    def test_qr_missing_renderer_or_malformed_sdk_url_is_sanitized(self):
+        with patch.object(web, "qrcode", None):
+            response = self.client.post("/api/telegram/qr", json={})
+            self.assertEqual(response.status_code, 503)
+        self.account_class.assert_not_called()
+        self.account.request_qr.return_value = self.state(
+            "waiting_qr", ok=True, qr_id=self.qr_id, qr_url="https://private-token.example", expires_at=1900000000)
+        with self.assertLogs(level="WARNING") as logs:
+            response = self.client.post("/api/telegram/qr", json={})
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("private-token", response.get_data(as_text=True) + "\n".join(logs.output))
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
 
     def test_request_code_does_not_enable_or_persist_credentials(self):
         payload = {**self.credentials, "proxy": "socks5://proxy-user:proxy-password@192.168.1.2:1080"}
@@ -259,15 +374,17 @@ class TelegramAppTests(unittest.TestCase):
         web.Config.write_json(self.config_path, self.config)
         with patch.object(web.Config, "load_plugins", return_value=({}, {}, {})):
             web.init()
-            self.assertEqual(self.saved()["source"]["telegram"], {"enable": False})
+            self.assertEqual(self.saved()["source"]["telegram"], {"enable": False, "auto_join": False})
             self.assertEqual(self.saved()["source"]["channelsearch"]["telegram_folders"], [])
             self.assertEqual(self.saved()["source"]["channelsearch"]["telegram_channels"], ["custom_channel"])
             saved = self.saved()
             saved["source"]["telegram"]["enable"] = True
+            saved["source"]["telegram"]["auto_join"] = True
             saved["source"]["channelsearch"]["telegram_folders"] = ["keep_this_folder"]
             web.Config.write_json(self.config_path, saved)
             web.init()
         self.assertTrue(self.saved()["source"]["telegram"]["enable"])
+        self.assertTrue(self.saved()["source"]["telegram"]["auto_join"])
         self.assertEqual(self.saved()["source"]["channelsearch"]["telegram_folders"], ["keep_this_folder"])
         self.account_class.assert_not_called()
 

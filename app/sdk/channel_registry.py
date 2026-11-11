@@ -82,6 +82,10 @@ class ChannelRegistry:
             db.execute("CREATE TABLE IF NOT EXISTS channel_origins ("
                        "origin TEXT PRIMARY KEY, names TEXT NOT NULL, last_checked REAL NOT NULL, "
                        "next_check REAL NOT NULL, reason TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS channel_joins ("
+                       "generation TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE, status TEXT NOT NULL, "
+                       "reason TEXT NOT NULL, last_checked REAL NOT NULL, next_check REAL NOT NULL, "
+                       "joined_at REAL NOT NULL, PRIMARY KEY(generation, name))")
             if not db.execute("SELECT 1 FROM channel_origins WHERE origin='directory'").fetchone():
                 names = [row[0] for row in db.execute("SELECT name FROM discovered_channels ORDER BY rowid LIMIT 40")]
                 state = db.execute("SELECT last_checked, next_check, reason FROM channel_discovery WHERE id=1").fetchone()
@@ -151,9 +155,21 @@ class ChannelRegistry:
                 rows = db.execute("SELECT name, status, reason, last_checked, next_check FROM discovered_channels ORDER BY rowid LIMIT ?", (MAX_CHANNELS,)).fetchall()
                 result["channels"] = [dict(zip(("name", "status", "reason", "last_checked", "next_check"), row))
                                       for row in rows if _valid_name(row[0])]
-                result["origins"] = [{"kind": "directory" if row[0] == "directory" else "folder",
+                result["origins"] = [{"kind": row[0] if row[0] in {"directory", "account"} else "folder",
                                       "last_checked": row[1], "next_check": row[2], "reason": row[3]}
                                      for row in db.execute("SELECT origin, last_checked, next_check, reason FROM channel_origins ORDER BY origin")]
+                generation = ""
+                if db.execute("SELECT 1 FROM channel_joins LIMIT 1").fetchone():
+                    from .telegram_account import TelegramAccount
+                    generation = TelegramAccount(self.path).authorization_generation()
+                joins = db.execute("SELECT status, reason, next_check, joined_at FROM channel_joins "
+                                   "WHERE generation=?", (generation,)).fetchall() if generation else []
+                pending = [row for row in joins if row[0] != "joined"]
+                result["joins"] = {"joined_count": sum(row[0] == "joined" for row in joins),
+                                   "recent_join_count": sum(row[3] > max(0, time.time() - 86400) for row in joins),
+                                   "pending_count": len(pending),
+                                   "next_check": min((row[2] for row in pending), default=0),
+                                   "reason": next((row[1] for row in pending if row[1]), "")}
         except (sqlite3.Error, OSError) as error:
             logging.warning("频道状态读取失败 (%s)", type(error).__name__)
             result["discovery_reason"] = "频道状态读取失败"
@@ -240,8 +256,12 @@ class ChannelRegistry:
 
     def _refresh_origins(self, client, folders, account, deadline, now, configured):
         origins = {"directory": DIRECTORY_URL}
+        if account is not None:
+            origins["account"] = ""
         origins.update({"folder:" + hashlib.sha256(url.encode()).hexdigest(): url for url in (folders or [])})
         with self._connect() as db:
+            if account is None:
+                db.execute("DELETE FROM channel_origins WHERE origin='account'")
             if folders is not None:
                 db.execute("DELETE FROM channel_origins WHERE origin NOT IN (" + ",".join("?" for _ in origins) + ")", list(origins))
             db.executemany("INSERT OR IGNORE INTO channel_origins VALUES (?, '[]', 0, 0, '')", [(key,) for key in origins])
@@ -260,7 +280,11 @@ class ChannelRegistry:
                 elif account is None:
                     reason, retry = "未启用 Telegram 账号", 300
                 else:
-                    result = account.read_folder(origins[origin], deadline=deadline)
+                    if origin == "account":
+                        result = account.discover_channels(
+                            seeds=self.active_channels(check_health=False), cursor=int(now // 86400), deadline=deadline)
+                    else:
+                        result = account.read_folder(origins[origin], deadline=deadline)
                     if result.get("ok"):
                         names = [item.get("name") for item in result.get("channels", [])
                                  if isinstance(item, dict) and _valid_name(item.get("name"))][:40]
@@ -273,8 +297,13 @@ class ChannelRegistry:
                     retry = 300
             with self._connect() as db:
                 if names is not None:
+                    if origin == "account":
+                        previous = json.loads(db.execute("SELECT names FROM channel_origins WHERE origin=?", (origin,)).fetchone()[0])
+                        active = {row[0].casefold() for row in db.execute("SELECT name FROM discovered_channels WHERE status='active' LIMIT 6")}
+                        # 保留已验证种子，同时让新发现先进入有限候选池。
+                        names = [name for name in previous if name.casefold() in active] + names + previous
                     unique = {name.casefold(): name for name in names}
-                    db.execute("UPDATE channel_origins SET names=? WHERE origin=?", (json.dumps(list(unique.values())), origin))
+                    db.execute("UPDATE channel_origins SET names=? WHERE origin=?", (json.dumps(list(unique.values())[:40]), origin))
                 db.execute("UPDATE channel_origins SET last_checked=?, next_check=?, reason=? WHERE origin=?",
                            (now, now + retry, reason, origin))
         with self._connect() as db:
@@ -321,6 +350,52 @@ class ChannelRegistry:
         ChannelRegistry._validate_media(result.get("candidates") or [])
         return started
 
+    def _join_verified(self, account, deadline, now):
+        if time.monotonic() >= deadline:
+            return
+        generation = account.authorization_generation()
+        if not isinstance(generation, str) or not generation:
+            return
+        with self._connect() as db:
+            db.commit()  # 表初始化事务先提交，再原子预留本轮加入名额。
+            db.execute("BEGIN IMMEDIATE")
+            recent = db.execute("SELECT COUNT(*) FROM channel_joins WHERE generation=? AND (joined_at>? "
+                                "OR (status='joining' AND next_check>?))", (generation, max(0, now - 86400), now)).fetchone()[0]
+            if recent >= 6:
+                return
+            discovered = {name.casefold() for (encoded,) in db.execute("SELECT names FROM channel_origins")
+                          for name in json.loads(encoded) if _valid_name(name)}
+            rows = db.execute("SELECT c.name, j.status FROM discovered_channels c LEFT JOIN channel_joins j "
+                              "ON j.name=c.name AND j.generation=? "
+                              "WHERE c.status IN ('active','standby') AND c.next_check>? "
+                              "AND (j.name IS NULL OR (j.status<>'joined' AND j.next_check<=?)) "
+                              "ORDER BY CASE WHEN j.status='joining' THEN 0 ELSE 1 END, "
+                              "COALESCE(j.last_checked,0), c.last_checked DESC", (generation, now, now)).fetchall()
+            selected = next((row for row in rows if row[0].casefold() in discovered), None)
+            if selected is None:
+                return
+            name, previous_state = selected
+            db.execute("INSERT OR REPLACE INTO channel_joins VALUES (?, ?, 'joining', '', ?, ?, 0)",
+                       (generation, name, now, now + 300))
+        # 公开消息验证与实际加入各自独立；加入失败不能停用搜索来源。
+        result = account.join_channel(name, deadline=deadline, expected_generation=generation)
+        joined = bool(result.get("ok") and (result.get("joined") or result.get("already_member")))
+        reason = "" if joined else _reason(result.get("error") or "Telegram 账号查询失败")
+        if result.get("code") in {"CHANNEL_APPROVAL_REQUIRED", "CHANNEL_PAID"}:
+            reason = "频道需要审核或付费，未自动加入"
+        elif result.get("code") == "ACCOUNT_CHANGED":
+            reason = "Telegram 账号已切换，等待下轮巡检"
+        retry = max(300, min(int(result.get("retry_after") or 0), 7 * 86400))
+        if result.get("code") in {"CHANNEL_UNAVAILABLE", "CHANNEL_RESTRICTED", "CHANNEL_APPROVAL_REQUIRED", "CHANNEL_PAID"}:
+            retry = max(retry, 86400)
+        with self._connect() as db:
+            db.execute("UPDATE channel_joins SET status=?, reason=?, next_check=?, joined_at=? "
+                       "WHERE generation=? AND name=?",
+                       ("joined" if joined else "joining" if result.get("code") in {"TIMEOUT", "NETWORK_ERROR"} else "cooldown",
+                        reason, 0 if joined else now + retry,
+                        now if joined and (not result.get("already_member") or previous_state == "joining") else 0,
+                        generation, name))
+
     def maintain(self, config):
         sources = config.get("source") or {} if isinstance(config, dict) else {}
         channels = (sources.get("channelsearch") or {}) if isinstance(sources, dict) else {}
@@ -328,11 +403,14 @@ class ChannelRegistry:
                 or str(channels.get("enable", True)).lower() != "true"):
             return self.status()
         discover_enabled = str(channels.get("auto_discover", True)).lower() == "true"
+        telegram = sources.get("telegram") or {}
+        join_enabled = (str(telegram.get("enable", False)).lower() == "true"
+                        and str(telegram.get("auto_join", False)).lower() == "true")
         configured = channels.get("telegram_channels", DEFAULT_TELEGRAM_CHANNELS)
         if isinstance(configured, str):
             configured = re.split(r"[,，\s]+", configured)
         configured = {name.lstrip("@").casefold() for name in configured if isinstance(name, str)} if isinstance(configured, list) else set()
-        if not discover_enabled and not any(row["name"].casefold() in configured and row["status"] == "cooldown"
+        if not discover_enabled and not join_enabled and not any(row["name"].casefold() in configured and row["status"] == "cooldown"
                                            and row["reason"] == "频道不可访问" and row["next_check"] <= time.time()
                                            for row in self.status()["channels"]):
             return self.status()
@@ -390,6 +468,8 @@ class ChannelRegistry:
                         except (SearchError, ValueError, TypeError) as error:
                             self.record_failure(name, error, check_health=account_probe is None,
                                                 retry_after=getattr(error, "retry_after", None))
+            if join_enabled and account_probe is not None:
+                self._join_verified(account_probe, deadline, time.time())
         except (sqlite3.Error, OSError) as error:
             logging.warning("频道自动维护失败 (%s)", type(error).__name__)
         finally:

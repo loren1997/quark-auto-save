@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,11 +23,14 @@ def main():
     output = ROOT / "test-results"
     output.mkdir(exist_ok=True)
     errors, console, calls, writes = [], [], [], []
-    state = {"available": True, "authorized": False, "state": "disconnected", "reason": "", "retry_after": 0}
+    state = {"available": True, "authorized": False, "state": "disconnected", "reason": "",
+             "retry_after": 0, "credentials_saved": False}
     credentials = {"api_id": 456789, "api_hash": "abcdef0123456789abcdef0123456789",
                    "phone": "+15550001111", "proxy": "socks5://smoke-user:smoke-secret@127.0.0.1:1080"}
     password = "smoke-only-two-factor-password"
     folders = "https://t.me/addlist/SmokeFolderOne\nhttps://t.me/addlist/SmokeFolderTwo"
+    qr_control = {"created": 0, "phase": "waiting", "version": 0, "id": ""}
+    qr_secrets = []
 
     class FakeAccount:
         def __init__(self, health_path):
@@ -39,7 +43,7 @@ def main():
         def request_code(self, **payload):
             calls.append(("code", payload))
             assert payload == credentials
-            state.update(state="waiting_code", reason="", authorized=False)
+            state.update(state="waiting_code", reason="", authorized=False, credentials_saved=True)
             return dict(state, ok=True)
 
         def sign_in(self, **payload):
@@ -55,9 +59,39 @@ def main():
                 raise AssertionError("Unexpected mock login input")
             return dict(state, ok=True, session="must-not-leak-session")
 
+        def request_qr(self, **payload):
+            calls.append(("qr", payload))
+            if payload:
+                assert payload == {key: value for key, value in credentials.items() if key != "phone"}
+            else:
+                assert state["credentials_saved"]
+            qr_control["created"] += 1
+            qr_control.update(id=f'{qr_control["created"]:032x}', version=0, phase="waiting")
+            state.update(state="waiting_qr", authorized=False, reason="", credentials_saved=True)
+            return dict(state, ok=True, qr_id=qr_control["id"], qr_url="", expires_at=0)
+
+        def qr_result(self):
+            url = f'tg://login?token=SmokeToken{qr_control["created"]}Version{qr_control["version"]}'
+            qr_secrets.extend([url, qr_control["id"]])
+            return dict(state, ok=True, qr_id=qr_control["id"], qr_url=url, expires_at=time.time() + 30)
+
+        def poll_qr(self, qr_id):
+            calls.append(("qr_poll", {"qr_id": qr_id}))
+            if qr_id != qr_control["id"]:
+                return dict(state, ok=False, reason="二维码已失效（模拟）")
+            if qr_control["phase"] == "expired":
+                state.update(state="reauthorize", reason="二维码已失效，请重新生成（模拟）")
+                return dict(state, ok=False)
+            if qr_control["phase"] == "password":
+                state.update(state="waiting_password", reason="请输入两步验证密码（模拟）")
+                return dict(state, ok=True)
+            qr_control["version"] += 1
+            return self.qr_result()
+
         def logout(self):
             calls.append(("logout", {}))
-            state.update(state="disconnected", authorized=False, reason="本地已注销；远端撤销未确认（模拟）")
+            state.update(state="disconnected", authorized=False, credentials_saved=False,
+                         reason="本地已注销；远端撤销未确认（模拟）")
             return dict(state, ok=False)
 
     def no_network(*args, **kwargs):
@@ -73,6 +107,7 @@ def main():
         config.update(webui={"username": "test", "password": "test-password"}, cookie=["TEST_COOKIE"],
                       crontab="0 8 * * *", tasklist=[], discovery={"savepath": "/cartoon", "auto_download": False})
         config.setdefault("source", {})["telegram"] = {"enable": False}
+        config["source"]["telegram"]["auto_join"] = False
         config["source"].setdefault("channelsearch", {})["telegram_folders"] = []
         web.Config.write_json(web.CONFIG_PATH, config)
         web.config_data = copy.deepcopy(config)
@@ -121,12 +156,69 @@ def main():
                     page.wait_for_function("!app.telegramBusy")
                     return result.value.json()
 
+                # QR is opt-in and local: no credentials or image travel through config,
+                # external image services, or the ordinary status endpoint.
+                assert page.locator("#telegram-start-qr").is_visible()
+                assert not page.locator("#telegram-auto-join").is_checked()
+                for key, value in credentials.items():
+                    if key != "phone":
+                        page.locator("#telegram-" + key.replace("_", "-")).fill(str(value))
+                page.locator("#discovery-savepath").fill("/qr-unsaved")
+                first_qr = action("#telegram-start-qr", "/api/telegram/qr")["qr"]
+                assert first_qr["image"] == "" and first_qr["id"]
+                page.wait_for_function("document.querySelector('#telegram-qr-image')?.naturalWidth > 0")
+                first_image = page.locator("#telegram-qr-image").get_attribute("src")
+                assert first_image.startswith("data:image/svg+xml;base64,")
+                assert page.evaluate("app.telegramLogin.api_hash === '' && app.telegramLogin.proxy === '' && app.telegramLogin.phone === ''")
+                page.wait_for_function("image => app.telegramQr.image !== image", arg=first_image)
+                assert qr_control["created"] == 1, "poll must rotate the image without resending login credentials"
+                qr_secrets.append(page.locator("#telegram-qr-image").get_attribute("src"))
+                page.wait_for_function("!app.telegramBusy")
+                page.locator("a.nav-link").filter(has_text="任务列表").click()
+                polls_away = sum(action == "qr_poll" for action, _ in calls)
+                page.wait_for_timeout(2300)
+                assert sum(action == "qr_poll" for action, _ in calls) == polls_away
+                qr_control["phase"] = "expired"
+                page.locator("a.nav-link").filter(has_text="系统配置").click()
+                page.wait_for_function("app.telegramStatus.state === 'reauthorize' && !app.telegramBusy")
+                assert page.locator("#telegram-qr-image").count() == 0
+                assert "二维码已失效" in section.get_by_role("alert").inner_text()
+                assert page.locator("#telegram-api-id").count() == 0, "saved application credentials should be reused"
+                second_qr = action("#telegram-start-qr", "/api/telegram/qr")["qr"]
+                assert second_qr["id"] != first_qr["id"]
+                assert [payload for action, payload in calls if action == "qr"][-1] == {}
+                stale = page.evaluate("""async id => {
+                    const response = await fetch('/api/telegram/qr/poll', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id})
+                    });
+                    return await response.json();
+                }""", first_qr["id"])
+                assert not stale["success"] and "qr" not in stale
+                assert page.evaluate("app.telegramQr.id") == second_qr["id"]
+                qr_control["phase"] = "password"
+                page.locator("#telegram-password").wait_for(timeout=7000)
+                assert page.locator("#telegram-qr-image").count() == 0
+                polls_before_password = sum(action == "qr_poll" for action, _ in calls)
+                page.wait_for_timeout(2300)
+                assert sum(action == "qr_poll" for action, _ in calls) == polls_before_password
+                page.locator("#telegram-password").fill(password)
+                qr_login = action("#telegram-submit-password", "/api/telegram/signin")
+                assert qr_login["data"]["authorized"] and page.locator("#telegram-account-enabled").is_checked()
+                assert page.locator("#discovery-savepath").input_value() == "/qr-unsaved"
+                assert page.evaluate("app.formData.config_revision") == qr_login["config_revision"]
+                assert page.evaluate("app.telegramLogin.password") == ""
+                action("#telegram-disconnect", "/api/telegram/session")
+                page.locator("#discovery-savepath").fill("/cartoon")
+                page.locator("#telegram-mode-code").click()
+
                 # Login input is independent from application config, even before submission.
                 page.locator("#telegram-folders").fill(folders)
+                page.locator("#telegram-auto-join").check()
                 for key, value in credentials.items():
                     page.locator("#telegram-" + key.replace("_", "-")).fill(str(value))
                 save()
                 assert web.Config.read_json(web.CONFIG_PATH)["source"]["channelsearch"]["telegram_folders"] == folders
+                assert web.Config.read_json(web.CONFIG_PATH)["source"]["telegram"]["auto_join"]
                 page.locator("#discovery-savepath").fill("/edited-before-login")
                 page.locator("#telegram-folders").fill(folders + "\nhttps://t.me/addlist/UnsavedThird")
                 old_revision = page.evaluate("app.formData.config_revision")
@@ -226,11 +318,12 @@ def main():
                 config_posts = [body for path, method, body in writes if path == "/update"]
                 assert len(config_posts) == 4
                 non_account_payloads = json.dumps(config_posts, ensure_ascii=False) + "\n".join(console)
-                for secret in (*credentials.values(), "00000", "12345", password, "must-not-leak-session"):
+                for secret in (*credentials.values(), "00000", "12345", password, "must-not-leak-session", *qr_secrets):
                     assert str(secret) not in non_account_payloads, "account credential escaped its dedicated request"
                 assert not errors, errors
                 browser.close()
-            print("Telegram UI smoke passed: local status only; code/error/2FA/authorized flow; cleared credentials; "
+            print("Telegram UI smoke passed: local status only; local QR/image rotation/expiry/nonce/2FA; no polling away; "
+                  "saved app credential reuse; code/error/2FA/authorized flow; cleared credentials; "
                   "JSON logout and revision; unsaved edits preserved; opt-in toggle and folder save; "
                   "concurrent worker task protected by stale revision; no credentials in /update or console; "
                   "HTTP error state; mobile layout; no JS errors")

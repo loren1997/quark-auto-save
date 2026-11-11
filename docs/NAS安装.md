@@ -2,16 +2,20 @@
 
 本版在原项目基础上维护，保留上游许可证和插件。默认工作方式是：NAS 上运行订阅服务，定时将夸克分享转存到自己的夸克网盘。需要 NAS 本地文件时，可启用已有 Aria2 插件。
 
+V3.12 将 Telegram 连接简化为扫码，并新增账号自动发现频道及可选自动订阅。首次配置 API ID/API Hash 后可以复用，无需每次填手机号和验证码；开启 Telegram 两步验证时仍需密码。
+
 V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再后台更新；定时换源、补集及待查找重试遵守任务运行星期，手动运行单个任务仍立即执行。
 
 ### Telegram 频道文件夹与账号（可选）
 
 1. 到 [Telegram 应用管理](https://my.telegram.org/apps) 创建自己的应用，取得 API ID 和 API Hash。
-2. 在 NAS 的“系统配置 → 资源搜索 → Telegram 账号连接”填写 API ID、API Hash 和带国际区号的手机号，申请登录验证码，再按页面输入验证码和可能要求的两步验证密码。仅在 NAS 管理页面填写这些信息，不要发到问题反馈或聊天中。
-3. 在“Telegram 频道文件夹”粘贴 `https://t.me/addlist/…` 邀请地址并保存，最多 3 个。连接成功后会开启账号搜索；原有匿名来源继续可用。需要代理时可在连接前填写 HTTP(S) 或 SOCKS 代理地址。
+2. 在 NAS 的“系统配置 → 资源搜索 → Telegram 账号连接”首次填写 API ID、API Hash，选择“扫码登录 → 生成登录二维码”。在手机 Telegram 的“设置 → 设备 → 连接桌面设备”扫描并确认；开启两步验证时再填写密码。二维码在 NAS 本地生成，过期自动更新，本次连接最多等待 3 分钟，也可取消或重新生成。已保存应用配置时无需重复填写。验证码登录仍作为备用方式。仅在 NAS 管理页面填写凭据，不要发到问题反馈或聊天中。
+3. 连接成功后开启账号搜索，保留“公开频道索引 → 自动发现”和后台巡检，即可持续从公开频道搜索、相似频道推荐及原目录发现新来源。可选在“Telegram 频道文件夹”粘贴 `https://t.me/addlist/…` 邀请地址并保存，最多 3 个；不填写也能自动发现。需要代理时可在连接前填写 HTTP(S) 或 SOCKS 代理地址。
 4. 后台巡检只读获取文件夹中的公开广播频道，先验证是否包含夸克视频资源，再自动接入搜索。私人频道、群组、被限制或失效频道不会直接进入搜索。查看“渠道状态”可看到名单读取和频道复查进度；导入名单不等于所有频道立即验证完毕，每轮限量检查，已验证频道轮换查询。
 
-Telegram 文件夹公开网页通常不提供完整频道名单，因此此功能需要一次账号登录。读取文件夹不会加入频道，也不会发送消息；搜索仅使用配置或发现的公开频道，不使用收费全网搜索。API ID/API Hash 和登录会话保存在 `config` 内独立私有文件，验证码和两步验证密码不持久化。`config` 备份包含登录权限，请妥善保管。退出连接会清除本地会话；若远端撤销失败，页面会提示，可在 Telegram“设备”中确认撤销。
+若希望账号实际订阅这些频道，勾选“自动订阅发现的夸克频道”并保存。该开关默认关闭，不影响只读搜索；开启后每轮巡检最多加入 1 个、最近 24 小时最多新增 6 个，只处理已验证包含夸克影视链接的公开频道，排除私人群组、受限频道和需要付费或申请审批的入口。已加入不会重复提交，换账号后重新确认加入状态；关闭开关或断开账号后停止新增，不自动退出已加入频道。Telegram 返回频率限制时按要求等待，不保证每个频道都允许加入。
+
+Telegram 文件夹公开网页通常不提供完整频道名单，因此此功能需要一次账号登录。读取名单本身不会加入频道；实际加入需要上述独立开关。搜索仅使用配置或发现的公开频道，不使用收费全网搜索，也不会发送消息。API ID/API Hash 和登录会话保存在 `config` 内独立私有文件，二维码仅在短暂登录期间保存，验证码和两步验证密码不持久化。`config` 备份包含登录权限，请妥善保管。退出连接会清除本地会话；若远端撤销失败，页面会提示，可在 Telegram“设备”中确认撤销。
 
 文件夹名单通常每天刷新；暂时失效频道到期后由后续巡检复查，通过后自动恢复。频率限制会按 Telegram 返回的等待时间暂停，不会通过高频重试规避限制；可用频道也不保证包含所需剧集。
 
@@ -27,7 +31,7 @@ V3.8 可以连续点击多部作品加入订阅队列，依次在后台执行，
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.11 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.11) 中的 `quark-auto-save-nas-docker-v3.11.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.12 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.12) 中的 `quark-auto-save-nas-docker-v3.12.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 
 ```sh
@@ -210,16 +214,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.11：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.12：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.11/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.12/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.11-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.12-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"

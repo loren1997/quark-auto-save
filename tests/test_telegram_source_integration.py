@@ -36,6 +36,7 @@ class TelegramFolderRegistryTests(unittest.TestCase):
         patch("app.sdk.channel_registry.WebSearch", return_value=self.web).start()
         self.account = Mock()
         self.account.status.return_value = {"authorized": True}
+        self.account.discover_channels.return_value = {"ok": True, "channels": []}
         self.account.read_folder.return_value = {"ok": True, "channels": [{"name": "folder_movie"}, {"name": "shared_movie"}]}
         self.account.search.side_effect = lambda query, channels, **kwargs: {"ok": True, "candidates": [candidate(channels[0])]}
         self.account_class = patch("app.sdk.telegram_account.TelegramAccount", return_value=self.account).start()

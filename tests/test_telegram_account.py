@@ -1,5 +1,6 @@
 import asyncio
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import logging
@@ -7,6 +8,7 @@ import os
 from pathlib import Path
 import ssl
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -42,6 +44,13 @@ class Driver:
         self.messages = defaultdict(list)
         self.entities = {}
         self.folder = SimpleNamespace(peers=[types.PeerChannel(1)], chats=[channel()])
+        self.qr_responses = []
+        self.handlers = []
+        self.discovery = SimpleNamespace(chats=[channel()])
+
+    def emit_login(self):
+        for client, handler in list(self.handlers):
+            client.loop.call_soon_threadsafe(lambda h=handler: asyncio.create_task(h(types.UpdateLoginToken())))
 
     def client(self, session, api_id, api_hash, **options):
         self.calls.append(("client", options))
@@ -54,6 +63,7 @@ class Driver:
                 session.auth_key = AuthKey(bytes(range(256)))
 
             async def connect(self):
+                self.loop = asyncio.get_running_loop()
                 driver.calls.append(("connect",))
                 if "connect" in driver.error:
                     raise driver.error["connect"]
@@ -89,8 +99,38 @@ class Driver:
                 driver.calls.append(("request", type(request).__name__))
                 if "request" in driver.error:
                     raise driver.error["request"]
-                assert isinstance(request, functions.chatlists.CheckChatlistInviteRequest)
-                return driver.folder
+                if isinstance(request, functions.chatlists.CheckChatlistInviteRequest):
+                    return driver.folder
+                if isinstance(request, (functions.auth.ExportLoginTokenRequest, functions.auth.ImportLoginTokenRequest)):
+                    value = driver.qr_responses.pop(0) if driver.qr_responses else types.auth.LoginToken(
+                        expires=datetime.now(timezone.utc) + timedelta(seconds=30), token=b"private-qr-token")
+                    if isinstance(value, Exception):
+                        raise value
+                    if callable(value):
+                        return await value()
+                    return value
+                if isinstance(request, functions.contacts.SearchRequest):
+                    driver.calls.append(("discover_query", request.q))
+                    return driver.discovery
+                if isinstance(request, functions.channels.GetChannelRecommendationsRequest):
+                    assert request.channel is not None
+                    return driver.discovery
+                if isinstance(request, functions.channels.JoinChannelRequest):
+                    return SimpleNamespace()
+                raise AssertionError(type(request).__name__)
+
+            def add_event_handler(self, handler, event):
+                driver.handlers.append((self, handler))
+
+            def remove_event_handler(self, handler):
+                driver.handlers[:] = [item for item in driver.handlers if item[1] is not handler]
+
+            async def _switch_dc(self, dc):
+                driver.calls.append(("switch_dc", dc))
+                self.session.set_dc(dc, "149.154.167.51", 443)
+
+            async def _on_login(self, user):
+                driver.calls.append(("on_login",))
 
             async def get_entity(self, name):
                 driver.calls.append(("entity", name))
@@ -121,6 +161,31 @@ class TelegramAccountTests(unittest.TestCase):
         self.account = TelegramAccount(self.path, client_factory=self.driver.client)
         self.api_hash = "a" * 32
         self.phone = "+12345678901"
+        self.addCleanup(self.stop_workers)
+
+    def stop_workers(self):
+        self.account._stop_qr()
+        for thread in threading.enumerate():
+            if thread.name == "telegram-qr-login":
+                thread.join(timeout=3)
+
+    def wait_for(self, predicate, timeout=2):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.01)
+        self.fail("Background mock operation did not complete within its bounded wait")
+
+    def start_qr(self):
+        result = self.account.request_qr(12345, self.api_hash)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["state"], "waiting_qr")
+        return result["qr_id"]
+
+    def qr_success(self):
+        return types.auth.LoginTokenSuccess(authorization=types.auth.Authorization(user=types.User(id=42)))
 
     def pending(self):
         result = self.account.request_code(12345, self.api_hash, self.phone)
@@ -406,6 +471,255 @@ class TelegramAccountTests(unittest.TestCase):
         self.assertEqual(result["code"], "STORAGE_ERROR")
         self.assertNotIn("SECRET", json.dumps(result))
         self.assertEqual(self.driver.calls, [])
+
+    def test_qr_request_is_nonblocking_poll_is_local_and_status_has_no_qr_secrets(self):
+        started = time.monotonic()
+        qr_id = self.start_qr()
+        self.assertLess(time.monotonic() - started, 0.3)
+        result = self.wait_for(lambda: (value if (value := self.account.poll_qr(qr_id)).get("qr_url") else None))
+        self.assertTrue(result["qr_url"].startswith("tg://login?token="))
+        self.assertGreater(result["expires_at"], time.time())
+        before = list(self.driver.calls)
+        for _ in range(5):
+            self.account.poll_qr(qr_id)
+            self.account.status()
+        self.assertEqual(self.driver.calls, before)
+        public = json.dumps(self.account.status())
+        for secret in (qr_id, "qr_url", "qr_id", "private-qr-token", self.api_hash):
+            self.assertNotIn(secret, public)
+        self.assertTrue(self.account.status()["credentials_saved"])
+        self.assertTrue(self.driver.calls[0][1]["receive_updates"])
+        self.assertFalse(any(call[0] == "send_code" for call in self.driver.calls))
+
+    def test_qr_requires_own_app_credentials_and_can_reuse_private_saved_ones(self):
+        self.assertEqual(self.account.request_qr()["code"], "API_CREDENTIALS_REQUIRED")
+        self.assertEqual(self.driver.calls, [])
+        self.account._save({"api_id": 12345, "api_hash": self.api_hash})
+        result = self.account.request_qr()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "waiting_qr")
+        self.assertNotIn(self.api_hash, json.dumps(result))
+
+    def test_qr_update_confirms_login_and_changes_authorization_generation(self):
+        qr_id = self.start_qr()
+        self.wait_for(lambda: self.account.poll_qr(qr_id).get("qr_url"))
+        self.driver.qr_responses.append(self.qr_success())
+        self.driver.emit_login()
+        result = self.wait_for(lambda: (value if (value := self.account.poll_qr(qr_id)).get("authorized") else None))
+        self.assertNotIn("qr_url", result)
+        self.assertNotIn("qr_id", self.account.status())
+        generation = self.account.authorization_generation()
+        self.assertRegex(generation, r"^[a-f0-9]{32}$")
+        self.assertEqual(TelegramAccount(self.path).authorization_generation(), generation)
+        self.assertNotIn(generation, json.dumps(self.account.status()))
+        stored = json.loads(self.account.path.read_text())
+        self.assertFalse({"qr_url", "qr_id", "qr_owner", "qr_expires"} & stored.keys())
+
+    def test_qr_dc_migration_imports_before_publishing_authorized(self):
+        self.driver.qr_responses = [types.auth.LoginTokenMigrateTo(dc_id=4, token=b"private-migration-token"), self.qr_success()]
+        qr_id = self.start_qr()
+        self.wait_for(lambda: self.account.poll_qr(qr_id).get("authorized"))
+        calls = [call for call in self.driver.calls if call[0] in {"request", "switch_dc", "on_login"}]
+        self.assertEqual(calls, [("request", "ExportLoginTokenRequest"), ("switch_dc", 4),
+                                 ("request", "ImportLoginTokenRequest"), ("on_login",)])
+        self.assertEqual(StringSession(json.loads(self.account.path.read_text())["session"]).dc_id, 4)
+
+    def test_qr_two_factor_releases_worker_and_uses_existing_password_flow(self):
+        self.driver.qr_responses = [rpc_error("SessionPasswordNeededError")]
+        qr_id = self.start_qr()
+        self.wait_for(lambda: self.account.poll_qr(qr_id).get("state") == "waiting_password")
+        self.wait_for(lambda: not self.driver.handlers)
+        result = self.account.sign_in(password="private-qr-password")
+        self.assertTrue(result["authorized"], result)
+        self.assertNotIn("private-qr-password", self.account.path.read_text())
+        self.assertNotIn("phone_code_hash", self.account.path.read_text())
+        self.assertFalse(any(call[0] == "send_code" for call in self.driver.calls))
+
+    def test_old_code_submission_during_qr_wait_does_not_connect_or_block_confirmation(self):
+        qr_id = self.start_qr()
+        self.wait_for(lambda: self.account.poll_qr(qr_id).get("qr_url"))
+        self.driver.error["connect_wait"] = 1.2
+        before = sum(call[0] == "connect" for call in self.driver.calls)
+        started = time.monotonic()
+        result = self.account.sign_in(code="12345")
+        self.assertEqual(result["code"], "AUTH_REQUIRED")
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(sum(call[0] == "connect" for call in self.driver.calls), before)
+        self.driver.qr_responses.append(self.qr_success())
+        self.driver.emit_login()
+        self.wait_for(lambda: self.account.poll_qr(qr_id).get("authorized"))
+        self.assertFalse(any(call[0] == "log_out" for call in self.driver.calls))
+
+    def test_qr_expiry_refreshes_token_within_same_bounded_flow(self):
+        self.driver.qr_responses = [types.auth.LoginToken(expires=datetime.now(timezone.utc) + timedelta(seconds=0.08), token=b"first-token"),
+                                    types.auth.LoginToken(expires=datetime.now(timezone.utc) + timedelta(seconds=30), token=b"second-token")]
+        qr_id = self.start_qr()
+        result = self.wait_for(lambda: (value if "c2Vjb25kLXRva2Vu" in (value := self.account.poll_qr(qr_id)).get("qr_url", "") else None))
+        self.assertEqual(result["qr_id"], qr_id)
+        self.assertEqual(sum(call == ("request", "ExportLoginTokenRequest") for call in self.driver.calls), 2)
+
+    def test_qr_flow_timeout_removes_token_but_retains_only_reusable_app_credentials(self):
+        with patch("app.sdk.telegram_account.QR_TTL", 0.08):
+            qr_id = self.start_qr()
+        result = self.wait_for(lambda: (value if (value := self.account.poll_qr(qr_id)).get("code") == "QR_EXPIRED" else None))
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["credentials_saved"])
+        self.wait_for(lambda: not self.driver.handlers)
+        data = json.loads(self.account.path.read_text())
+        self.assertFalse({"session", "qr_url", "qr_id", "qr_owner", "qr_expires"} & data.keys())
+
+    def test_qr_flood_wait_is_persistent_and_does_not_automatically_send_sms(self):
+        self.driver.qr_responses = [rpc_error("FloodWaitError", 120)]
+        qr_id = self.start_qr()
+        result = self.wait_for(lambda: (value if (value := self.account.poll_qr(qr_id)).get("code") == "FLOOD_WAIT" else None))
+        self.assertEqual(result["retry_after"], 120)
+        before = list(self.driver.calls)
+        self.assertEqual(self.account.request_qr()["code"], "FLOOD_WAIT")
+        self.assertEqual(self.driver.calls, before)
+        self.assertFalse(any(call[0] == "send_code" for call in self.driver.calls))
+
+    def test_old_qr_poll_cannot_read_new_qr_and_old_worker_cannot_resurrect_after_logout(self):
+        first = self.start_qr()
+        self.wait_for(lambda: self.account.poll_qr(first).get("qr_url"))
+        second = self.account.request_qr()["qr_id"]
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.account.poll_qr(first)["code"], "QR_EXPIRED")
+        self.wait_for(lambda: self.account.poll_qr(second).get("qr_url"))
+        result = self.account.logout()
+        self.assertTrue(result["ok"])
+        self.stop_workers()
+        self.assertEqual(json.loads(self.account.path.read_text()), {})
+        self.assertFalse(self.account.status()["authorized"])
+        self.assertEqual(self.account.poll_qr(second)["code"], "QR_EXPIRED")
+
+    def test_sms_login_replaces_qr_flow_without_old_worker_restoring_it(self):
+        qr_id = self.start_qr()
+        self.wait_for(lambda: self.account.poll_qr(qr_id).get("qr_url"))
+        result = self.pending()
+        self.stop_workers()
+        self.assertEqual(result["state"], "waiting_code")
+        self.assertEqual(self.account.status()["state"], "waiting_code")
+        self.assertNotIn("qr_id", json.loads(self.account.path.read_text()))
+
+    def test_late_qr_success_after_logout_is_revoked_and_cannot_restore_session(self):
+        entered, release = threading.Event(), threading.Event()
+        async def late_response():
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return self.qr_success()
+        self.driver.qr_responses = [late_response]
+        self.start_qr()
+        self.assertTrue(entered.wait(2))
+        result = self.account.logout()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "LOGOUT_UNCONFIRMED")
+        release.set()
+        self.stop_workers()
+        self.assertEqual(json.loads(self.account.path.read_text()), {})
+        self.assertFalse(any(call[0] == "on_login" for call in self.driver.calls))
+        self.assertTrue(any(call[0] == "log_out" for call in self.driver.calls))
+
+    def test_late_qr_success_after_replacement_cannot_overwrite_new_nonce(self):
+        entered, release = threading.Event(), threading.Event()
+        async def late_response():
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return self.qr_success()
+        self.driver.qr_responses = [late_response]
+        first = self.start_qr()
+        self.assertTrue(entered.wait(2))
+        second = self.account.request_qr()["qr_id"]
+        release.set()
+        self.wait_for(lambda: self.account.poll_qr(second).get("qr_url"))
+        self.wait_for(lambda: any(call[0] == "log_out" for call in self.driver.calls))
+        self.assertEqual(json.loads(self.account.path.read_text())["qr_id"], second)
+        self.assertFalse(self.account.status()["authorized"])
+        self.assertEqual(self.account.poll_qr(first)["code"], "QR_EXPIRED")
+
+    def test_orphaned_qr_owner_expires_without_network_and_never_waits_forever(self):
+        qr_id = "a" * 32
+        self.account._save({"api_id": 1, "api_hash": self.api_hash, "state": "waiting_qr", "qr_id": qr_id,
+                            "qr_owner": 999999, "qr_url": "tg://login?token=PRIVATE", "qr_heartbeat": time.time() - 46,
+                            "expires": time.time() + 180, "qr_expires": time.time() + 30})
+        self.assertEqual(self.account.status()["state"], "disconnected")
+        result = self.account.poll_qr(qr_id)
+        self.assertEqual(result["code"], "QR_EXPIRED")
+        self.assertNotIn("qr_url", self.account.path.read_text())
+        self.assertEqual(self.driver.calls, [])
+
+    def test_account_discovery_is_public_only_bounded_and_keyword_rotation_is_explicit(self):
+        self.authorized()
+        self.driver.discovery = SimpleNamespace(chats=[channel(), channel(None), channel("PrivateGroup", broadcast=False),
+                                                       channel("ScamSource", scam=True)], users=[types.User(id=99)])
+        for cursor, query in enumerate(("quark", "kuake", "夸克网盘", "影视资源", "动漫资源")):
+            self.driver.calls.clear()
+            result = self.account.discover_channels(cursor=cursor)
+            self.assertEqual(result["channels"], [{"name": "FilmChannel", "title": "影视资源"}])
+            self.assertIn(("discover_query", query), self.driver.calls)
+            self.assertEqual(sum(call[0] == "request" for call in self.driver.calls), 1)
+        self.driver.calls.clear()
+        result = self.account.discover_channels(["FilmChannel"], cursor=5)
+        self.assertTrue(result["ok"])
+        self.assertIn(("entity", "FilmChannel"), self.driver.calls)
+        self.assertIn(("request", "GetChannelRecommendationsRequest"), self.driver.calls)
+        self.assertFalse(any(call == ("request", "JoinChannelRequest") for call in self.driver.calls))
+
+    def test_join_is_explicit_public_only_and_existing_members_are_idempotent(self):
+        self.authorized()
+        self.driver.entities["FilmChannel"] = channel(left=True)
+        result = self.account.join_channel("FilmChannel")
+        self.assertTrue(result["joined"])
+        self.assertFalse(result["already_member"])
+        self.assertIn(("request", "JoinChannelRequest"), self.driver.calls)
+        self.driver.calls.clear()
+        self.driver.entities["FilmChannel"] = channel(left=False)
+        result = self.account.join_channel("FilmChannel")
+        self.assertTrue(result["already_member"])
+        self.assertFalse(any(call[0] == "request" for call in self.driver.calls))
+
+    def test_join_skips_restricted_approval_paid_and_private_targets(self):
+        self.authorized()
+        for entity, code in ((channel(left=True, join_request=True), "CHANNEL_APPROVAL_REQUIRED"),
+                             (channel(left=True, subscription_until_date=datetime.now(timezone.utc)), "CHANNEL_PAID"),
+                             (channel(left=True, scam=True), "CHANNEL_RESTRICTED"),
+                             (channel(None, left=True), "CHANNEL_UNAVAILABLE")):
+            self.driver.entities["FilmChannel"] = entity
+            self.driver.calls.clear()
+            self.assertEqual(self.account.join_channel("FilmChannel")["code"], code)
+            self.assertFalse(any(call[0] == "request" for call in self.driver.calls))
+
+    def test_join_flood_wait_blocks_account_until_server_deadline(self):
+        self.authorized()
+        self.driver.entities["FilmChannel"] = channel(left=True)
+        self.driver.error["request"] = rpc_error("FloodWaitError", 240)
+        result = self.account.join_channel("FilmChannel")
+        self.assertEqual(result["code"], "FLOOD_WAIT")
+        self.assertEqual(result["retry_after"], 240)
+        self.assertEqual(self.account.status()["retry_after"], 240)
+
+    def test_join_rejects_changed_account_before_resolving_or_joining_channel(self):
+        self.authorized()
+        old_generation = self.account.authorization_generation()
+        self.account.logout()
+        self.authorized()
+        self.driver.entities["FilmChannel"] = channel(left=True)
+        result = self.account.join_channel("FilmChannel", expected_generation=old_generation)
+        self.assertEqual(result["code"], "ACCOUNT_CHANGED")
+        self.assertFalse(any(call[0] in {"entity", "request"} for call in self.driver.calls))
+        self.driver.calls.clear()
+        result = self.account.join_channel("FilmChannel", expected_generation=self.account.authorization_generation())
+        self.assertTrue(result["joined"])
+
+    def test_authorization_generation_changes_only_on_new_authorization(self):
+        self.authorized()
+        first = self.account.authorization_generation()
+        self.assertEqual(self.account.authorization_generation(), first)
+        self.account.logout()
+        self.assertEqual(self.account.authorization_generation(), "")
+        self.authorized()
+        self.assertNotEqual(self.account.authorization_generation(), first)
 
     def test_logout_clears_corrupt_private_storage_and_bad_session(self):
         self.account.path.write_text("{broken SECRET SESSION", encoding="utf-8")

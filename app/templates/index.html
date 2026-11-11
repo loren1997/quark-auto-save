@@ -415,7 +415,9 @@
             <div class="form-group row ml-3" aria-label="Telegram 账号连接">
               <label class="col-sm-2 col-form-label" for="telegram-account-enabled">Telegram 账号</label>
               <div class="col-sm-10">
-                <label><input id="telegram-account-enabled" type="checkbox" v-model="formData.source.telegram.enable"> 启用账号搜索与文件夹发现</label>
+                <label><input id="telegram-account-enabled" type="checkbox" v-model="formData.source.telegram.enable"> 启用账号搜索与频道自动发现</label>
+                <label class="d-block"><input id="telegram-auto-join" type="checkbox" v-model="formData.source.telegram.auto_join"> 自动订阅发现的夸克频道（会改变 Telegram 账号的频道订阅）</label>
+                <small class="text-muted d-block mb-2">保存后生效。仅加入已验证含夸克影视链接的公开频道，每轮最多 1 个、每天最多 6 个；遇到限流自动暂停。关闭后停止新增，已订阅频道保留。</small>
                 <div class="mb-2">
                   <button id="telegram-status" type="button" class="btn btn-outline-secondary btn-sm" @click="loadTelegramStatus" :disabled="telegramBusy">查看连接状态</button>
                   <span v-if="telegramStatus" class="ml-2 small" role="status">{{ telegramStateLabel(telegramStatus.state) }}</span>
@@ -423,17 +425,36 @@
                 <p v-if="telegramStatus && telegramStatus.reason" class="small text-muted" role="status">{{ telegramStatus.reason }}<span v-if="telegramStatus.retry_after > 0">；约 {{ Math.ceil(telegramStatus.retry_after) }} 秒后重试</span></p>
                 <div v-if="telegramError" class="alert alert-warning" role="alert">{{ telegramError }}</div>
                 <template v-if="!telegramStatus || !telegramStatus.authorized">
-                  <div v-if="!telegramStatus || !['waiting_code', 'waiting_password'].includes(telegramStatus.state)">
-                    <small class="text-muted d-block mb-2">在 <a href="https://my.telegram.org/apps" target="_blank" rel="noopener noreferrer">Telegram 官方应用管理</a> 获取用户账号 API ID / API Hash。首次连接需输入 Telegram 登录验证码，开启两步验证的账号还需输入密码。</small>
+                  <div v-if="!telegramStatus || !['waiting_qr', 'waiting_code', 'waiting_password'].includes(telegramStatus.state)">
+                    <div class="btn-group mb-2" role="group" aria-label="Telegram 登录方式">
+                      <button id="telegram-mode-qr" type="button" class="btn btn-outline-primary" :class="{active: telegramLoginMode === 'qr'}" @click="telegramLoginMode = 'qr'" :disabled="telegramBusy">扫码登录</button>
+                      <button id="telegram-mode-code" type="button" class="btn btn-outline-primary" :class="{active: telegramLoginMode === 'code'}" @click="telegramLoginMode = 'code'" :disabled="telegramBusy">验证码登录</button>
+                    </div>
+                    <p v-if="telegramStatus && telegramStatus.credentials_saved && telegramLoginMode === 'qr'" class="small mb-2">已保存应用配置，可直接生成二维码。<button id="telegram-edit-credentials" type="button" class="btn btn-link btn-sm" @click="telegramEditCredentials = !telegramEditCredentials">{{ telegramEditCredentials ? '使用已保存配置' : '修改应用配置' }}</button></p>
+                    <div v-if="!telegramStatus || !telegramStatus.credentials_saved || telegramEditCredentials || telegramLoginMode === 'code'">
+                    <small class="text-muted d-block mb-2">首次在 <a href="https://my.telegram.org/apps" target="_blank" rel="noopener noreferrer">Telegram 官方应用管理</a> 获取 API ID / API Hash。扫码也需要应用配置，保存后无需反复填写。</small>
                     <label class="d-block" for="telegram-api-id">API ID</label>
                     <input id="telegram-api-id" class="form-control mb-2" inputmode="numeric" maxlength="12" v-model="telegramLogin.api_id" autocomplete="off">
                     <label class="d-block" for="telegram-api-hash">API Hash</label>
                     <input id="telegram-api-hash" type="password" class="form-control mb-2" maxlength="64" v-model="telegramLogin.api_hash" autocomplete="new-password">
-                    <label class="d-block" for="telegram-phone">手机号（含国家区号）</label>
-                    <input id="telegram-phone" type="tel" class="form-control mb-2" maxlength="24" v-model="telegramLogin.phone" placeholder="+86…" autocomplete="off">
                     <label class="d-block" for="telegram-proxy">连接代理（可选）</label>
                     <input id="telegram-proxy" type="password" class="form-control mb-2" maxlength="2048" v-model="telegramLogin.proxy" placeholder="http://… 或 socks5://…" autocomplete="new-password">
-                    <button id="telegram-send-code" type="button" class="btn btn-outline-primary" @click="requestTelegramCode" :disabled="telegramBusy">发送登录验证码</button>
+                    </div>
+                    <template v-if="telegramLoginMode === 'code'">
+                      <label class="d-block" for="telegram-phone">手机号（含国家区号）</label>
+                      <input id="telegram-phone" type="tel" class="form-control mb-2" maxlength="24" v-model="telegramLogin.phone" placeholder="+86…" autocomplete="off">
+                      <button id="telegram-send-code" type="button" class="btn btn-outline-primary" @click="requestTelegramCode" :disabled="telegramBusy">发送登录验证码</button>
+                    </template>
+                    <button v-else id="telegram-start-qr" type="button" class="btn btn-primary" @click="requestTelegramQr" :disabled="telegramBusy">生成登录二维码</button>
+                  </div>
+                  <div v-if="telegramStatus && telegramStatus.state === 'waiting_qr'" class="mb-2">
+                    <template v-if="telegramQr">
+                      <img v-if="telegramQr.image" id="telegram-qr-image" :src="telegramQr.image" alt="Telegram 登录二维码，请用手机 Telegram 扫描并确认" width="256" height="256" class="d-block mb-2" style="max-width:100%;height:auto;background:white">
+                      <p v-else class="small" role="status">正在连接 Telegram 并生成二维码…</p>
+                      <p class="small">在手机 Telegram 打开“设置 → 设备 → 连接桌面设备”扫码确认；二维码过期会自动更新。本次登录最多等待 3 分钟。</p>
+                      <p class="small text-muted" v-if="telegramQr.expires_at">当前二维码有效至 {{ formatSourceTime(telegramQr.expires_at) }}</p>
+                    </template>
+                    <button v-else id="telegram-restart-qr" type="button" class="btn btn-primary" @click="requestTelegramQr" :disabled="telegramBusy">重新生成登录二维码</button>
                   </div>
                   <div v-if="telegramStatus && telegramStatus.state === 'waiting_code'">
                     <label class="d-block" for="telegram-code">Telegram 登录验证码</label>
@@ -446,8 +467,8 @@
                     <button id="telegram-submit-password" type="button" class="btn btn-primary" @click="signInTelegram(true)" :disabled="telegramBusy">验证并连接</button>
                   </div>
                 </template>
-                <button v-if="telegramStatus && (telegramStatus.authorized || formData.source.telegram.enable || ['waiting_code', 'waiting_password'].includes(telegramStatus.state))" id="telegram-disconnect" type="button" class="btn btn-outline-secondary mt-2" @click="disconnectTelegram" :disabled="telegramBusy">{{ telegramStatus.authorized || formData.source.telegram.enable ? '断开账号' : '取消登录' }}</button>
-                <small class="text-muted d-block mt-2">账号仅用于读取公开频道与文件夹。会话单独保存在 NAS 配置目录；验证码和两步验证密码不保存。不会加入频道、发送消息或使用付费全网搜索。</small>
+                <button v-if="telegramStatus && (telegramStatus.authorized || formData.source.telegram.enable || ['waiting_qr', 'waiting_code', 'waiting_password'].includes(telegramStatus.state))" id="telegram-disconnect" type="button" class="btn btn-outline-secondary mt-2" @click="disconnectTelegram" :disabled="telegramBusy">{{ telegramStatus.authorized || formData.source.telegram.enable ? '断开账号' : '取消登录' }}</button>
+                <small class="text-muted d-block mt-2">会话单独保存在 NAS 配置目录；二维码、验证码和两步验证密码不会写入普通配置或运行日志。只有开启并保存自动订阅开关后才会加入频道，不发送消息或使用付费全网搜索。</small>
               </div>
             </div>
             <div class="form-group row ml-3">
@@ -465,9 +486,10 @@
                       <caption class="small">频道名单来源。文件夹需先连接 Telegram 账号；此处不显示邀请地址。</caption>
                       <thead><tr><th>来源</th><th>上次读取</th><th>下次检查</th><th>状态</th></tr></thead>
                       <tbody>
-                        <tr v-for="(origin, index) in sourceStatus.registry.origins" :key="index"><td>{{ origin.kind === 'folder' ? 'Telegram 频道文件夹' : '公开频道目录' }}</td><td>{{ formatSourceTime(origin.last_checked) }}</td><td>{{ formatSourceTime(origin.next_check) }}</td><td>{{ origin.reason || (origin.last_checked ? '已读取' : '等待读取') }}</td></tr>
+                        <tr v-for="(origin, index) in sourceStatus.registry.origins" :key="index"><td>{{ origin.kind === 'folder' ? 'Telegram 频道文件夹' : origin.kind === 'account' ? 'Telegram 账号自动发现' : '公开频道目录' }}</td><td>{{ formatSourceTime(origin.last_checked) }}</td><td>{{ formatSourceTime(origin.next_check) }}</td><td>{{ origin.reason || (origin.last_checked ? '已读取' : '等待读取') }}</td></tr>
                       </tbody>
                     </table>
+                    <p v-if="sourceStatus.registry.joins" class="small">账号频道订阅：已确认加入 {{ sourceStatus.registry.joins.joined_count }} 个，最近 24 小时新增 {{ sourceStatus.registry.joins.recent_join_count }} 个，待处理 {{ sourceStatus.registry.joins.pending_count }} 个。{{ sourceStatus.registry.joins.reason || '' }}<span v-if="sourceStatus.registry.joins.next_check">；下次检查 {{ formatSourceTime(sourceStatus.registry.joins.next_check) }}</span></p>
                     <table class="table table-sm table-bordered mb-2">
                       <caption class="small">已记录故障来源。没有记录不代表所有来源均可用；到期后在下一轮巡检复查。</caption>
                       <thead><tr><th>来源</th><th>状态</th><th>原因</th><th>复查时间</th></tr></thead>
@@ -911,7 +933,7 @@
             websearch: { enable: true },
             monitor: { enable: true },
             channelsearch: { enable: true, auto_discover: true, telegram_channels: 'guoman4K,kuakedongman', telegram_folders: '', qq_channels: 'pd26778899' },
-            telegram: { enable: false },
+            telegram: { enable: false, auto_join: false },
             net: {
               enable: ""
             },
@@ -933,6 +955,10 @@
         telegramStatus: null,
         telegramBusy: false,
         telegramError: '',
+        telegramLoginMode: 'qr',
+        telegramEditCredentials: false,
+        telegramQr: null,
+        telegramQrNextPoll: 0,
         telegramLogin: { api_id: '', api_hash: '', phone: '', proxy: '', code: '', password: '' },
         calendar: { days: [], warnings: [], notes: [], refreshing: false, stale: false },
         discoveryLoading: false,
@@ -1038,6 +1064,7 @@
           if (!document.hidden) {
             this.refreshRuns();
             if (this.activeTab === 'discovery' && this.calendar.refreshing) this.loadDiscovery();
+            if (this.activeTab === 'config' && this.telegramQr && this.telegramStatus?.state === 'waiting_qr' && Date.now() >= this.telegramQrNextPoll) this.pollTelegramQr();
           }
         }, 2000);
         this.checkNewVersion();
@@ -1056,7 +1083,7 @@
       },
       methods: {
         telegramStateLabel(state) {
-          return { disconnected: '未连接', waiting_code: '等待登录验证码', waiting_password: '等待两步验证密码', authorized: '已连接', reauthorize: '需要重新登录', suspended: '账号暂不可用', unavailable: '连接组件不可用' }[state] || '待检查';
+          return { disconnected: '未连接', waiting_qr: '等待手机扫码确认', waiting_code: '等待登录验证码', waiting_password: '等待两步验证密码', authorized: '已连接', reauthorize: '需要重新登录', suspended: '账号暂不可用', unavailable: '连接组件不可用' }[state] || '待检查';
         },
         async telegramRequest(method, url, data, syncEnabled = false) {
           if (this.telegramBusy) return;
@@ -1066,6 +1093,9 @@
             const response = await axios({ method, url, data });
             const result = response.data;
             if (result.data) this.telegramStatus = result.data;
+            if (result.qr && result.data?.state === 'waiting_qr') this.telegramQr = result.qr;
+            if (result.data && result.data.state !== 'waiting_qr') this.telegramQr = null;
+            if (!result.success && url.startsWith('/api/telegram/qr')) this.telegramQr = null;
             if (result.config_revision) {
               if (result.previous_config_revision === this.formData.config_revision) {
                 this.formData.config_revision = result.config_revision;
@@ -1077,13 +1107,34 @@
             if (!result.success) this.telegramError = [this.telegramError, result.data?.reason || result.message || 'Telegram 操作未完成'].filter(Boolean).join(' ');
           } catch (error) {
             if (error.response?.data?.data) this.telegramStatus = error.response.data.data;
+            if (this.telegramStatus?.state !== 'waiting_qr') this.telegramQr = null;
             this.telegramError = error.response?.data?.message || 'Telegram 连接暂不可用，请稍后重试';
+            this.telegramQrNextPoll = Date.now() + 10000;
           } finally {
             this.telegramBusy = false;
           }
         },
         loadTelegramStatus() {
           return this.telegramRequest('get', '/api/telegram/status');
+        },
+        async requestTelegramQr() {
+          const saved = this.telegramStatus?.credentials_saved && !this.telegramEditCredentials;
+          const data = saved ? {} : { api_id: Number(this.telegramLogin.api_id), api_hash: this.telegramLogin.api_hash.trim(), proxy: this.telegramLogin.proxy.trim() || null };
+          this.telegramQr = null;
+          this.telegramQrNextPoll = Date.now() + 2000;
+          try {
+            await this.telegramRequest('post', '/api/telegram/qr', data, true);
+          } finally {
+            this.telegramLogin.api_hash = '';
+            this.telegramLogin.proxy = '';
+            this.telegramLogin.phone = '';
+          }
+        },
+        async pollTelegramQr() {
+          if (!this.telegramQr || this.telegramBusy) return;
+          const id = this.telegramQr.id;
+          this.telegramQrNextPoll = Date.now() + 2000;
+          await this.telegramRequest('post', '/api/telegram/qr/poll', { id }, true);
         },
         async requestTelegramCode() {
           const data = { api_id: Number(this.telegramLogin.api_id), api_hash: this.telegramLogin.api_hash.trim(), phone: this.telegramLogin.phone.trim(), proxy: this.telegramLogin.proxy.trim() || null };
@@ -1105,6 +1156,7 @@
           }
         },
         async disconnectTelegram() {
+          this.telegramQr = null;
           await this.telegramRequest('delete', '/api/telegram/session', {}, true);
           this.telegramLogin = { api_id: '', api_hash: '', phone: '', proxy: '', code: '', password: '' };
         },
@@ -1345,8 +1397,9 @@
               if (!config_data.source.channelsearch) config_data.source.channelsearch = { enable: true, telegram_channels: ['guoman4K', 'kuakedongman'], qq_channels: ['pd26778899'] };
               if (config_data.source.channelsearch.enable === undefined) config_data.source.channelsearch.enable = true;
               if (config_data.source.channelsearch.auto_discover === undefined) config_data.source.channelsearch.auto_discover = true;
-              if (!config_data.source.telegram) config_data.source.telegram = { enable: false };
+              if (!config_data.source.telegram) config_data.source.telegram = { enable: false, auto_join: false };
               if (config_data.source.telegram.enable === undefined) config_data.source.telegram.enable = false;
+              if (config_data.source.telegram.auto_join === undefined) config_data.source.telegram.auto_join = false;
               if (config_data.source.channelsearch.telegram_folders === undefined) config_data.source.channelsearch.telegram_folders = [];
               if (Array.isArray(config_data.source.channelsearch.telegram_folders)) config_data.source.channelsearch.telegram_folders = config_data.source.channelsearch.telegram_folders.join('\n');
               for (const key of ['telegram_channels', 'qq_channels']) {

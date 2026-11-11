@@ -6,3 +6,4 @@ natsort
 opencc-python-reimplemented==0.1.7
 Telethon==1.45.0
 python-socks[asyncio]==3.2.1
+qrcode==8.2

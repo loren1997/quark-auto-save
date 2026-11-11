@@ -106,16 +106,18 @@ class SourceMonitorAppTests(unittest.TestCase):
         registry = self.patch("ChannelRegistry")
         directory = {"kind": "directory", "last_checked": 1, "next_check": 2, "reason": ""}
         folder = {"kind": "folder", "last_checked": 3, "next_check": 4, "reason": "需要连接 Telegram 账号"}
+        account = {"kind": "account", "last_checked": 5, "next_check": 6, "reason": ""}
         registry.return_value.status.return_value = {
             "last_discovery": 10, "next_discovery": 20, "discovery_reason": "", "channels": [],
             "origins": [None, "private-title", {"kind": "private-kind", "reason": "private-secret"},
                         {**directory, "url": "private-directory-url", "secret": "private-secret"},
                         *[{**folder, "url": "private-folder-url", "slug": "private-slug",
-                           "origin": "private-hash", "phone": "private-phone"} for _ in range(8)]],
+                           "origin": "private-hash", "phone": "private-phone"} for _ in range(3)],
+                        {**account, "session": "private-session"}, *[folder for _ in range(8)]],
         }
         response = self.client.get("/source_status")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json["data"]["registry"]["origins"], [directory, folder, folder, folder])
+        self.assertEqual(response.json["data"]["registry"]["origins"], [directory, folder, folder, folder, account])
         self.assertEqual(response.json["data"]["registry"]["last_discovery"], 10)
         self.assertNotIn("private-", response.get_data(as_text=True))
         for invalid in (None, "not-a-list", {"kind": "folder"}):
@@ -123,6 +125,21 @@ class SourceMonitorAppTests(unittest.TestCase):
             self.assertEqual(self.client.get("/source_status").json["data"]["registry"]["origins"], [])
         self.maintain.assert_not_called()
         self.run_manager.assert_not_called()
+
+    def test_status_join_summary_is_sanitized_and_preserves_zero_defaults(self):
+        registry = self.patch("ChannelRegistry")
+        summary = {"joined_count": 4, "recent_join_count": 2, "pending_count": 3, "next_check": 123, "reason": "等待下次执行"}
+        registry.return_value.status.return_value = {
+            "channels": [], "joins": {**summary, "authorization_generation": "private-generation",
+                                     "url": "private-url", "phone": "private-phone", "session": "private-session"}}
+        response = self.client.get("/source_status")
+        self.assertEqual(response.json["data"]["registry"]["joins"], summary)
+        self.assertNotIn("private-", response.get_data(as_text=True))
+        registry.return_value.status.return_value["joins"] = {
+            "joined_count": True, "recent_join_count": -1, "pending_count": "3", "next_check": float("nan"), "reason": []}
+        self.assertEqual(self.client.get("/source_status").json["data"]["registry"]["joins"],
+                         {"joined_count": 0, "recent_join_count": 0, "pending_count": 0, "next_check": 0, "reason": ""})
+        self.maintain.assert_not_called()
 
     def test_status_config_error_does_not_leak_credentials(self):
         with patch.object(web.Config, "read_json", side_effect=ValueError("private-cookie")):

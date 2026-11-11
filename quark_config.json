@@ -50,7 +50,8 @@
       "qq_channels": ["pd26778899"]
     },
     "telegram": {
-      "enable": false
+      "enable": false,
+      "auto_join": false
     },
     "pansou": {
       "enable": true,
