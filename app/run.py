@@ -395,7 +395,7 @@ def get_task_suggestions():
 def discovery():
     if not is_login():
         return jsonify(success=False, message="未登录"), 401
-    return jsonify(success=True, data=get_calendar())
+    return jsonify(success=True, data=get_calendar(background=True, refresh=request.args.get("refresh") == "1"))
 
 
 @app.route("/api/discovery/subscribe", methods=["POST"])

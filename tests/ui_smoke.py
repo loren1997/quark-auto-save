@@ -4,6 +4,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import jsonify, request
 from playwright.sync_api import sync_playwright
@@ -31,7 +32,19 @@ def main():
                       "donghua": [donghua] if day == 1 else [],
                       "anime": [item] if day == 1 else [failed_item] if day == 3 else [],
                       "tv": []} for day in range(1, 8)]}
-    web.get_calendar = lambda **kwargs: calendar
+    calendar_state = {"refreshing": True, "stale": True, "note": "首个快照中的缓存排期"}
+    calendar_requests = []
+
+    def calendar_snapshot(**kwargs):
+        if kwargs.get("background"):
+            calendar_requests.append(dict(kwargs))
+        snapshot = json.loads(json.dumps(calendar))
+        snapshot.update(refreshing=calendar_state["refreshing"], stale=calendar_state["stale"],
+                        warnings=["TVmaze 暂不可用，已保留本周缓存"])
+        snapshot["days"][0]["donghua"][0]["schedule_note"] = calendar_state["note"]
+        return snapshot
+
+    web.get_calendar = calendar_snapshot
     web.get_search_aliases = lambda entry: []
     web.search_resources = lambda *args, **kwargs: {
         "success": False, "data": [], "message": "PanSou: 搜索源暂时不可用", "errors": []}
@@ -132,9 +145,60 @@ def main():
                 page.locator('input[name="username"]').fill("test")
                 page.locator('input[name="password"]').fill("test-password")
                 page.locator('button[type="submit"]').click()
-                page.get_by_role("link", name="热门追更").click()
+                with page.expect_response(lambda response: urlsplit(response.url).path == "/api/discovery") as initial_calendar:
+                    page.get_by_role("link", name="热门追更").click()
+                first_snapshot = initial_calendar.value.json()["data"]
+                assert first_snapshot["refreshing"] and first_snapshot["stale"]
+                assert first_snapshot["days"][0]["donghua"]
                 page.get_by_role("button", name="周一", exact=True).click()
                 page.get_by_role("heading", name="1. 国漫周更测试").wait_for()
+                page.get_by_text("首个快照中的缓存排期", exact=True).wait_for()
+                assert page.get_by_role("button", name="更新中…", exact=True).is_disabled()
+                assert calendar_requests[0] == {"background": True, "refresh": False}
+                page.screenshot(path=str(output / "v311-calendar-first-snapshot.png"), full_page=True)
+
+                # The existing two-second timer replaces stale card data in place.
+                calendar_state.update(refreshing=False, stale=False, note="排期已自动更新")
+                page.get_by_text("排期已自动更新", exact=True).wait_for(timeout=7000)
+                assert len(calendar_requests) >= 2
+                assert all(call["refresh"] is False for call in calendar_requests)
+                warnings = page.locator('details[aria-label="排期来源提示"]')
+                assert not warnings.evaluate("element => element.open")
+                assert not warnings.get_by_text("TVmaze 暂不可用，已保留本周缓存", exact=True).is_visible()
+                warnings.locator("summary").click()
+                assert warnings.get_by_text("TVmaze 暂不可用，已保留本周缓存", exact=True).is_visible()
+                warnings.locator("summary").click()
+
+                # Explicit refresh sends refresh=1 and keeps the old cards visible.
+                calendar_state["refreshing"] = True
+                with page.expect_response(lambda response: "/api/discovery?refresh=1" in response.url) as forced_calendar:
+                    page.get_by_role("button", name="刷新", exact=True).click()
+                assert forced_calendar.value.json()["data"]["refreshing"]
+                assert calendar_requests[-1] == {"background": True, "refresh": True}
+                assert page.get_by_role("heading", name="1. 国漫周更测试").is_visible()
+                page.locator("a.nav-link").filter(has_text="任务列表").click()
+                page.wait_for_function("!app.discoveryLoading && app.activeTab !== 'discovery'")
+                requests_away = len(calendar_requests)
+                page.wait_for_timeout(2300)
+                assert len(calendar_requests) == requests_away, "calendar kept polling away from its tab"
+                calendar_state.update(refreshing=False, note="返回页面后的最新排期")
+                page.get_by_role("link", name="热门追更").click()
+                page.get_by_text("返回页面后的最新排期", exact=True).wait_for()
+
+                # A failed snapshot cannot clear cached cards or subscription errors.
+                page.evaluate("app.discoveryError = '订阅验证仍待完成'")
+                def unavailable_calendar(route):
+                    route.fulfill(status=503, json={"success": False, "message": "排期暂时不可用（测试）"})
+                page.route("**/api/discovery?refresh=1", unavailable_calendar)
+                page.get_by_role("button", name="刷新", exact=True).click()
+                page.wait_for_function("!app.discoveryLoading && !!app.discoveryLoadError")
+                assert page.get_by_role("heading", name="1. 国漫周更测试").is_visible()
+                assert page.get_by_text("订阅验证仍待完成", exact=True).is_visible()
+                warnings.locator("summary").click()
+                assert warnings.get_by_text("排期暂时不可用（测试）", exact=True).is_visible()
+                page.unroute("**/api/discovery?refresh=1", unavailable_calendar)
+                page.evaluate("app.discoveryError = ''; app.loadDiscovery()")
+                page.wait_for_function("!app.discoveryLoading && !app.discoveryLoadError")
                 page.get_by_text("Bilibili · 1 部", exact=False).wait_for()
                 page.get_by_role("button", name="动漫", exact=True).click()
                 page.get_by_role("heading", name="1. 测试动漫").wait_for()
@@ -218,6 +282,7 @@ def main():
                         has=page.get_by_text(key, exact=True)
                     ).locator("input").fill(value)
                 page.locator("#discovery-download").check()
+                page.evaluate("app.formData.tasklist.find(task => task.resource_id === 'bangumi:123').runweek = [2]")
                 with page.expect_response(lambda response: response.url.endswith("/update")
                                           and response.request.method == "POST") as saved_response:
                     page.locator('button[data-original-title="保存 CTRL+S"], button[title="保存 CTRL+S"]').click()
@@ -235,11 +300,24 @@ def main():
                 assert len(runs) == 3
                 retry = runs[2]["tasklist"][0]
                 assert retry["resource_id"] == "bangumi:123"
+                assert "runweek" not in retry and "enddate" not in retry
+                scheduled_week = web.Config.read_json(web.CONFIG_PATH)["tasklist"][1]["runweek"]
+                assert scheduled_week == [2]
+                assert page.evaluate("app.formData.tasklist.find(task => task.resource_id === 'bangumi:123').runweek") == scheduled_week
                 assert retry["addition"]["aria2"] == {
                     "auto_download": True, "download_subdir": True, "download_existing": True,
                     "save_path": "cartoon",
                 }
                 assert "ui-test-only-secret" not in json.dumps(runs)
+                finish_run()
+                page.wait_for_function("!app.backgroundRun")
+
+                # Running everything passes no task overrides, preserving saved weekdays.
+                page.wait_for_function("!app.configModified")
+                page.locator('button[data-original-title="后台运行 CTRL+R"], button[title="后台运行 CTRL+R"]').click()
+                page.wait_for_function("app.backgroundRun && !app.runRequestPending")
+                assert runs[-1] == {}
+                assert web.Config.read_json(web.CONFIG_PATH)["tasklist"][1]["runweek"] == scheduled_week
                 finish_run()
                 page.wait_for_function("!app.backgroundRun")
 
@@ -270,7 +348,7 @@ def main():
                 page.get_by_role("heading", name="订阅队列（1）", exact=True).wait_for()
                 assert not errors, errors
                 browser.close()
-            print("UI smoke passed: login, donghua/source groups, seven days, subscribe/run, dedup, mobile, background log, reload/reconnect/history/errors, enable existing Aria2 download/save/refresh/run, contextual search errors; no JS errors")
+            print("UI smoke passed: first cached calendar snapshot, background refresh, no polling away, explicit refresh, expandable warnings, preserved cards/errors, manual/all-run weekday contract, login, donghua/source groups, seven days, subscribe/run, dedup, mobile, background log, reload/reconnect/history/errors, enable existing Aria2 download/save/refresh/run, contextual search errors; no JS errors")
         finally:
             if errors:
                 print("Browser errors:", errors)

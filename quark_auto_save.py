@@ -44,6 +44,15 @@ NOTIFYS = []
 GH_PROXY = os.environ.get("GH_PROXY", "https://ghproxy.net/")
 
 
+def task_is_due(task):
+    """Manual runs may omit runweek; scheduled tasks retain their stored limits."""
+    today = datetime.now().date()
+    return (
+        not task.get("enddate")
+        or today <= datetime.strptime(task["enddate"], "%Y-%m-%d").date()
+    ) and ("runweek" not in task or today.isoweekday() in (task.get("runweek") or []))
+
+
 # 发送通知消息
 def send_ql_notify(title, body):
     try:
@@ -1881,6 +1890,9 @@ class Quark:
     def repair_share(self, task, reason="分享已失效"):
         if not task.get("auto_repair", CONFIG_DATA.get("auto_repair", True)):
             return None
+        if not task_is_due(task):
+            print(f"《{task['taskname']}》待换源：未到任务运行日或已过截止日期，保留原链接和任务设置")
+            return None
         if task.get("update_subdir_resave_mode"):
             print("自动换源已跳过：此任务开启了删除子目录后重存，请手工检查新资源")
             return None
@@ -1906,7 +1918,7 @@ class Quark:
     def repair_episode_gaps(self, task, tree):
         if (not task.get("resource_id") or task.get("resource_type") not in ("anime", "tv")
                 or not task.get("auto_repair", CONFIG_DATA.get("auto_repair", True))
-                or task.get("shareurl_ban") or tree.root is None):
+                or task.get("shareurl_ban") or tree.root is None or not task_is_due(task)):
             return
         mr = MagicRename(CONFIG_DATA.get("magic_regex", {}))
         mr.set_taskname(task["taskname"])
@@ -2039,6 +2051,9 @@ class Quark:
             print(f"补集暂未完成（{type(exc).__name__}）；保留原订阅和已有文件")
 
     def do_save_task(self, task):
+        if not task_is_due(task):
+            print("任务不在运行周期内，跳过；失效分享将在任务运行日复查并自动换源")
+            return
         report_progress("verify", task=task.get("taskname", ""), source="当前分享")
         apply_media_rename_defaults(task)
         # Recheck historical bans: older versions also banned temporary login errors.
@@ -2364,9 +2379,12 @@ def retry_pending_subscriptions(account, config_path):
     """Only verified pending intents become transfer tasks; cancellation wins over search results."""
     promoted = []
     records = Config.read_json(config_path).get("pending_subscriptions", [])
-    if len(records) > 3:
-        print(f"待查找订阅共 {len(records)} 部，本轮先重试最久未查找的 3 部，其余保留到下次定时运行")
-    for snapshot in sorted(records, key=lambda item: item.get("last_attempt_at", ""))[:3]:
+    due = [item for item in records if task_is_due(item["task"])]
+    if len(due) < len(records):
+        print(f"待查找订阅中 {len(records) - len(due)} 部未到运行日或已过截止日期，保留设置并跳过")
+    if len(due) > 3:
+        print(f"本日到期待查找订阅共 {len(due)} 部，本轮先重试最久未查找的 3 部，其余保留到下次定时运行")
+    for snapshot in sorted(due, key=lambda item: item.get("last_attempt_at", ""))[:3]:
         with Config.locked(config_path):
             current = Config.read_json(config_path)
             records = current.get("pending_subscriptions", [])
@@ -2374,6 +2392,9 @@ def retry_pending_subscriptions(account, config_path):
             if pending is None:
                 continue
             task = deepcopy(pending["task"])
+            if not task_is_due(task):
+                print(f"《{task['taskname']}》运行周期已修改，保留待查找订阅，等待任务运行日")
+                continue
             if Config.existing_subscription(current.get("tasklist", []), task["resource_id"], task["taskname"]):
                 current["pending_subscriptions"] = [item for item in records if item["id"] != pending["id"]]
                 Config.write_json(config_path, current)
@@ -2400,6 +2421,9 @@ def retry_pending_subscriptions(account, config_path):
             pending = next((item for item in records if item["id"] == snapshot["id"]), None)
             if pending is None:
                 print(f"《{task['taskname']}》待查找订阅已取消，本次结果已丢弃")
+                continue
+            if not task_is_due(pending["task"]):
+                print(f"《{task['taskname']}》运行周期已修改，本次不创建转存任务，等待任务运行日")
                 continue
             candidate = result.get("candidate") or {}
             if not result.get("success") or not candidate.get("shareurl"):
@@ -2430,22 +2454,10 @@ def do_save(account, tasklist=[]):
     print()
     print(f"转存账号: {account.nickname}")
     # 获取全部保存目录fid
-    for task in tasklist:
+    due_tasks = [task for task in tasklist if task_is_due(task)]
+    for task in due_tasks:
         apply_media_rename_defaults(task)
-    account.update_savepath_fid(tasklist)
-
-    def is_time(task):
-        return (
-            not task.get("enddate")
-            or (
-                datetime.now().date()
-                <= datetime.strptime(task["enddate"], "%Y-%m-%d").date()
-            )
-        ) and (
-            "runweek" not in task
-            # 星期一为0，星期日为6
-            or (datetime.today().weekday() + 1 in task.get("runweek"))
-        )
+    account.update_savepath_fid(due_tasks)
 
     for plugin_name, plugin in plugins.items():
         if plugin.is_active and hasattr(plugin, "task_before"):
@@ -2473,8 +2485,8 @@ def do_save(account, tasklist=[]):
             )
         print()
         # 判断任务周期
-        if not is_time(task):
-            print(f"任务不在运行周期内，跳过")
+        if not task_is_due(task):
+            print("任务不在运行周期内，跳过" + ("；已失效分享待换源，等待任务运行日" if task.get("shareurl_ban") else ""))
         else:
             is_new_tree = account.do_save_task(task)
 

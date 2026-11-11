@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from math import isfinite
-from threading import Lock
+from threading import Event, Lock, Thread
 from time import monotonic
 import logging
 import re
@@ -25,6 +25,15 @@ _expires = 0
 _lock = Lock()
 _aliases = {}
 _bilibili_media = {}
+_source_data = {}
+_snapshot_week = None
+_preview = None
+_refreshing = False
+_refresh_thread = None
+_refresh_done = Event()
+_refresh_done.set()
+_requested_week = None
+_retry_at = 0
 
 
 def _request_json(url, deadline=None):
@@ -61,10 +70,11 @@ def _get_json(url, deadline=None):
     return data
 
 
-def _fetch_many(urls):
+def _fetch_many(urls, deadline=None, on_result=None):
     results, errors = {}, {}
     with ThreadPoolExecutor(max_workers=2) as executor:
-        pending = {executor.submit(_get_json, url): key for key, url in urls.items()}
+        pending = {executor.submit(_get_json, url, **({"deadline": deadline} if deadline is not None else {})): key
+                   for key, url in urls.items()}
         for future in as_completed(pending):
             key = pending[future]
             try:
@@ -72,6 +82,8 @@ def _fetch_many(urls):
             except (requests.RequestException, ValueError) as exc:
                 logging.warning("Calendar source %s failed: %s", key, exc)
                 errors[key] = "连接超时，请检查 NAS 网络或 HTTPS_PROXY" if isinstance(exc, requests.Timeout) else str(exc)
+            if on_result is not None:
+                on_result(key, results.get(key), errors.get(key))
     return results, errors
 
 
@@ -101,7 +113,7 @@ def _bilibili_catalog_id(url):
         return None
 
 
-def _prefer_official_bilibili(days, warnings):
+def _prefer_official_bilibili(days, warnings, fetch=True, deadline=None):
     pairs = []
     for day in days:
         official = [item for item in day["donghua"] if item["source"] == "Bilibili" and not item.get("stale")]
@@ -117,8 +129,8 @@ def _prefer_official_bilibili(days, warnings):
     now = monotonic()
     needed = list(dict.fromkeys(season for _, _, season, identity in pairs if identity[0] == "media"
                                and _bilibili_media.get(season, (None, 0))[1] <= now))[:12]
-    details, errors = _fetch_many({season: BILIBILI_SEASON + str(season) for season in needed})
-    for season in needed:
+    details, errors = _fetch_many({season: BILIBILI_SEASON + str(season) for season in needed}, deadline=deadline) if fetch else ({}, {})
+    for season in needed if fetch else []:
         entries = details.get(season) or [{}]
         data = entries[0]
         media = data.get("media_id") if data.get("season_id") == season else None
@@ -272,8 +284,8 @@ def _bilibili_items(groups, days):
             })
 
 
-def _tv_items(results, days, warnings, resource_id=None):
-    shows, episodes = {}, {}
+def _tv_items(results, days, warnings, resource_id=None, stale_keys=(), fetch_aliases=True, alias_limit=None, deadline=None):
+    shows, episodes, stale_episodes = {}, {}, set()
     day_dates = {day["date"] for day in days}
     for key, entries in results.items():
         if key in ("anime", "bilibili"):
@@ -295,6 +307,8 @@ def _tv_items(results, days, warnings, resource_id=None):
             if any(value is not None and not isinstance(value, int) for value in (season, number)):
                 continue
             episodes.setdefault((entry["airdate"], show_id), set()).add((season, number))
+            if key in stale_keys:
+                stale_episodes.add((entry["airdate"], show_id, season, number))
     dramas = sorted((key for key in shows if shows[key]["type"] == "Scripted"),
                     key=lambda key: (-_number(shows[key].get("weight")), key))
     popular = dramas[:TV_LIMIT]
@@ -306,18 +320,17 @@ def _tv_items(results, days, warnings, resource_id=None):
                         key=lambda key: (-_number(shows[key].get("weight")), key))
     popular += animations[:DONGHUA_LIMIT]
     alias_pending += [key for key in animations[:DONGHUA_LIMIT] if key not in _aliases]
+    if alias_limit is not None:
+        alias_pending = alias_pending[:alias_limit]
     if len(animations) > DONGHUA_LIMIT:
         warnings.append(f"国漫 TVmaze 来源本周超过 {DONGHUA_LIMIT} 部，已展示热度最高的 {DONGHUA_LIMIT} 部")
     aliases, failures = _fetch_many({
         key: f"https://api.tvmaze.com/shows/{key}/akas" for key in alias_pending
-    })
+    }, deadline=deadline) if fetch_aliases else ({}, {})
     for key, entries in aliases.items():
         _aliases[key] = _chinese_aliases(entries) or [shows[key]["name"]]
     if failures:
         warnings.append(f"{len(failures)} 部作品的中文别名暂不可用，已保留原名")
-    untranslated = sum(not re.search(r"[\u4e00-\u9fff]", _aliases.get(key, [shows[key]["name"]])[0]) for key in popular)
-    if untranslated:
-        warnings.append(f"{untranslated} 部作品尚无可用中文名，先显示原名；订阅会使用可获取的官方别名")
     for day in days:
         for key in popular:
             aired = episodes.get((day["date"], key))
@@ -347,87 +360,191 @@ def _tv_items(results, days, warnings, resource_id=None):
                     "year": str(show.get("premiered") or "")[:4] if category == "tv" and season == 1 else "",
                     "airdate": day["date"],
                     "episodes": [{"season": season, "number": number} for number in numbers],
+                    "stale": any((day["date"], key, season, number) in stale_episodes for number in numbers),
                     "schedule_note": f"TVmaze {season_label} 第{episode_label or '?'}集；中国播出排期，不代表网盘资源已更新",
                 })
 
 
-def get_calendar(config=None, resource_id=None):
-    """Return the weekly calendar, or look up one subscription without unrelated sources."""
-    global _cache, _expires
-    now = datetime.now(CHINA_TZ)
+def _week(now):
+    return (now.date() - timedelta(days=now.weekday())).isoformat()
+
+
+def _days(now):
     monday = now.date() - timedelta(days=now.weekday())
-    week_start = monday.isoformat()
+    return [{"weekday": index + 1, "label": f"星期{label}",
+             "date": (monday + timedelta(days=index)).isoformat(), "anime": [], "donghua": [], "tv": []}
+            for index, label in enumerate("一二三四五六日")]
+
+
+def _calendar_urls(now, resource_id=None):
+    source = None if resource_id is None else (
+        resource_id.split(":")[0] if isinstance(resource_id, str)
+        and re.fullmatch(r"(?:bangumi|bilibili):\d+|tvmaze:\d+:s(?:\d+|unknown)", resource_id) else "")
+    # 两个单请求来源先发布，不排在整周 TVmaze 请求后面。
+    urls = {}
+    if source in (None, "bangumi"):
+        urls["anime"] = "https://api.bgm.tv/calendar"
+    if source in (None, "bilibili"):
+        urls["bilibili"] = BILIBILI_CALENDAR
+    if source in (None, "tvmaze"):
+        for day in _days(now):
+            urls[day["date"]] = f"https://api.tvmaze.com/schedule?country=CN&date={day['date']}"
+            urls[f"web:{day['date']}"] = f"https://api.tvmaze.com/schedule/web?country=CN&date={day['date']}"
+    return urls
+
+
+def _select_resource(calendar, resource_id):
+    if resource_id is not None:
+        for day in calendar["days"]:
+            for category in ("anime", "donghua", "tv"):
+                day[category] = [item for item in day[category] if item["id"] == resource_id]
+    return calendar
+
+
+def _assemble_calendar(now, results, errors, stale_keys=(), resource_id=None, enrich=True, deadline=None, alias_limit=None):
+    days = _days(now)
+    source_names = {"anime": "Bangumi 周播表", "bilibili": "哔哩哔哩国创周历"}
+    warnings = [f"{source_names.get(key, 'TVmaze ' + key)} 获取失败：{error}" for key, error in sorted(errors.items())]
+    _anime_items(results.get("anime", []), days, now.date())
+    _bilibili_items(results.get("bilibili", []), days)
+    for day in days:
+        for category, source in (("anime", "anime"), ("donghua", "bilibili")):
+            if source in stale_keys:
+                for item in day[category]:
+                    item["stale"] = True
+    _tv_items(results, days, warnings, resource_id, stale_keys, enrich, alias_limit, deadline)
+    if stale_keys:
+        warnings.append("部分来源沿用本周上次成功数据，已标注缓存；排期可能已变更")
+    identity_pending = _prefer_official_bilibili(days, warnings, fetch=enrich, deadline=deadline) if resource_id is None else False
+    for day in days:
+        unique = {}
+        for item in sorted(day["donghua"], key=lambda entry: (bool(entry.get("stale")), entry["source"] != "Bilibili")):
+            unique.setdefault(_title_key(item["title"]), item)
+        day["donghua"] = sorted(unique.values(), key=lambda item: (item["source"] != "TVmaze", -item["heat"], item["title"]))
+        for category in ("anime", "tv"):
+            day[category].sort(key=lambda item: (-item["heat"], item["title"]))
+    tv_items = {item["id"]: item for day in days for category in ("donghua", "tv") for item in day[category]
+                if item["source"] == "TVmaze"}
+    untranslated = sum(not re.search(r"[\u4e00-\u9fff]", item["series_title"]) for item in tv_items.values())
+    notes = ["动漫：Bangumi 当季周播表，已排除首播日期在未来的作品；不保证本周每一部都更新。",
+             "国漫：哔哩哔哩官方国创日历与 TVmaze 中国网络/电视播出排期，按本周真实日期归日；覆盖范围以来源收录为准。",
+             f"电视剧：TVmaze 中国播出数据，本周热度前 {TV_LIMIT} 部，按实际集日期归日、按 TVmaze 热度排序。",
+             "热度口径按条目标注，按来源分组、组内热度降序；不同来源数值不直接比较。TVmaze 数据按 CC BY-SA 4.0 使用。"]
+    if untranslated:
+        notes.append(f"{untranslated} 部作品尚无可用中文名，先显示原名；订阅会按需查询官方别名，不影响浏览。")
+    calendar = {"week_start": _week(now), "week_end": days[-1]["date"], "timezone": "Asia/Shanghai",
+                "updated_at": now.isoformat(), "cached": False, "refreshing": False, "stale": bool(stale_keys),
+                "days": days, "warnings": warnings, "notes": notes}
+    alias_pending = any(int(key.split(":")[1]) not in _aliases for key in tv_items)
+    return _select_resource(calendar, resource_id), identity_pending or alias_pending
+
+
+def _refresh_calendar(now, old_sources, done, background):
+    global _cache, _expires, _source_data, _snapshot_week, _preview, _refreshing, _refresh_thread, _retry_at
+    results, errors = dict(old_sources), {}
+    stale_keys = set(old_sources)
+    week_start = _week(now)
+
+    def publish(key, data, error):
+        global _preview
+        if error is None:
+            results[key] = data
+            stale_keys.discard(key)
+        else:
+            errors[key] = error
+        preview, _ = _assemble_calendar(now, results, errors, stale_keys, enrich=False)
+        preview["refreshing"] = True
+        with _lock:
+            if _requested_week == week_start:
+                _preview = preview
+
+    try:
+        _fetch_many(_calendar_urls(now), deadline=monotonic() + 30 if background else None, on_result=publish)
+        # 主数据已可浏览，别名和身份补充共用额外 10 秒；不阻塞 API。
+        calendar, pending = _assemble_calendar(
+            now, results, errors, stale_keys, deadline=monotonic() + 10 if background else None,
+            alias_limit=10 if background else None)
+        with _lock:
+            if _requested_week == week_start:
+                _cache, _source_data, _snapshot_week = calendar, results, week_start
+                _expires = monotonic() + (300 if errors or pending else 3600)
+                _retry_at = 0
+    except Exception as error:
+        logging.warning("周历后台刷新未完成 (%s)", type(error).__name__)
+        with _lock:
+            if _requested_week == week_start:
+                _preview["refreshing"] = False
+                _preview["warnings"].append("本轮周历刷新未完成，将稍后重试")
+                _retry_at = monotonic() + 300
+    finally:
+        with _lock:
+            _refreshing = False
+            _refresh_thread = None
+            done.set()
+
+
+def get_calendar(config=None, resource_id=None, background=False, refresh=False):
+    """UI reads a progressive snapshot; synchronous callers only use complete calendars."""
+    global _preview, _refreshing, _refresh_thread, _refresh_done, _requested_week, _retry_at
+    now, start, wait = datetime.now(CHINA_TZ), False, None
+    week_start = _week(now)
     with _lock:
-        if _cache and _cache["week_start"] == week_start and monotonic() < _expires:
-            cached = deepcopy(_cache)
+        _requested_week = week_start
+        current = _cache if _cache and _cache["week_start"] == week_start else None
+        fresh = current is not None and monotonic() < _expires
+        if (resource_id is None and not refresh and not _refreshing
+                and _preview and _preview["week_start"] == week_start and monotonic() < _retry_at):
+            return deepcopy(_preview)
+        if not refresh and fresh and not (background and _refreshing):
+            cached = deepcopy(current)
             cached["cached"] = True
-            if resource_id is not None:
-                for day in cached["days"]:
-                    for category in ("anime", "donghua", "tv"):
-                        day[category] = [item for item in day[category] if item["id"] == resource_id]
-            return cached
-        days = [{"weekday": index + 1, "label": f"星期{label}",
-                 "date": (monday + timedelta(days=index)).isoformat(), "anime": [], "donghua": [], "tv": []}
-                for index, label in enumerate("一二三四五六日")]
-        source = None if resource_id is None else (
-            resource_id.split(":")[0] if isinstance(resource_id, str)
-            and re.fullmatch(r"(?:bangumi|bilibili):\d+|tvmaze:\d+:s(?:\d+|unknown)", resource_id) else "")
-        urls = {}
-        if source in (None, "tvmaze"):
-            urls = {day["date"]: f"https://api.tvmaze.com/schedule?country=CN&date={day['date']}" for day in days}
-            urls.update({f"web:{day['date']}": f"https://api.tvmaze.com/schedule/web?country=CN&date={day['date']}" for day in days})
-        if source in (None, "bangumi"):
-            urls["anime"] = "https://api.bgm.tv/calendar"
-        if source in (None, "bilibili"):
-            urls["bilibili"] = BILIBILI_CALENDAR
-        results, errors = _fetch_many(urls)
-        source_names = {"anime": "Bangumi 周播表", "bilibili": "哔哩哔哩国创周历"}
-        warnings = [f"{source_names.get(key, 'TVmaze ' + key)} 获取失败：{error}"
-                    for key, error in sorted(errors.items())]
-        old = _cache if resource_id is None and _cache and _cache["week_start"] == week_start else None
-        _anime_items(results.get("anime", []), days, now.date())
-        _bilibili_items(results.get("bilibili", []), days)
-        _tv_items(results, days, warnings, resource_id)
-        if old:
-            stale_used = False
-            for day, previous in zip(days, old["days"]):
-                failed_sources = {source for source, failed in (
-                    ("Bangumi", "anime" in errors), ("Bilibili", "bilibili" in errors),
-                    ("TVmaze", day["date"] in errors or f"web:{day['date']}" in errors)) if failed}
-                for category in ("anime", "donghua", "tv"):
-                    seen = {item["id"] for item in day[category]}
-                    for item in previous.get(category, []):
-                        if item["source"] in failed_sources and item["id"] not in seen:
-                            item = deepcopy(item)
-                            item["stale"] = True
-                            day[category].append(item)
-                            seen.add(item["id"])
-                            stale_used = True
-            if stale_used:
-                warnings.append("失败的来源保留本周上次成功数据，已标注缓存；排期可能已变更")
-        identity_pending = _prefer_official_bilibili(days, warnings) if resource_id is None else False
-        for day in days:
-            # Prefer the official Bilibili entry when both sources name the same series.
-            unique = {}
-            for item in sorted(day["donghua"], key=lambda entry: (bool(entry.get("stale")), entry["source"] != "Bilibili")):
-                name = _title_key(item["title"])
-                unique.setdefault(name, item)
-            day["donghua"] = sorted(unique.values(), key=lambda item: (item["source"] != "TVmaze", -item["heat"], item["title"]))
-            for category in ("anime", "tv"):
-                day[category].sort(key=lambda item: (-item["heat"], item["title"]))
-        calendar = {
-            "week_start": week_start, "week_end": days[-1]["date"], "timezone": "Asia/Shanghai",
-            "updated_at": now.isoformat(), "cached": False, "days": days, "warnings": warnings,
-            "notes": ["动漫：Bangumi 当季周播表，已排除首播日期在未来的作品；不保证本周每一部都更新。",
-                      "国漫：哔哩哔哩官方国创日历与 TVmaze 中国网络/电视播出排期，按本周真实日期归日；覆盖范围以来源收录为准。",
-                      f"电视剧：TVmaze 中国播出数据，本周热度前 {TV_LIMIT} 部，按实际集日期归日、按 TVmaze 热度排序。",
-                      "热度口径按条目标注，按来源分组、组内热度降序；不同来源数值不直接比较。TVmaze 数据按 CC BY-SA 4.0 使用。"],
-        }
-        if resource_id is not None:
-            for day in days:
-                for category in ("anime", "donghua", "tv"):
-                    day[category] = [item for item in day[category] if item["id"] == resource_id]
-            return calendar
-        _cache = calendar
-        _expires = monotonic() + (300 if errors or identity_pending else 3600)
-        return deepcopy(_cache)
+            _select_resource(cached, resource_id)
+            if resource_id is None or any(day[kind] for day in cached["days"] for kind in ("anime", "donghua", "tv")):
+                return cached
+        if resource_id is None:
+            if not _refreshing:
+                old_sources = deepcopy(_source_data) if current and _snapshot_week == week_start else {}
+                _preview = deepcopy(current) if current else _assemble_calendar(now, {}, {}, enrich=False)[0]
+                _preview.update(refreshing=True, cached=bool(current), stale=bool(current))
+                if current:
+                    for day in _preview["days"]:
+                        for category in ("anime", "donghua", "tv"):
+                            for item in day[category]:
+                                item["stale"] = True
+                _refresh_done = Event()
+                _refreshing, start = True, True
+                _retry_at = 0
+                if background:
+                    _refresh_thread = Thread(target=_refresh_calendar, args=(now, old_sources, _refresh_done, True),
+                                             name="calendar-refresh", daemon=True)
+            if background:
+                snapshot = deepcopy(_preview) if _preview and _preview["week_start"] == week_start else _assemble_calendar(now, {}, {}, enrich=False)[0]
+                snapshot["refreshing"] = True
+                worker = _refresh_thread if start else None
+            elif not start:
+                wait = _refresh_done
+    if resource_id is not None:
+        # A partial UI preview must never turn an unfinished source into “作品不存在”.
+        results, errors = _fetch_many(_calendar_urls(now, resource_id))
+        return _assemble_calendar(now, results, errors, resource_id=resource_id)[0]
+    if background:
+        if worker:
+            try:
+                worker.start()
+            except RuntimeError:
+                with _lock:
+                    _refreshing = False
+                    _refresh_thread = None
+                    _retry_at = monotonic() + 300
+                    _refresh_done.set()
+                snapshot.update(refreshing=False)
+                snapshot["warnings"].append("无法启动周历刷新，请稍后重试")
+                with _lock:
+                    _preview = deepcopy(snapshot)
+        return snapshot
+    if wait is not None:
+        wait.wait()
+        return get_calendar(config=config)
+    _refresh_calendar(now, old_sources, _refresh_done, False)
+    with _lock:
+        return deepcopy(_preview if monotonic() < _retry_at else _cache)

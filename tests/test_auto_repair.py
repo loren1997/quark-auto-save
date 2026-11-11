@@ -1,5 +1,6 @@
 import contextlib
 import copy
+from datetime import datetime
 import io
 import json
 import os
@@ -23,6 +24,10 @@ EXPIRED = {"status": 400, "code": 41001, "message": "分享已取消"}
 
 class AutoRepairTests(unittest.TestCase):
     def setUp(self):
+        clock = patch.object(qas, "datetime", wraps=datetime)
+        frozen = clock.start()
+        frozen.now.return_value = datetime(2026, 11, 9, 8)  # Monday, within this fixture's schedule.
+        self.addCleanup(clock.stop)
         self.account = qas.Quark()
         self.task = {
             "taskname": "测试剧 第二季 (2024)",

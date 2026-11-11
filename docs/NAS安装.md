@@ -14,7 +14,7 @@ V3.8 可以连续点击多部作品加入订阅队列，依次在后台执行，
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.10 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.10) 中的 `quark-auto-save-nas-docker-v3.10.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.11 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.11) 中的 `quark-auto-save-nas-docker-v3.11.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 
 ```sh
@@ -130,6 +130,8 @@ V3.6 将找到的资源线索独立保存到 `config/quark_config.resources.json
 
 自动查询复用搜索服务缓存，避免每次订阅强制重新抓取全部频道；每个候选分享仍实时验证。需要强制刷新索引时，可使用任务列表的手动搜索按钮。
 
+V3.11 的定时换源、补集和待查找重试统一遵守任务的运行星期及截止日期。例如任务只勾选周五，即使链接已标记失效，周一至周四也不会查找替代资源；周五系统定时运行时再复验旧分享、寻找有效链接，并继续转存及调用下载插件。非运行日任务保留原设置，也不占用每轮待查找重试的 3 个名额。手动点击单个任务“▶运行”仍立即执行；批量运行按保存的任务周期判断。此功能不另建周五零点计划，系统定时规则需要覆盖该运行日。
+
 开启“删除子目录后重存”的任务不会自动换源，以免新来源触发已有删除规则。单任务可在 JSON 配置中设置 `auto_repair: false` 禁用换源。
 
 热门订阅运行时还会检查明确集号之间的缺口，例如 `01、03、04、05、05.mkv` 去重后缺第 2 集；从其他通过同作品、同季、已知年份验证的分享中仅补入缺号，再交给下载插件，保留原订阅继续追更。V3.6 每轮最多使用 3 份不同候选分享，每次按剩余缺号继续查找；120 秒预算用于停止发起下一轮查询，已返回的候选仍会验证和转存。未补齐会打印剩余缺号并在下次运行重试。不会根据文件数量推断集数，也不猜测首集之前或最新集之后是否还缺集。
@@ -160,12 +162,14 @@ V3.7 已在新的公开分享中匿名读到《黑暗召唤师在地下恋爱中
 - 电视剧与 TVmaze 国漫保留普通季号，避免第四季误订到首季；来源的年份型季号不会被当成几千季。国内年番与来源季号不一致时，可能需要手动选取正确分享。来源未提供当前季年份或重拍版本时，请核对实际目录。
 - 周历每次实际刷新最多为 10 部尚无缓存的电视剧补取 TVmaze 官方中文别名；已缓存的全部复用，其余先显示来源原名，后续刷新逐批补齐。订阅单部作品时再按需读取该部官方别名，共用既有 10 秒预算并保留季号；失败不会永久缓存为空。扩展展示量不会一次额外请求 40 部别名。
 - TVmaze 官方链接指向同一哔哩哔哩节目时，会核对 B站媒体/季度 ID，在同日同系列的重复条目中优先保留 B站周历，避免将连续更新误显示为额外一季。身份核对失败时保留来源条目，不凭相似片名合并。
-- 数据缓存一小时，错误后五分钟重试。刷新按钮重新读取当前缓存，不会强制高频抓取外部源。
+- V3.11 先返回可用快照，动漫、国漫和电视剧逐来源显示；中文别名补充在后台进行，不等待全部来源才显示卡片。刷新按钮启动一次后台更新，重复请求共用正在进行的刷新，不叠加外部查询。
+- 完整数据缓存一小时，部分错误时缩短为五分钟。同周单日接口失败时沿用该来源该日期的成功快照并标记缓存，其他正常来源继续更新；上周数据不会冒充本周。真实错误可展开“排期来源提示”查看，缺中文名先显示原名。
+- 页面可见且更新中时才继续获取快照，离开热门追更后停止周历轮询；订阅校验不会使用尚未完整加载的空快照。
 - 新热门订阅每日按定时规则检查；周历展示首播安排，网盘资源上传时间可能更晚，所以不会只在播出当天检查。
 
 数据来源：[Bangumi API](https://github.com/bangumi/api)、[TVmaze API](https://www.tvmaze.com/api)。TVmaze 数据按 [CC BY-SA](https://creativecommons.org/licenses/by-sa/4.0/) 使用，页面保留条目来源链接。两种来源热度口径不同，不混合比较。
 
-国创官方日历：[哔哩哔哩国创时间表](https://www.bilibili.com/guochuang/timeline/)。各来源仍可能漏收录或错填日期，不保证涵盖每部周更国漫，也不会凭印象补写更新星期。首次打开需要汇总多个来源及中文别名，通常比缓存刷新慢。
+国创官方日历：[哔哩哔哩国创时间表](https://www.bilibili.com/guochuang/timeline/)。各来源仍可能漏收录或错填日期，不保证涵盖每部周更国漫，也不会凭印象补写更新星期。周历缓存保存在应用进程内；重启后的首次请求仍需要网络获取数据，但已返回的作品会先显示，不再等待完整汇总和中文别名。
 
 ## 5. 下载到 NAS 本地磁盘
 
@@ -193,16 +197,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.10：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.11：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.10/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.11/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.10-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.11-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"

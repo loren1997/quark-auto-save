@@ -446,10 +446,10 @@
           <section v-if="activeTab === 'discovery'" aria-label="热门追更">
             <div class="row title align-items-center">
               <div class="col"><h2><i class="bi bi-calendar-week"></i> 热门追更</h2></div>
-              <div class="col-auto"><button type="button" class="btn btn-outline-primary" @click="loadDiscovery" :disabled="discoveryLoading">刷新</button></div>
+              <div class="col-auto"><button type="button" class="btn btn-outline-primary" @click="loadDiscovery(true)" :disabled="discoveryLoading || calendar.refreshing">{{ calendar.refreshing ? '更新中…' : '刷新' }}</button></div>
             </div>
             <p>按各自来源热度排列。点击订阅会搜索并验证夸克分享，视频和字幕直接保存到 {{ formData.discovery.savepath }}，按“片名 S01E01”命名，不再创建作品或分享子目录。{{ formData.discovery.auto_download ? '转存后默认只提交视频到 Aria2；字幕保留在网盘。' : '当前仅转存到夸克网盘；本地视频下载可在系统配置中开启。' }}</p>
-            <p class="text-muted" v-if="calendar.week_start">{{ calendar.week_start }} — {{ calendar.week_end }} · 北京时间 · {{ calendar.cached ? '缓存数据' : '已更新' }}</p>
+            <p class="text-muted" v-if="calendar.week_start">{{ calendar.week_start }} — {{ calendar.week_end }} · 北京时间 · {{ calendar.refreshing ? '后台更新中' : calendar.stale ? '部分为本周缓存' : calendar.cached ? '缓存数据' : '已更新' }}</p>
             <div v-for="note in calendar.notes" :key="note" class="small text-muted mb-1">{{ note }}</div>
             <div v-if="discoveryError" class="alert alert-danger" role="alert">
               {{ discoveryError }}
@@ -471,8 +471,12 @@
               </div>
               <small class="text-muted">直接验证分享内的视频、片名、季度和年份，通过后按当前设置转存。</small>
             </div>
-            <div v-for="warning in calendar.warnings" :key="warning" class="alert alert-warning" role="status">{{ warning }}</div>
-            <p v-if="discoveryLoading" role="status">正在读取本周排期，请稍候…</p>
+            <details v-if="calendar.warnings.length || discoveryLoadError" class="small text-muted my-2" aria-label="排期来源提示">
+              <summary>排期来源提示（{{ calendar.warnings.length + (discoveryLoadError ? 1 : 0) }}）</summary>
+              <p v-if="discoveryLoadError" class="mb-1">{{ discoveryLoadError }}</p>
+              <div v-for="warning in calendar.warnings" :key="warning" class="mb-1">{{ warning }}</div>
+            </details>
+            <p v-if="discoveryLoading || calendar.refreshing" class="small text-muted" role="status">正在后台读取排期，已获取的作品会先显示。</p>
             <div class="btn-group flex-wrap my-3" role="group" aria-label="更新星期">
               <button v-for="(day, i) in weekdays" :key="i" type="button" class="btn" :class="discoveryDay === i + 1 ? 'btn-primary' : 'btn-outline-primary'" :aria-pressed="discoveryDay === i + 1" @click="discoveryDay = i + 1">{{ day }}</button>
             </div>
@@ -483,7 +487,7 @@
             </div>
             <div v-for="day in calendar.days" :key="day.weekday" v-show="day.weekday === discoveryDay">
               <h3 class="h5 my-3">{{ day.label }} · {{ day.date }}</h3>
-              <p v-if="!discoveryLoading && !(day[discoveryKind] || []).length" class="text-muted">当天暂无已收录的更新；可到任务列表按名称搜索。</p>
+              <p v-if="!discoveryLoading && !calendar.refreshing && !(day[discoveryKind] || []).length" class="text-muted">当天暂无已收录的更新；可到任务列表按名称搜索。</p>
               <div v-for="group in discoveryGroups(day)" :key="group.source">
                 <h4 v-if="discoveryKind === 'donghua'" class="h6 text-muted">{{ group.source }} · {{ group.items.length }} 部 · 按本来源热度排序</h4>
                 <div class="row">
@@ -877,8 +881,9 @@
         sourceStatus: null,
         sourceStatusLoading: false,
         sourceStatusError: '',
-        calendar: { days: [], warnings: [], notes: [] },
+        calendar: { days: [], warnings: [], notes: [], refreshing: false, stale: false },
         discoveryLoading: false,
+        discoveryLoadError: '',
         discoveryError: '',
         discoverySearchDetails: {},
         discoveryFailedItem: null,
@@ -976,7 +981,10 @@
         this.fetchData();
         this.refreshRuns();
         this.runsTimer = setInterval(() => {
-          if (!document.hidden) this.refreshRuns();
+          if (!document.hidden) {
+            this.refreshRuns();
+            if (this.activeTab === 'discovery' && this.calendar.refreshing) this.loadDiscovery();
+          }
         }, 2000);
         this.checkNewVersion();
         $('[data-toggle="tooltip"]').tooltip();
@@ -1016,21 +1024,22 @@
         },
         changeTab(tab) {
           this.activeTab = tab;
-          if (tab === 'discovery' && !this.calendar.days.length) this.loadDiscovery();
+          if (tab === 'discovery') this.loadDiscovery();
           if (tab === 'runs') this.refreshRuns();
           if (window.innerWidth <= 768) {
             $('#sidebarMenu').collapse('toggle')
           }
         },
-        async loadDiscovery() {
+        async loadDiscovery(refresh = false) {
+          if (this.discoveryLoading) return;
           this.discoveryLoading = true;
-          this.discoveryError = '';
           try {
-            const response = await axios.get('/api/discovery');
+            const response = await axios.get('/api/discovery', { params: refresh === true ? { refresh: '1' } : {} });
             if (!response.data.success) throw new Error(response.data.message);
             this.calendar = response.data.data;
+            this.discoveryLoadError = '';
           } catch (error) {
-            this.discoveryError = error.response?.data?.message || error.message || '获取排期失败，请重试';
+            this.discoveryLoadError = error.response?.data?.message || error.message || '排期暂未更新，已保留现有数据';
           } finally {
             this.discoveryLoading = false;
           }

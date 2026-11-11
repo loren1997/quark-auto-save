@@ -203,6 +203,32 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(response.json["data"]["days"][0]["anime"][0]["id"], "bangumi:42")
         self.assertEqual(response.json["data"]["errors"], self.calendar["errors"])
 
+    def test_discovery_snapshot_requests_background_refresh_and_keeps_cached_cards(self):
+        self.calendar.update(cached=True, stale=True, refreshing=True,
+                             warnings=["TVmaze 暂不可用，保留本周缓存"])
+        response = self.client.get("/api/discovery")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json, {"success": True, "data": self.calendar})
+        self.get_calendar.assert_called_once_with(background=True, refresh=False)
+        self.find.assert_not_called()
+        self.assertEqual(self.saved_config(), self.config)
+
+    def test_discovery_only_explicit_refresh_one_forces_background_update(self):
+        for value, expected in (("1", True), ("0", False), ("true", False), ("", False)):
+            with self.subTest(refresh=value):
+                self.get_calendar.reset_mock()
+                response = self.client.get("/api/discovery", query_string={"refresh": value})
+                self.assertEqual(response.status_code, 200)
+                self.get_calendar.assert_called_once_with(background=True, refresh=expected)
+                self.assertEqual(response.json["data"]["days"][0]["anime"][0]["id"], self.entry["id"])
+
+    def test_anonymous_calendar_refresh_does_not_start_background_work(self):
+        response = web.app.test_client().get("/api/discovery?refresh=1")
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(response.json["success"])
+        self.get_calendar.assert_not_called()
+        self.find.assert_not_called()
+
     def test_subscription_rejects_malformed_and_unknown_ids(self):
         for value in (None, 42, ["bangumi:42"], {"id": "bangumi:42"}):
             with self.subTest(value=value):
