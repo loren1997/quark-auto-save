@@ -19,9 +19,12 @@ async ({query, limit, timeout}) => {
     state.botJobs = new Map();
   }
   // Re-read posts skipped by the old button parser, retaining already-started bot requests.
-  if (state.buttonSchema !== 2) {
+  if (state.buttonSchema !== 3) {
     state.searches = new Map();
-    state.buttonSchema = 2;
+    state.buttonSchema = 3;
+    for (const job of state.botJobs?.values() || []) {
+      if (job.started && !job.replies) { job.failed = false; job.polls = 0; job.waitUntil = Date.now() + 45000; }
+    }
   }
   const botJobs = state.botJobs ||= new Map();
   for (const [payload, job] of botJobs) {
@@ -44,8 +47,11 @@ async ({query, limit, timeout}) => {
   let archive = state.archives;
   let botPeer, activeJob, detailRequest;
   let botChecked = false;
+  let globalPages = 0, directLinks = 0;
+  const globalDialogs = new Set(), richCache = new WeakMap();
   const bot = {requests: 0, links: 0, pending: 0, failed: 0, channel_posts: 0, buttons: 0, channel_archived: 0,
-    details_read: 0, details_failed: 0, button_count: 0, button_rejections: {}};
+    details_read: 0, details_failed: 0, button_count: 0, button_rejections: {},
+    reply_messages: 0, reply_rich: 0, reply_links: 0};
   const isOscarChannel = entity => entity.input._ === 'inputPeerChannel' && (
     [entity.username, ...(entity.usernames || [])].some(name => name?.toLowerCase() === 'oscar_4kmovies')
     || /奥斯卡.*(?:4k|蓝光).*(?:影视|磁力)/i.test(String(entity.title || '').normalize('NFKC')));
@@ -120,18 +126,42 @@ async ({query, limit, timeout}) => {
   }
   function progress() {
     return {phase, current: phase === 'archives' ? archive?.peers.size || 0 : search?.seen || 0,
-      total: phase === 'archives' ? archive?.total || 0 : search?.total || 0};
+      total: phase === 'archives' ? archive?.total || 0 : search?.total || 0,
+      global_pages: globalPages, global_dialogs: globalDialogs.size, direct_links: directLinks};
   }
-  const buttons = message => (message.reply_markup?.rows || []).flatMap(row => row.buttons || [])
+  function richContent(message) {
+    if (richCache.has(message)) return richCache.get(message);
+    const result = {text: '', links: [], buttons: []};
+    let nodes = 0;
+    const visit = (node, depth = 0) => {
+      if (++nodes > 2000 || depth > 24) return '';
+      if (typeof node === 'string') return node.slice(0, 16000);
+      if (Array.isArray(node)) return node.slice(0, 2000).map(item => visit(item, depth + 1)).join('\n');
+      if (!node || typeof node !== 'object') return '';
+      if (node._ === 'textUrl' && typeof node.url === 'string') result.links.push(node.url);
+      if (node._ === 'pageButton') result.buttons.push(node);
+      if (node._ === 'textConcat' && Array.isArray(node.texts)) {
+        return node.texts.slice(0, 2000).map(item => visit(item, depth + 1)).join('');
+      }
+      return ['text', 'title', 'caption', 'credit', 'blocks', 'items', 'rows', 'cells', 'cover', 'buttons']
+        .filter(field => node[field] !== undefined).map(field => visit(node[field], depth + 1)).filter(Boolean).join('\n');
+    };
+    if (message.rich_message?._ === 'richMessage') result.text = visit(message.rich_message.blocks).slice(0, 32000);
+    richCache.set(message, result);
+    return result;
+  }
+  const messageText = message => [String(message.message || ''), richContent(message).text].filter(Boolean).join('\n');
+  const buttons = message => [...(message.reply_markup?.rows || []).flatMap(row => row.buttons || []),
+    ...richContent(message).buttons]
     .filter(button => button && typeof button === 'object').map(button => {
-      const type = button._ === 'keyboardInlineButton' ? button.type : null;
+      const type = ['keyboardInlineButton', 'pageButton'].includes(button._) ? button.type : null;
       if (type?._ === 'inlineButtonTypeUrl') return {_: 'keyboardButtonUrl', text: button.text, url: type.url};
       if (type?._ === 'inlineButtonTypeCopy') return {_: 'keyboardButtonCopy', text: button.text, copy_text: type.copy_text};
       return button;
     });
   function shares(message) {
-    const text = String(message.message || '');
-    const links = [text,
+    const text = messageText(message);
+    const links = [text, ...richContent(message).links,
       ...(message.entities || []).filter(e => e._ === 'messageEntityTextUrl').map(e => e.url || ''),
       ...buttons(message).filter(b => b._ === 'keyboardButtonUrl').map(b => b.url || ''),
       ...buttons(message).filter(b => b._ === 'keyboardButtonCopy').map(b => b.copy_text || '')].join('\n');
@@ -147,7 +177,7 @@ async ({query, limit, timeout}) => {
     });
   }
   function addShares(message, post, entity, priority = false) {
-    const text = String(post.message || '');
+    const text = messageText(post);
     for (const url of shares(message)) {
       if (search.urls.has(url)) continue;
       search.urls.add(url);
@@ -158,7 +188,7 @@ async ({query, limit, timeout}) => {
       }
       const item = {peerKey: key(post.peer_id), candidate, priority};
       if (priority) { search.pending.unshift(item); bot.links++; }
-      else search.pending.push(item);
+      else { search.pending.push(item); directLinks++; }
     }
   }
   function resourcePayload(button) {
@@ -214,26 +244,34 @@ async ({query, limit, timeout}) => {
           const random = crypto.getRandomValues(new Uint32Array(2));
           job.randomId = (BigInt.asIntN(64, (BigInt(random[0]) << 32n) | BigInt(random[1])) || 1n).toString();
           job.started = true; // An ambiguous timeout must not send another /start on the next batch.
+          job.waitUntil = Date.now() + 45000;
           bot.requests++;
-          const started = await invoke('messages.startBot', {bot: {_: 'inputUser', user_id: user.id,
-            access_hash: user.access_hash}, peer: botPeer, random_id: job.randomId, start_param: job.payload});
+          let started;
+          try {
+            started = await invoke('messages.startBot', {bot: {_: 'inputUser', user_id: user.id,
+              access_hash: user.access_hash}, peer: botPeer, random_id: job.randomId, start_param: job.payload});
+          } catch (error) {
+            if (/^FLOOD(?:_PREMIUM)?_WAIT_/.test(String(error?.type || ''))) job.started = false;
+            throw error;
+          }
           job.requestId = (started.updates || []).map(u => u.message).find(m => m?.pFlags?.out
             && key(m.peer_id) === `u:${user.id}` && m.message === `/start ${job.payload}`)?.id;
         }
-        const end = Math.min(until - 300, Date.now() + 6000);
         const normalize = value => String(value).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-        do {
-          const response = await history(job.baseline);
-          if (!Array.isArray(response.messages)) throw {type: 'BOT_UNAVAILABLE'};
-          const replies = response.messages.filter(m => m._ === 'message' && !m.pFlags?.out
-            && m.id > job.baseline && key(m.peer_id) === `u:${user.id}` && (!m.from_id || key(m.from_id) === `u:${user.id}`)
-            && (job.requestId && m.reply_to?.reply_to_msg_id === job.requestId
-              || normalize(m.message || '').includes(normalize(query))) && shares(m).length);
-          if (replies.length) { job.replies = replies; break; }
-          if (Date.now() + 600 >= end) break;
-          await new Promise(resolve => setTimeout(resolve, 500));
-        } while (Date.now() < end);
-        if (!job.replies && ++job.polls >= 3) job.failed = true;
+        // Poll once per paced search batch; other archived chats must not wait for this bot.
+        const response = await history(job.baseline);
+        if (!Array.isArray(response.messages)) throw {type: 'BOT_UNAVAILABLE'};
+        const fresh = response.messages.filter(m => m._ === 'message' && !m.pFlags?.out
+          && m.id > job.baseline && key(m.peer_id) === `u:${user.id}` && (!m.from_id || key(m.from_id) === `u:${user.id}`));
+        bot.reply_messages += fresh.length;
+        bot.reply_rich += fresh.filter(m => m.rich_message?._ === 'richMessage').length;
+        const linked = fresh.filter(m => shares(m).length);
+        bot.reply_links += linked.length;
+        const replies = linked.filter(m => job.requestId && m.reply_to?.reply_to_msg_id === job.requestId
+          || normalize(query) && normalize(messageText(m)).includes(normalize(query))
+          || new RegExp('\\bID\\s*[:：#]?\\s*' + job.payload.slice(3) + '(?![0-9])', 'i').test(messageText(m)));
+        if (replies.length) job.replies = replies;
+        if (!job.replies && (++job.polls >= 15 || Date.now() >= job.waitUntil)) job.failed = true;
       }
       if (job.replies) {
         for (const reply of job.replies) addShares(reply, item.post, entity, true);
@@ -283,9 +321,15 @@ async ({query, limit, timeout}) => {
         if (payload && !search.botSeen.has(payload)) {
           search.botSeen.add(payload); bot.buttons++;
           search.botPending.push({payload, post: {id: message.id, peer_id: message.peer_id,
-            message: message.message}, peerKey: key(message.peer_id)});
+            message: messageText(message)}, peerKey: key(message.peer_id)});
         }
       }
+    }
+  }
+  function drain() {
+    while (search.pending.length && results.length < limit) {
+      const item = search.pending.shift();
+      if (archive.peers.has(item.peerKey)) results.push(item.candidate);
     }
   }
   try {
@@ -323,14 +367,6 @@ async ({query, limit, timeout}) => {
         done: false, exhausted: false, pending: [], urls: new Set(), botPending: [], botSeen: new Set(), used: Date.now()};
       searches.set(query, search);
     }
-    const drain = () => {
-      while (search.pending.length && results.length < limit) {
-        // Finish resource buttons in search order before stale direct links consume the verification budget.
-        if (search.botPending.length && !search.pending[0].priority) break;
-        const item = search.pending.shift();
-        if (archive.peers.has(item.peerKey)) results.push(item.candidate);
-      }
-    };
     const channel = [...archive.peers.values()].find(isOscarChannel);
     bot.channel_archived = channel ? 1 : 0;
     const channelKey = channel ? `c:${channel.input.channel_id}` : '';
@@ -351,18 +387,19 @@ async ({query, limit, timeout}) => {
       }
       search.channelChecked = channelKey;
     }
-    await resolveResourceButton();
-    drain();
-    while (!search.exhausted && !search.botPending.length && results.length < limit && archive.peers.size) {
+    // Search all archived dialogs independently of pending resource buttons.
+    while (!search.exhausted && search.pending.length < limit && archive.peers.size) {
       const response = await invoke('messages.searchGlobal', {folder_id: 1, q: query,
         filter: {_: 'inputMessagesFilterEmpty'}, min_date: 0, max_date: 0,
         offset_rate: search.rate, offset_peer: search.peer, offset_id: search.id, limit: 100});
       if (!Array.isArray(response.messages)) throw {type: 'BRIDGE_UNAVAILABLE'};
       const entities = peers(response);
+      globalPages++;
+      for (const message of response.messages) {
+        if (archive.peers.has(key(message.peer_id))) globalDialogs.add(key(message.peer_id));
+      }
       search.total = Math.max(search.total, Number(response.count) || response.messages.length);
       collectMessages(response.messages);
-      await resolveResourceButton();
-      drain();
       if (response._ === 'messages.messages' || !response.messages.length) { search.exhausted = true; break; }
       const last = response.messages[response.messages.length - 1];
       const id = key(last.peer_id), entity = entities.get(id) || archive.peers.get(id);
@@ -371,6 +408,8 @@ async ({query, limit, timeout}) => {
       if (!entity || !last.id || cursor === search.cursor) throw {type: 'PAGINATION_FAILED'};
       search.cursor = cursor; search.id = last.id; search.peer = entity.input; search.rate = nextRate;
     }
+    await resolveResourceButton();
+    drain();
     if (!archive.peers.size) search.exhausted = true;
     bot.pending = search.botPending.length;
     search.done = search.exhausted && !search.pending.length && !bot.pending;
@@ -379,6 +418,7 @@ async ({query, limit, timeout}) => {
       partial: !search.done, progress: progress(), bot};
   } catch (error) {
     const type = String(error?.type || error?.message || '');
+    if (search && archive?.complete && /FLOOD|BUDGET_EXHAUSTED/.test(type)) drain();
     const flood = /FLOOD(?:_PREMIUM)?_WAIT_(\d+)/.exec(type);
     let code = flood ? 'FLOOD_WAIT' : ['ACCOUNT_CHANGED','AUTH_KEY_UNREGISTERED','SESSION_REVOKED','SESSION_EXPIRED'].includes(type)
       ? 'AUTH_REQUIRED' : ['BUDGET_EXHAUSTED','PAGINATION_FAILED','BRIDGE_UNAVAILABLE'].includes(type) ? type : 'SEARCH_FAILED';

@@ -505,9 +505,9 @@ global.response=async(method,params)=>method==='messages.search'
 const result=await run('作品',1);
 assert.equal(starts,0);assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
 assert.equal(result.bot.channel_posts,1);assert.equal(result.bot.buttons,1);
-assert.equal(window.__qasArchiveReadState.buttonSchema,2);
+assert.equal(window.__qasArchiveReadState.buttonSchema,3);
 assert.equal(window.__qasArchiveReadState.searches.get('作品').id,0);
-assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));
+assert.equal(calls.filter(c=>c.method==='messages.searchGlobal').length,1);
 """)
 
     def test_oscar_start_reply_is_prioritized_and_keeps_archived_provenance(self):
@@ -519,6 +519,94 @@ assert.equal(result.results[0].title,'作品 第4季');assert.equal(result.resul
 assert.equal(result.bot.requests,1);assert.equal(result.bot.links,1);assert.equal(result.partial,true);
 assert.ok(!JSON.stringify(result).includes('BOT_PRIVATE_HASH'));assert.ok(!JSON.stringify(result).includes('get59171'));
 const second=await run('作品',1);assert.equal(starts,1);assert.equal(second.results[0].url,'https://pan.quark.cn/s/STALE0111111');
+""")
+
+    def test_rich_bot_reply_title_code_block_and_page_buttons_are_read(self):
+        self.run_bot_bridge(r"""
+const plain=text=>({_: 'textPlain',text});
+post.message='一念永恒 第四季';
+replyOverride=()=>[reply(102,'',{rich_message:{_: 'richMessage',blocks:[
+ {_: 'pageBlockHeading1',text:{_: 'textConcat',texts:[plain('一念'),{_: 'textBold',text:plain('永恒')}]}},
+ {_: 'pageBlockPreformatted',text:plain('https://pan.quark.cn/s/RICH00111111'),language:''},
+ {_: 'pageBlockButtonRow',buttons:[{_: 'pageButton',text:plain('复制链接'),
+  type:{_: 'inlineButtonTypeCopy',copy_text:'https://pan.quark.cn/s/RICH00111111'}}]}]}})];
+const result=await run('一念永恒');
+assert.equal(result.results.length,1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/RICH00111111');
+assert.equal(result.results[0].title,'一念永恒 第四季');
+assert.equal(result.bot.reply_messages,1);assert.equal(result.bot.reply_rich,1);assert.equal(result.bot.reply_links,1);
+assert.equal(historyReads,2);
+""")
+
+    def test_rich_direct_posts_in_other_archived_dialogs_need_no_bot(self):
+        self.run_bridge(r"""
+const plain=text=>({_: 'textPlain',text});
+const posts=peers.map((peer,i)=>({...message(peer,10+i,''),rich_message:{_: 'richMessage',blocks:[
+ {_: 'pageBlockHeading1',text:plain('作品 第四季')},
+ {_: 'pageBlockDetails',title:plain('资源'),blocks:[
+  i===0?{_: 'pageBlockParagraph',text:{_: 'textUrl',text:plain('夸克'),url:'https://pan.quark.cn/s/RICH0000000'+i}}:
+  i===1?{_: 'pageBlockTable',rows:[{_: 'pageTableRow',cells:[{_: 'pageTableCell',text:plain('https://pan.quark.cn/s/RICH0000000'+i)}]}]}:
+  {_: 'pageBlockButtonRow',buttons:[{_: 'pageButton',text:plain('资源'),type:{_: 'inlineButtonTypeUrl',url:'https://pan.quark.cn/s/RICH0000000'+i}}]}]}]}}));
+posts.push({...posts[0],peer_id:{_: 'peerChannel',channel_id:99}});
+global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'
+ ? allDialogs():{_: 'messages.messages',messages:posts,users:[user],chats:[chat,channel]};
+const result=await run();assert.equal(result.results.length,3);
+assert.ok(result.results.every(r=>r.title==='作品 第四季'));
+assert.equal(result.progress.global_pages,1);assert.equal(result.progress.global_dialogs,3);assert.equal(result.progress.direct_links,3);
+assert.equal(result.bot.requests,0);assert.equal(calls.length,3);
+""")
+
+    def test_rich_reply_resource_id_association_rejects_other_and_old_replies(self):
+        self.run_bot_bridge(r"""
+const rich=(id,resource,extra={})=>reply(id,'',{rich_message:{_: 'richMessage',blocks:[
+ {_: 'pageBlockParagraph',text:{_: 'textPlain',text:'资源 ID '+resource}},
+ {_: 'pageBlockPreformatted',text:{_: 'textPlain',text:'https://pan.quark.cn/s/ID0000'+resource}}]},...extra});
+replyOverride=()=>[rich(99,'59171'),rich(102,'59172'),rich(103,'59171',{from_id:{_: 'peerUser',user_id:43}}),rich(104,'59171')];
+const result=await run();assert.equal(result.results.length,1);
+assert.equal(result.results[0].url,'https://pan.quark.cn/s/ID000059171');assert.equal(result.bot.reply_links,2);
+""")
+
+    def test_pending_bot_reply_does_not_block_other_archived_links(self):
+        self.run_bot_bridge(r"""
+channel.title='奥斯卡4K蓝光(精品)影视磁力站';
+const original=response;
+global.response=async(method,params)=>{
+ if(method==='messages.search')return {_: 'messages.channelMessages',messages:[post],chats:[channel]};
+ if(method==='messages.searchGlobal')return {_: 'messages.messages',messages:[
+  message(peers[0],13,'作品 https://pan.quark.cn/s/USER00111111'),
+  message(peers[1],14,'作品 https://pan.quark.cn/s/GROUP0111111')],users:[user],chats:[chat]};
+ return original(method,params);
+};
+replyOverride=()=>[reply(102,'请稍候')];
+const first=await run();assert.equal(first.results.length,2);assert.equal(first.bot.pending,1);
+assert.equal(first.progress.global_dialogs,2);assert.equal(historyReads,2);assert.equal(first.bot.failed,0);
+replyOverride=()=>[reply(103,'作品 https://pan.quark.cn/s/NEW000111111')];
+const second=await run();assert.equal(second.results.length,1);assert.equal(starts,1);assert.equal(historyReads,3);
+""")
+
+    def test_rejected_bot_start_keeps_direct_links_and_can_retry_after_flood(self):
+        self.run_bot_bridge(r"""
+posts.push(message(peers[1],14,'作品 https://pan.quark.cn/s/GROUP0111111'));
+const original=response;let attempts=0;
+global.response=async(method,params)=>{
+ if(method==='messages.startBot'&&++attempts===1)throw {type:'FLOOD_WAIT_5'};
+ return original(method,params);
+};
+const first=await run();assert.equal(first.code,'FLOOD_WAIT');assert.equal(first.retry_after,5);
+assert.equal(first.results.length,1);assert.equal(first.results[0].url,'https://pan.quark.cn/s/GROUP0111111');
+assert.equal(window.__qasArchiveReadState.botJobs.get('get59171').started,false);
+const clock=Date.now;Date.now=()=>clock()+6000;
+const second=await run();assert.equal(second.results.length,1);assert.equal(attempts,2);assert.equal(starts,1);
+""")
+
+    def test_rich_html_and_unsafe_page_button_actions_are_not_followed(self):
+        self.run_bot_bridge(r"""
+post.reply_markup={rows:[]};post.message='作品';
+post.rich_message={_: 'richMessage',blocks:[
+ {_: 'pageBlockEmbed',html:'https://pan.quark.cn/s/HIDDEN111111'},
+ {_: 'pageBlockButtonRow',buttons:[{_: 'pageButton',text:{_: 'textPlain',text:'获取资源'},
+  type:{_: 'inlineButtonTypeCallback',data:'get59171',url:'tg://resolve?domain=Oscar4KBot&start=get59171'}}]}]};
+post.rich_message.blocks.push({_: 'pageBlockCover',cover:post.rich_message});
+const result=await run();assert.equal(starts,0);assert.equal(result.results.length,0);assert.equal(result.success,true);
 """)
 
     def test_archived_oscar_channel_is_searched_before_global_stale_results(self):
@@ -533,7 +621,7 @@ global.response=async(method,params)=>{
 const result=await run('作品',1);
 assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
 assert.equal(result.bot.channel_posts,1);assert.equal(result.bot.buttons,1);assert.equal(starts,1);
-assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));
+assert.ok(calls.findIndex(c=>c.method==='messages.search') < calls.findIndex(c=>c.method==='messages.searchGlobal'));
 await run('作品',1);assert.equal(calls.filter(c=>c.method==='messages.search').length,1);
 """)
 
@@ -557,7 +645,7 @@ global.response=async(method,params)=>{
 };
 const result=await run('作品',1);
 assert.equal(result.bot.details_read,1);assert.equal(result.bot.details_failed,0);
-assert.equal(result.bot.button_count,1);assert.equal(result.bot.buttons,1);assert.equal(starts,1);
+assert.equal(result.bot.button_count,2);assert.equal(result.bot.buttons,1);assert.equal(starts,1);
 assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
 """)
 
@@ -603,7 +691,7 @@ global.response=async(method,params)=>method==='messages.search'?{messages:[post
 const result=await run('作品',1);
 assert.equal(result.bot.channel_archived,1);assert.equal(starts,1);
 assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
-assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));
+assert.equal(calls.filter(c=>c.method==='messages.searchGlobal').length,1);
 """)
 
     def test_unarchived_oscar_title_and_inactive_username_do_not_authorize_search(self):
@@ -632,6 +720,7 @@ post.reply_markup.rows[0].buttons[0].url='https://t.me/Oscar4KBot?start=get59171
 let polls=0;
 replyOverride=()=>++polls===1?[reply(102,'正在获取')]:[reply(102,'#作品',{
  reply_markup:{rows:[{buttons:[{_: 'keyboardButtonCopy',copy_text:'https://pan.quark.cn/s/NEW000111111'}]}]}})];
+const first=await run();assert.equal(polls,1);assert.equal(first.bot.pending,1);assert.equal(first.results.length,0);
 const result=await run();assert.equal(polls,2);assert.equal(starts,1);assert.equal(result.results.length,1);
 """)
 
@@ -656,7 +745,7 @@ for(const url of urls){
 }
 """)
 
-    def test_channel_buttons_are_resolved_top_to_bottom_before_stale_global_links(self):
+    def test_channel_buttons_keep_order_without_blocking_global_links(self):
         self.run_bot_bridge(r"""
 channel.title='奥斯卡4K蓝光(精品)影视磁力站';
 const payloads=['get59171','get59172','get59173'];
@@ -678,8 +767,10 @@ for(let i=0;i<3;i++){
  const result=await run('作品',6);
  assert.equal(starts,i+1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000'+payloads[i].slice(3));
  assert.equal(result.results[0].source_url,'https://t.me/publicchannel/'+(12-i));
- if(i<2){assert.equal(result.results.length,1);assert.equal(result.partial,true);
-  assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));}
+ assert.equal(result.results.length,i===0?2:1);
+ if(i===0)assert.equal(result.results[1].url,'https://pan.quark.cn/s/STALE0111111');
+ if(i<2)assert.equal(result.partial,true);
+ assert.equal(calls.filter(c=>c.method==='messages.searchGlobal').length,1);
 }
 """)
 
@@ -775,7 +866,7 @@ const second=await run();assert.equal(second.code,'AUTH_REQUIRED');assert.equal(
         self.run_bot_bridge(r"""
 replyOverride=()=>[reply(102,'请稍候')];
 const first=await run();assert.equal(first.bot.pending,1);assert.equal(first.partial,true);assert.equal(starts,1);
-window.__qasArchiveReadState.botJobs.get('get59171').polls=2;
+window.__qasArchiveReadState.botJobs.get('get59171').waitUntil=Date.now()-1;
 const second=await run();assert.equal(second.bot.failed,1);assert.equal(second.bot.pending,0);assert.equal(starts,1);
 assert.equal(second.partial,false);assert.equal(second.results.length,0);
 """)

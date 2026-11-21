@@ -115,7 +115,7 @@ def _safe_result(result, action):
         clean["partial"] = result.get("partial") is True
         bot = result.get("bot")
         if isinstance(bot, dict):
-            clean["bot"] = {key: _number(bot.get(key)) for key in ("requests", "links", "pending", "failed", "channel_posts", "buttons", "channel_archived", "details_read", "details_failed", "button_count")}
+            clean["bot"] = {key: _number(bot.get(key)) for key in ("requests", "links", "pending", "failed", "channel_posts", "buttons", "channel_archived", "details_read", "details_failed", "button_count", "reply_messages", "reply_rich", "reply_links")}
             rejected = bot.get("button_rejections")
             if isinstance(rejected, dict):
                 clean["bot"]["button_rejections"] = {key: _number(rejected.get(key)) for key in
@@ -124,6 +124,8 @@ def _safe_result(result, action):
         if isinstance(progress, dict) and progress.get("phase") in ("archives", "search", "complete"):
             clean["progress"] = {"phase": progress["phase"], "current": _number(progress.get("current")),
                                  "total": _number(progress.get("total"))}
+            clean["progress"].update({key: _number(progress.get(key)) for key in
+                                     ("global_pages", "global_dialogs", "direct_links") if key in progress})
     return clean
 
 

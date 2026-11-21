@@ -35,6 +35,7 @@ def search_error_reason(message):
     for pattern, reason in (
         (r"Telegram 暂时限制查询|Telegram 查询限流|FLOOD(?:_PREMIUM)?_WAIT", "Telegram 查询限流，等待冷却后自动重试"),
         (r"归档消息详情读取失败", "归档消息详情读取失败，稍后自动重试"),
+        (r"Oscar4KBot 暂不可用或未返回可关联的夸克资源", "Oscar4KBot 暂不可用或未返回可关联的夸克资源，稍后自动重试"),
         (r"没有启用的搜索源|未启用其他索引来源", "未启用其他索引来源"),
         (r"本次查找已跳过此前失败的来源", "本次查找已跳过此前失败的来源"),
         (r"非公网", "地址解析为非公网 IP，已拒绝访问"),
@@ -117,12 +118,19 @@ def search_telegram_resources(query, config, health_path=None, limit=20, deadlin
               f"已检查 {progress.get('current', 0)} 条消息，返回 {len(candidates)} 条夸克候选"
               + ("；还有结果待继续查询" if result.get("partial") else ""), flush=True)
     errors = []
+    if not reading_archives and "global_pages" in progress:
+        print(f"Telegram归档直链：范围为全部 {data.get('archived_count', 0)} 个归档对话；"
+              f"本批读取 {progress['global_pages']} 页，命中 {progress.get('global_dialogs', 0)} 个对话，"
+              f"新增 {progress.get('direct_links', 0)} 条直链", flush=True)
     bot = result.get("bot") or {}
     if bot:
         channel_state = "归档列表未读完，奥斯卡频道状态待确认" if reading_archives else ("奥斯卡资源频道在归档中" if bot.get("channel_archived") else "未检测到已归档的奥斯卡资源频道")
         print(f"Telegram归档资源按钮：{channel_state}；本批定向查询 {bot.get('channel_posts', 0)} 条帖子，补读 {bot.get('details_read', 0)} 条详情，读取 {bot.get('button_count', 0)} 个按钮，识别 {bot.get('buttons', 0)} 个资源按钮；Oscar4KBot 请求 {bot.get('requests', 0)} 次，"
               f"新增 {bot.get('links', 0)} 条夸克候选，待获取 {bot.get('pending', 0)} 项，"
               f"未取得可关联资源回复 {bot.get('failed', 0)} 项", flush=True)
+        if bot.get("requests") or bot.get("pending") or bot.get("reply_messages"):
+            print(f"Telegram机器人回复：本批读取 {bot.get('reply_messages', 0)} 条新消息，"
+                  f"其中富文本 {bot.get('reply_rich', 0)} 条、含夸克链接 {bot.get('reply_links', 0)} 条", flush=True)
         rejected = bot.get("button_rejections") or {}
         reasons = [("not_url", "非链接按钮"), ("invalid_url", "链接格式不支持"), ("other_target", "其他目标"),
                    ("other_action", "非资源获取操作"), ("invalid_payload", "资源编号不支持")]

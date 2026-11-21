@@ -97,12 +97,20 @@ class TelegramArchiveSearchIntegrationTests(unittest.TestCase):
         self.browser.search.assert_not_called()
 
     def test_resource_button_failure_is_logged_without_losing_candidates(self):
-        self.browser.search.return_value.update(bot={"requests": 1, "links": 1, "pending": 0, "failed": 1})
+        self.browser.search.return_value.update(bot={"requests": 1, "links": 1, "pending": 0, "failed": 1,
+                                                    "reply_messages": 3, "reply_rich": 2, "reply_links": 1},
+            progress={"phase": "search", "global_pages": 1, "global_dialogs": 4, "direct_links": 6},
+            data={"archived_count": 28})
         with patch("resource_search.print") as log:
             result = search_telegram_resources("测试动画", self.config)
         self.assertEqual(result["data"], [self.candidate])
         self.assertEqual(result["errors"][0]["source"], "Telegram归档资源按钮")
         self.assertTrue(any("Oscar4KBot 请求 1 次" in call.args[0] for call in log.call_args_list))
+        text = "\n".join(call.args[0] for call in log.call_args_list)
+        self.assertIn("范围为全部 28 个归档对话", text)
+        self.assertIn("命中 4 个对话，新增 6 条直链", text)
+        self.assertIn("本批读取 3 条新消息，其中富文本 2 条、含夸克链接 1 条", text)
+        self.assertEqual(search_error_reason(result["errors"][0]["message"]), result["errors"][0]["message"])
 
     def test_partial_archive_flood_reports_wait_without_saying_channel_is_missing(self):
         self.browser.search.return_value = {"success": False, "code": "FLOOD_WAIT", "results": [], "partial": True,
