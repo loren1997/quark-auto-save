@@ -42,9 +42,9 @@ class ResourceHistoryTests(unittest.TestCase):
             self.assertTrue(restarted.find_valid_resource(self.task, {})["success"])
         token.assert_called_once_with("old", "")
 
-    def test_expired_or_changed_history_continues_to_live_search(self):
+    def test_expired_or_nonvideo_history_continues_to_live_search(self):
         qas.Config.remember_resources(self.history_path, [self.old])
-        for stale in ({"code": 1, "message": "分享已取消"}, self.detail(title="另一部作品 (2026)"), self.detail(title="测试作品 (2025)")):
+        for stale in ({"code": 1, "message": "分享已取消"}, {"code": 0, "data": {"list": []}}, {"code": 0, "data": {"list": [{"fid": "image", "file_name": "poster.png", "dir": False}]}}):
             with self.subTest(stale=stale), \
                     patch.object(self.account, "get_stoken", return_value={"status": 200, "data": {"stoken": "t"}}), \
                     patch.object(self.account, "get_detail", side_effect=lambda share, *_a, **_k: stale if share == "old" else self.detail()), \

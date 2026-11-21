@@ -39,7 +39,7 @@ async ({query, limit, timeout}) => {
   let archive = state.archives;
   let botPeer, activeJob;
   let botChecked = false;
-  const bot = {requests: 0, links: 0, pending: 0, failed: 0};
+  const bot = {requests: 0, links: 0, pending: 0, failed: 0, channel_posts: 0, buttons: 0, channel_archived: 0};
   function assertAccount() {
     if (String(window.rootScope?.myId) !== account) throw {type: 'ACCOUNT_CHANGED'};
   }
@@ -54,7 +54,11 @@ async ({query, limit, timeout}) => {
           || method === 'messages.startBot' && params.start_param === activeJob.payload
             && params.bot?._ === 'inputUser' && params.bot.user_id === botPeer.user_id
             && params.bot.access_hash === botPeer.access_hash));
-    if (!archiveRead && !botRead) throw {type: 'BRIDGE_UNAVAILABLE'};
+    const channelRead = method === 'messages.search' && archive?.complete
+      && [...archive.peers.values()].some(entity => entity.username?.toLowerCase() === 'oscar_4kmovies'
+        && entity.input._ === 'inputPeerChannel' && params.peer?._ === 'inputPeerChannel'
+        && params.peer.channel_id === entity.input.channel_id && params.peer.access_hash === entity.input.access_hash);
+    if (!archiveRead && !botRead && !channelRead) throw {type: 'BRIDGE_UNAVAILABLE'};
     const remaining = until - Date.now();
     if (remaining < 250) throw {type: 'BUDGET_EXHAUSTED'};
     let timer;
@@ -212,6 +216,22 @@ async ({query, limit, timeout}) => {
       activeJob = null; botPeer = null;
     }
   }
+  function collectMessages(messages) {
+    for (const message of messages) {
+      search.seen++;
+      const entity = archive.peers.get(key(message.peer_id));
+      if (!entity || message._ !== 'message') continue;
+      addShares(message, message, entity);
+      for (const button of buttons(message)) {
+        const payload = resourcePayload(button);
+        if (payload && !search.botSeen.has(payload)) {
+          search.botSeen.add(payload); bot.buttons++;
+          search.botPending.push({payload, post: {id: message.id, peer_id: message.peer_id,
+            message: message.message}, peerKey: key(message.peer_id)});
+        }
+      }
+    }
+  }
   try {
     // Refresh the complete archive membership for every request. A timed-out
     // archive listing resumes from its cursor; it is never treated as the whole folder.
@@ -253,6 +273,24 @@ async ({query, limit, timeout}) => {
         if (archive.peers.has(item.peerKey)) results.push(item.candidate);
       }
     };
+    const channel = [...archive.peers.values()].find(entity => entity.username?.toLowerCase() === 'oscar_4kmovies');
+    bot.channel_archived = channel ? 1 : 0;
+    if (!search.channelChecked) {
+      if (channel) {
+        try {
+          const response = await invoke('messages.search', {peer: channel.input, q: query,
+            filter: {_: 'inputMessagesFilterEmpty'}, min_date: 0, max_date: 0, offset_id: 0,
+            add_offset: 0, limit: 20, max_id: 0, min_id: 0, hash: '0'});
+          if (!Array.isArray(response.messages)) throw {type: 'BRIDGE_UNAVAILABLE'};
+          bot.channel_posts = response.messages.length;
+          collectMessages(response.messages.filter(message => key(message.peer_id) === `c:${channel.input.channel_id}`));
+        } catch (error) {
+          if (/FLOOD|ACCOUNT_CHANGED|AUTH_KEY|SESSION_|BUDGET_EXHAUSTED/.test(String(error?.type || ''))) throw error;
+          bot.failed++;
+        }
+      }
+      search.channelChecked = true;
+    }
     await resolveResourceButton();
     drain();
     while (!search.exhausted && results.length < limit && archive.peers.size) {
@@ -262,20 +300,7 @@ async ({query, limit, timeout}) => {
       if (!Array.isArray(response.messages)) throw {type: 'BRIDGE_UNAVAILABLE'};
       const entities = peers(response);
       search.total = Math.max(search.total, Number(response.count) || response.messages.length);
-      for (const message of response.messages) {
-        search.seen++;
-        const entity = archive.peers.get(key(message.peer_id));
-        if (!entity || message._ !== 'message') continue;
-        addShares(message, message, entity);
-        for (const button of buttons(message)) {
-          const payload = resourcePayload(button);
-          if (payload && !search.botSeen.has(payload)) {
-            search.botSeen.add(payload);
-            search.botPending.push({payload, post: {id: message.id, peer_id: message.peer_id,
-              message: message.message}, peerKey: key(message.peer_id)});
-          }
-        }
-      }
+      collectMessages(response.messages);
       await resolveResourceButton();
       drain();
       if (response._ === 'messages.messages' || !response.messages.length) { search.exhausted = true; break; }

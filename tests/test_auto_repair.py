@@ -52,6 +52,14 @@ class AutoRepairTests(unittest.TestCase):
         return {"taskname": title or self.task["taskname"],
                 "shareurl": f"https://pan.quark.cn/s/{share}?pwd=abcd", "source": "test"}
 
+    def strict_candidate(self):
+        # Retain coverage of the strict manual-link verifier, not the new description policy.
+        from resource_search import search_resources
+        rows = search_resources(self.task["taskname"], {}).get("data", [])
+        return self.account._find_verified_resource(
+            self.task, rows, set(), self.task.get("search_aliases", []), max_checked=12,
+            verify_index_title=False)
+
     def search(self, candidates):
         return patch("resource_search.search_resources", return_value={
             "success": True, "data": candidates, "errors": [],
@@ -108,7 +116,7 @@ class AutoRepairTests(unittest.TestCase):
                          search_aliases=["生徒会にも穴はある!", "脑洞学生会"])
         title = "学生会也有洞！ 生徒会にも穴はある! (2026)"
         folder = {"code": 0, "data": {"share": {"title": title}, "list": [
-            {"fid": "folder", "dir": True, "file_name": title},
+            {"fid": "f" * 32, "dir": True, "file_name": title},
         ]}}
         videos = {"code": 0, "data": {"list": [
             {"fid": "video", "dir": False, "file_name": "Even.the.Student.Council.Has.Its.Holes.S01E05.mkv"},
@@ -121,7 +129,7 @@ class AutoRepairTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual([call.args[0] for call in search.call_args_list], ["学生会也有洞", "生徒会にも穴はある"])
 
-    def test_alias_query_preserves_original_year_and_season_requirements(self):
+    def test_alias_query_matches_introduction_without_requiring_its_year(self):
         self.task["search_aliases"] = ["Test Show"]
         wrong = self.candidate(title="Test Show 第二季 (2023)")
         right = self.candidate(title="Test Show 第二季 (2024)")
@@ -133,7 +141,7 @@ class AutoRepairTests(unittest.TestCase):
         self.assertEqual(search.call_args.args[0], "Test Show")
         token.assert_called_once()
 
-    def test_first_season_english_alias_does_not_turn_valid_video_into_conflict(self):
+    def test_strict_first_season_english_alias_does_not_turn_valid_video_into_conflict(self):
         english = "Even the Student Council Has Its Holes"
         self.task.update(taskname="学生会也有洞！ (2026)", resource_type="anime",
                          search_aliases=["生徒会にも穴はある!", english])
@@ -144,10 +152,11 @@ class AutoRepairTests(unittest.TestCase):
             with self.subTest(season=season), self.search([self.candidate()]), \
                     patch.object(self.account, "get_stoken", return_value=TOKEN), \
                     patch.object(self.account, "get_detail", return_value=detail):
-                self.assertEqual(self.account.find_valid_resource(self.task, {})["success"], accepted)
+                self.assertEqual(self.strict_candidate()["success"], accepted)
         self.assertTrue(qas.resource_titles_match(self.task["taskname"], "学生会也有洞 S01 (2026)"))
         self.assertFalse(qas.resource_titles_match(self.task["taskname"], "学生会也有洞 S02 (2026)"))
         self.assertFalse(qas.resource_titles_match(self.task["taskname"], "学生会也有洞 S01 (2025)"))
+
 
     def test_failed_query_still_tries_alternate_season_spelling(self):
         with patch("resource_search.search_resources", side_effect=[
@@ -183,7 +192,7 @@ class AutoRepairTests(unittest.TestCase):
             self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
         self.web_search.assert_not_called()
 
-    def test_base_name_query_does_not_relax_season_verification(self):
+    def test_description_policy_accepts_matching_work_without_filename_season_checks(self):
         self.task["taskname"] = "罗小黑战记 第3季"
         wrong, right = self.candidate("wrong", "罗小黑战记 第二季"), self.candidate("right", "罗小黑战记 第三季")
         detail = copy.deepcopy(FILES)
@@ -195,7 +204,7 @@ class AutoRepairTests(unittest.TestCase):
         with patch("resource_search.search_resources", side_effect=search), patch.object(self.account, "get_stoken", return_value=TOKEN) as token, patch.object(self.account, "get_detail", return_value=detail):
             result = self.account.find_valid_resource(self.task, {})
         self.assertTrue(result["success"])
-        token.assert_called_once_with("right", "abcd")
+        token.assert_called_once_with("wrong", "abcd")
 
     def test_numbered_title_only_means_a_season_when_task_explicitly_requires_one(self):
         self.assertTrue(qas.resource_titles_match("大理寺日志 第3季", "大理寺日志3 (2026) 更新至3集"))
@@ -204,7 +213,7 @@ class AutoRepairTests(unittest.TestCase):
         self.assertFalse(qas.resource_titles_match("大理寺日志", "大理寺日志3"))
         self.assertTrue(qas.resource_titles_match("作品86", "作品86"))
 
-    def test_directory_name_and_plain_episode_season_jointly_verify_same_show(self):
+    def test_strict_directory_name_and_plain_episode_season_jointly_verify_same_show(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
         for directory, filename, accepted in (("大理寺日志 (2026)", "S03E09 1080p-GyWEB.mp4", True),
                                                ("大理", "S03E09 1080p-GyWEB.mp4", False),
@@ -213,7 +222,8 @@ class AutoRepairTests(unittest.TestCase):
             folder = {"code": 0, "data": {"list": [{"fid": "folder", "dir": True, "file_name": directory}]}}
             videos = {"code": 0, "data": {"list": [{"fid": "file", "dir": False, "file_name": filename}]}}
             with self.subTest(directory=directory, filename=filename), self.search([self.candidate(title="大理寺日志3 (2026)")]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[folder, videos]):
-                self.assertEqual(self.account.find_valid_resource(self.task, {})["success"], accepted)
+                self.assertEqual(self.strict_candidate()["success"], accepted)
+
 
     def test_other_season_video_or_document_cannot_supply_missing_season_evidence(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
@@ -226,7 +236,7 @@ class AutoRepairTests(unittest.TestCase):
             with self.subTest(files=files), self.search([self.candidate(title="大理寺日志3 (2026)")]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=detail):
                 self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
 
-    def test_old_movie_and_mixed_season_collection_do_not_validate_a_new_season(self):
+    def test_strict_old_movie_and_mixed_season_collection_do_not_validate_a_new_season(self):
         self.task.update(taskname="罗小黑战记 第3季", resource_type="anime")
         for files in ([{"fid": "movie", "dir": False, "file_name": "罗小黑战记 (2019).mp4"}],
                       [{"fid": "old", "dir": True, "file_name": "罗小黑战记 (2019) 电影"},
@@ -234,7 +244,8 @@ class AutoRepairTests(unittest.TestCase):
             detail = {"code": 0, "data": {"share": {"title": "罗小黑战记"}, "list": files}}
             self.web_search.return_value = {"success": True, "data": [self.candidate(title="罗小黑战记 第三季资源下载")]}
             with self.subTest(files=files), self.search([]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=detail):
-                self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+                self.assertFalse(self.strict_candidate()["success"])
+
 
     def test_partial_source_errors_with_no_candidates_are_unavailable(self):
         with patch("resource_search.search_resources", return_value={"success": True, "data": [], "errors": [{"source": "backup", "message": "timeout"}]}):
@@ -326,15 +337,16 @@ class AutoRepairTests(unittest.TestCase):
             self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
         self.assertEqual(index.call_count, 2)
 
-    def test_web_fallback_verifies_real_share_despite_generic_webpage_title(self):
+    def test_web_fallback_uses_introduction_instead_of_generic_page_title(self):
         candidate = self.candidate(title="网站资源下载 - 今日更新")
+        candidate["content"] = "资源名称：测试剧 第二季 (2024)"
         self.web_search.return_value = {"success": True, "data": [candidate]}
         with self.search([]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=FILES):
             self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
         wrong = copy.deepcopy(FILES)
         wrong["data"]["share"]["title"] = "另外一部剧 第二季 (2024)"
         with self.search([]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=wrong):
-            self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
 
     def test_archive_has_dedicated_verification_budget_and_continues_past_first_batch(self):
         # Three anonymous web hits used to consume the entire shared allowance.
@@ -356,15 +368,15 @@ class AutoRepairTests(unittest.TestCase):
         index.assert_not_called()
         self.web_search.assert_not_called()
 
-    def test_archive_wrong_media_is_rejected_and_other_sources_still_run(self):
+    def test_archive_nonmatching_introduction_is_rejected_before_opening_share(self):
         wrong = copy.deepcopy(FILES)
         wrong["data"]["share"]["title"] = "其他作品 (2024)"
-        archive_row = dict(self.candidate("archive01"), source_type="telegram_web")
+        archive_row = dict(self.candidate("archive01", "其他作品 (2024)"), source_type="telegram_web")
         with patch("resource_search.search_telegram_resources", return_value={
                 "success": True, "data": [archive_row], "partial": False}), \
                 self.search([self.candidate("validindex")]) as index, \
                 patch.object(self.account, "get_stoken", return_value=TOKEN), \
-                patch.object(self.account, "get_detail", side_effect=[wrong, FILES]):
+                patch.object(self.account, "get_detail", return_value=FILES):
             result = self.account.find_valid_resource(self.task, {"source": {"telegram_web": {"enable": True}}})
         self.assertTrue(result["success"])
         self.assertIn("validindex", result["candidate"]["shareurl"])
@@ -373,6 +385,7 @@ class AutoRepairTests(unittest.TestCase):
     def test_web_fallback_retries_arabic_season_with_chinese_numeral(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
         candidate = self.candidate(title="大理寺日志 第三季资源网页")
+        candidate["content"] = "名称：大理寺日志 第三季"
         self.web_search.side_effect = lambda query, *args, **kwargs: {
             "success": True, "data": [candidate] if query == "大理寺日志 第三季" else [],
         }
@@ -402,7 +415,7 @@ class AutoRepairTests(unittest.TestCase):
             self.account.find_valid_resource(self.task, {})
         self.assertEqual([call.args[0] for call in self.web_search.call_args_list], ["测试剧 第二季", "另一中文译名"])
 
-    def test_failed_directory_does_not_hide_another_directory_in_same_share(self):
+    def test_strict_failed_directory_does_not_hide_another_directory_in_same_share(self):
         first, second = self.candidate(), self.candidate()
         first["shareurl"] += "#/list/share/" + "a" * 32
         second["shareurl"] += "#/list/share/" + "b" * 32
@@ -410,21 +423,23 @@ class AutoRepairTests(unittest.TestCase):
         wrong["data"]["share"]["title"] = "测试剧 第二季 (2023)"
         with self.search([first, second]), patch.object(self.account, "get_stoken", return_value=TOKEN), \
                 patch.object(self.account, "get_detail", side_effect=[wrong, FILES]) as detail:
-            result = self.account.find_valid_resource(self.task, {})
+            result = self.strict_candidate()
         self.assertTrue(result["success"])
         self.assertEqual(result["candidate"]["shareurl"], second["shareurl"])
         self.assertEqual(detail.call_count, 2)
 
-    def test_nested_single_folder_video_wrapper_is_verified(self):
+
+    def test_strict_nested_single_folder_video_wrapper_is_verified(self):
         self.task["resource_type"] = "anime"
         folders = [{"code": 0, "data": {"list": [
             {"fid": f"folder{index}", "dir": True, "file_name": self.task["taskname"]},
         ]}} for index in range(2)]
         with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=folders + [FILES]) as detail:
-            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertTrue(self.strict_candidate()["success"])
         self.assertEqual(detail.call_count, 3)
 
-    def test_collection_selects_only_the_unique_matching_season_and_scopes_saved_url(self):
+
+    def test_strict_collection_selects_only_the_unique_matching_season_and_scopes_saved_url(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
         selected = "c" * 32
         root = {"code": 0, "data": {"list": [{"fid": "a" * 32, "dir": True, "file_name": "大理寺日志"}]}}
@@ -437,7 +452,7 @@ class AutoRepairTests(unittest.TestCase):
         candidate = self.candidate(title="大理寺日志3")
         candidate["shareurl"] += "#/list/share/" + "f" * 32
         with self.search([candidate]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[root, collection, videos]) as detail:
-            result = self.account.find_valid_resource(self.task, {})
+            result = self.strict_candidate()
         self.assertTrue(result["success"])
         self.assertEqual([call.args[2] for call in detail.call_args_list], ["f" * 32, "a" * 32, selected])
         expected = "https://pan.quark.cn/s/newshare?pwd=abcd#/list/share/" + selected
@@ -447,6 +462,7 @@ class AutoRepairTests(unittest.TestCase):
         with patch.object(self.account, "find_valid_resource", return_value=result):
             self.account.repair_share(self.task)
         self.assertEqual(self.task["shareurl"], expected)
+
 
     def test_quarter_collection_selects_only_named_work_and_combines_actual_year(self):
         directory = tempfile.TemporaryDirectory()
@@ -482,18 +498,6 @@ class AutoRepairTests(unittest.TestCase):
                 self.assertEqual(result["candidate"]["episode_fids"], {"episode2": 2})
             self.assertEqual(qas.Config.resource_history(self.account.resource_history_path)[0]["shareurl"],
                              self.candidate()["shareurl"])
-            restarted = qas.Quark()
-            restarted.resource_history_path = self.account.resource_history_path
-            deleted_task = {key: value for key, value in self.task.items() if key not in ("shareurl", "search_aliases")}
-            with patch.object(restarted, "get_stoken", return_value=TOKEN), \
-                    patch.object(restarted, "get_detail", side_effect=[root, collection, videos]) as detail, \
-                    patch("resource_search.search_resources", side_effect=AssertionError("no live search needed")):
-                recovered = restarted.find_valid_resource(deleted_task, {}, required_episodes=required)
-            self.assertTrue(recovered["success"], recovered)
-            self.assertEqual(recovered["candidate"]["pdir_fid"], selected)
-            self.assertEqual([str(call.args[2]) for call in detail.call_args_list], ["0", wrapper, selected])
-            if required:
-                self.assertEqual(recovered["candidate"]["episode_fids"], {"episode2": 2})
 
     def test_quarter_collection_rejects_ambiguous_or_conflicting_context(self):
         self.task.update(taskname="目标动画 (2026)", search_aliases=["目标动画别名"], resource_type="anime")
@@ -523,7 +527,7 @@ class AutoRepairTests(unittest.TestCase):
             self.assertFalse(result["success"], result)
             self.assertLessEqual(detail.call_count, 2)
 
-    def test_release_group_collection_scopes_one_directory_without_mixing_works(self):
+    def test_strict_release_group_collection_scopes_one_directory_without_mixing_works(self):
         group_ids = ["a" * 32, "b" * 32]
         root = {"code": 0, "data": {"share": {"title": self.task["taskname"]}, "list": [
             {"fid": fid, "file_name": f"[Group-{index}] {self.task['taskname']}", "dir": True}
@@ -539,10 +543,11 @@ class AutoRepairTests(unittest.TestCase):
 
         with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), \
                 patch.object(self.account, "get_detail", side_effect=detail):
-            result = self.account.find_valid_resource(self.task, {})
+            result = self.strict_candidate()
         self.assertTrue(result["success"], result)
         self.assertEqual(result["candidate"]["pdir_fid"], group_ids[1])
         self.assertTrue(result["candidate"]["shareurl"].endswith(group_ids[1]))
+
 
     def test_release_group_traversal_is_bounded_and_does_not_trust_mixed_folders(self):
         for mixed in (False, True):
@@ -561,7 +566,7 @@ class AutoRepairTests(unittest.TestCase):
             if not mixed:
                 self.assertTrue(result["validation_limited"])
 
-    def test_pure_season_child_requires_exact_parent_name(self):
+    def test_strict_pure_season_child_requires_exact_parent_name(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
         folders = {"code": 0, "data": {"list": [
             {"fid": "c" * 32, "dir": True, "file_name": "S03"},
@@ -571,11 +576,12 @@ class AutoRepairTests(unittest.TestCase):
         for parent, accepted in (("大理寺日志", True), ("大理", False), ("另一部剧", False)):
             root = {"code": 0, "data": {"list": [{"fid": "a" * 32, "dir": True, "file_name": parent}]}}
             with self.subTest(parent=parent), self.search([self.candidate(title="大理寺日志3")]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[root, folders, videos]) as detail:
-                result = self.account.find_valid_resource(self.task, {})
+                result = self.strict_candidate()
                 self.assertEqual(result["success"], accepted)
                 self.assertEqual(detail.call_count, 3 if accepted else 2)
 
-    def test_ambiguous_incomplete_or_wrong_season_directory_is_never_selected(self):
+
+    def test_strict_ambiguous_incomplete_or_wrong_season_directory_is_never_selected(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
         for names, total in ((["大理寺日志1", "大理寺日志2"], 2),
                              (["大理寺日志3", "大理寺日志 第三季"], 2),
@@ -584,10 +590,11 @@ class AutoRepairTests(unittest.TestCase):
                 {"fid": str(index + 1) * 32, "dir": True, "file_name": name} for index, name in enumerate(names)
             ]}}
             with self.subTest(names=names, total=total), self.search([self.candidate(title="大理寺日志3")]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=folders) as detail:
-                self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+                self.assertFalse(self.strict_candidate()["success"])
                 self.assertEqual(detail.call_count, 1)
 
-    def test_selected_season_cannot_hide_conflicting_ancestor_or_video(self):
+
+    def test_strict_selected_season_cannot_hide_conflicting_ancestor_or_video(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
         for parent, video in (("大理寺日志 第2季", "09.mp4"), ("大理寺日志", "S02E09.mp4")):
             folders = {"code": 0, "data": {"share": {"title": parent}, "list": [
@@ -596,20 +603,22 @@ class AutoRepairTests(unittest.TestCase):
             ]}}
             videos = {"code": 0, "data": {"list": [{"fid": "episode", "dir": False, "file_name": video}]}}
             with self.subTest(parent=parent, video=video), self.search([self.candidate(title="大理寺日志3")]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[folders, videos]):
-                self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+                self.assertFalse(self.strict_candidate()["success"])
 
-    def test_recursive_wrappers_remain_bounded_and_cannot_hide_wrong_season(self):
+
+    def test_strict_recursive_wrappers_remain_bounded_and_cannot_hide_wrong_season(self):
         self.task.update(resource_type="anime", search_aliases=["Test Show"])
         folder = {"code": 0, "data": {"list": [
             {"fid": "folder", "dir": True, "file_name": self.task["taskname"]},
         ]}}
         with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=folder) as detail:
-            self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertFalse(self.strict_candidate()["success"])
         self.assertEqual(detail.call_count, 4)
         wrong_folder = copy.deepcopy(folder)
         wrong_folder["data"]["list"][0]["file_name"] = "Test Show 第三季 (2024)"
         with self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[folder, wrong_folder, FILES]):
-            self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertFalse(self.strict_candidate()["success"])
+
 
     def test_search_failures_are_distinct_from_no_results_and_unverified_matches(self):
         for payload, code in (({"success": False, "data": []}, "unavailable"),
@@ -621,10 +630,10 @@ class AutoRepairTests(unittest.TestCase):
             self.assertEqual(result["code"], code)
             self.assertNotIn("保留原订阅", result["error"])
 
-    def test_search_skips_old_wrong_season_and_non_quark_candidates(self):
+    def test_search_skips_old_wrong_work_and_non_quark_candidates(self):
         evil = self.candidate("evil")
         evil["shareurl"] = "https://pan.quark.cn.evil.example/s/evil"
-        candidates = [self.candidate("oldshare"), self.candidate("wrong", "测试剧 第三季 (2024)"), evil, self.candidate()]
+        candidates = [self.candidate("oldshare"), self.candidate("wrong", "其他剧 第三季 (2024)"), evil, self.candidate()]
         original = copy.deepcopy(self.task)
         with self.search(candidates), patch.object(self.account, "get_stoken", return_value=TOKEN) as token, patch.object(self.account, "get_detail", return_value=FILES):
             result = self.account.find_valid_resource(self.task, {})
@@ -642,14 +651,15 @@ class AutoRepairTests(unittest.TestCase):
             self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
             self.assertEqual(token.call_count, 5)
 
-    def test_missing_year_requires_matching_real_directory(self):
+    def test_strict_missing_year_requires_matching_real_directory(self):
         candidate = self.candidate(title="测试剧 第二季")
         folder = {"code": 0, "data": {"list": [{"fid": "folder", "dir": True, "file_name": self.task["taskname"]}]}}
         with self.search([candidate]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[folder, FILES]):
-            self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertTrue(self.strict_candidate()["success"])
         plain_files = {"code": 0, "data": {"list": FILES["data"]["list"]}}
         with self.search([candidate]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=plain_files):
-            self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+            self.assertFalse(self.strict_candidate()["success"])
+
 
     def test_pure_season_directory_conflict_overrides_matching_share_title(self):
         for folder_name in ("S03", "Season 3", "第三季", "2023"):
@@ -658,20 +668,22 @@ class AutoRepairTests(unittest.TestCase):
             with self.subTest(folder_name=folder_name), self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=[folder, FILES]):
                 self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
 
-    def test_index_title_alone_cannot_validate_another_show_or_numbered_files(self):
+    def test_strict_index_title_alone_cannot_validate_another_show_or_numbered_files(self):
         plain_files = {"code": 0, "data": {"list": FILES["data"]["list"]}}
         wrong_show = {"code": 0, "data": {"list": [{"fid": "folder", "dir": True, "file_name": "另外一部剧 第二季 (2024)"}]}}
         wrong_share = {"code": 0, "data": {"list": FILES["data"]["list"], "share": {"title": "另外一部剧 第二季 (2024)"}}}
         for details in ([plain_files], [wrong_show, plain_files], [wrong_share]):
             with self.subTest(details=details), self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", side_effect=details):
-                self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+                self.assertFalse(self.strict_candidate()["success"])
 
-    def test_real_share_title_or_filename_can_validate_numbered_contents(self):
+
+    def test_strict_real_share_title_or_filename_can_validate_numbered_contents(self):
         named_file = {"code": 0, "data": {"list": [{"fid": "episode", "dir": False, "file_name": self.task["taskname"] + ".mkv"}]}}
         for detail in (FILES, named_file):
             with self.subTest(detail=detail), self.search([self.candidate()]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=detail) as get_detail:
-                self.assertTrue(self.account.find_valid_resource(self.task, {})["success"])
+                self.assertTrue(self.strict_candidate()["success"])
                 self.assertEqual(get_detail.call_args.kwargs["_fetch_share"], 1)
+
 
     def test_audiobook_or_text_only_share_is_not_a_video_replacement(self):
         self.task["resource_type"] = "anime"
@@ -736,7 +748,7 @@ class AutoRepairTests(unittest.TestCase):
             self.assertIn("尚未完整确认", result["error"])
             self.assertEqual(listing.call_args.kwargs["max_pages"], 3)
 
-    def test_one_named_folder_beside_images_and_text_keeps_alias_and_season_checks(self):
+    def test_strict_one_named_folder_beside_images_and_text_keeps_alias_and_season_checks(self):
         self.task.update(taskname="黑色召唤师 (2022)", search_aliases=["Black Summoner"])
         selected = "a" * 32
         videos = {"code": 0, "data": {"list": [{"fid": "episode", "file_name": "01.mkv", "dir": False}]}}
@@ -750,12 +762,13 @@ class AutoRepairTests(unittest.TestCase):
             with self.subTest(folder_name=folder_name), self.search([self.candidate()]), \
                     patch.object(self.account, "get_stoken", return_value=TOKEN), \
                     patch.object(self.account, "get_detail", side_effect=[root, videos]) as listing:
-                result = self.account.find_valid_resource(self.task, {})
+                result = self.strict_candidate()
             self.assertEqual(result["success"], accepted)
             self.assertEqual(listing.call_count, 2 if accepted else 1)
             if accepted:
                 self.assertEqual(result["candidate"]["pdir_fid"], selected)
                 self.assertTrue(result["candidate"]["shareurl"].endswith("#/list/share/" + selected))
+
 
     def test_no_video_reason_reuses_repair_without_claiming_expiry(self):
         replacement = {**self.candidate(), "pwd_id": "newshare"}

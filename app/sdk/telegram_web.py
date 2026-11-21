@@ -115,7 +115,7 @@ def _safe_result(result, action):
         clean["partial"] = result.get("partial") is True
         bot = result.get("bot")
         if isinstance(bot, dict):
-            clean["bot"] = {key: _number(bot.get(key)) for key in ("requests", "links", "pending", "failed")}
+            clean["bot"] = {key: _number(bot.get(key)) for key in ("requests", "links", "pending", "failed", "channel_posts", "buttons", "channel_archived")}
         progress = result.get("progress")
         if isinstance(progress, dict) and progress.get("phase") in ("archives", "search", "complete"):
             clean["progress"] = {"phase": progress["phase"], "current": _number(progress.get("current")),

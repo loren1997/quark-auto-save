@@ -310,7 +310,7 @@ global.location = {origin: 'https://web.telegram.org', pathname: '/k/'};
 let calls = [];
 global.rootScope = {myId: 777, managers: {apiManager: {invokeApi: async (method, params, options) => {
   calls.push({method, params, options});
-  if (global.validateBotCall && ['contacts.resolveUsername','messages.startBot','messages.getHistory'].includes(method)) {
+  if (global.validateBotCall && ['contacts.resolveUsername','messages.startBot','messages.getHistory','messages.search'].includes(method)) {
     global.validateBotCall(method, params);
   } else {
     assert.equal(params.folder_id, 1);
@@ -392,6 +392,7 @@ let posts=[post], starts=0, historyReads=0, botResolved=oscar, replyOverride, ar
 const reply=(id,body,extra={})=>({...message(botPeer,id,body),from_id:botPeer,...extra});
 global.validateBotCall=(method,params)=>{
   if(method==='contacts.resolveUsername')assert.equal(params.username,'Oscar4KBot');
+  else if(method==='messages.search'){assert.equal(params.peer.channel_id,3);assert.equal(params.limit,20);}
   else {assert.equal(params.peer.user_id,42);assert.equal(params.peer.access_hash,'BOT_PRIVATE_HASH');}
   if(method==='messages.startBot'){
     assert.equal(params.bot.user_id,42);assert.equal(params.start_param,'get59171');
@@ -425,6 +426,28 @@ assert.equal(result.results[0].title,'作品 第4季');assert.equal(result.resul
 assert.equal(result.bot.requests,1);assert.equal(result.bot.links,1);assert.equal(result.partial,true);
 assert.ok(!JSON.stringify(result).includes('BOT_PRIVATE_HASH'));assert.ok(!JSON.stringify(result).includes('get59171'));
 const second=await run('作品',1);assert.equal(starts,1);assert.equal(second.results[0].url,'https://pan.quark.cn/s/STALE0111111');
+""")
+
+    def test_archived_oscar_channel_is_searched_before_global_stale_results(self):
+        self.run_bot_bridge(r"""
+channel.username='Oscar_4Kmovies';
+const original=response;
+global.response=async(method,params)=>{
+ if(method==='messages.search')return {messages:[post]};
+ if(method==='messages.searchGlobal')return {_: 'messages.messages',messages:[message(peers[2],20,'作品 https://pan.quark.cn/s/STALE0111111')]};
+ return original(method,params);
+};
+const result=await run('作品',1);
+assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
+assert.equal(result.bot.channel_posts,1);assert.equal(result.bot.buttons,1);assert.equal(starts,1);
+assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));
+await run('作品',1);assert.equal(calls.filter(c=>c.method==='messages.search').length,1);
+""")
+
+    def test_unarchived_oscar_channel_is_never_searched_directly(self):
+        self.run_bot_bridge(r"""
+channel.username='Oscar_4Kmovies';archived=false;
+await run();assert.ok(!calls.some(c=>c.method==='messages.search'));assert.equal(starts,0);
 """)
 
     def test_oscar_https_buttons_and_delayed_reply_copy_buttons(self):

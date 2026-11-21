@@ -481,7 +481,7 @@
               <div class="col"><h2><i class="bi bi-calendar-week"></i> 热门追更</h2></div>
               <div class="col-auto"><button type="button" class="btn btn-outline-primary" @click="loadDiscovery(true)" :disabled="discoveryLoading || calendar.refreshing">{{ calendar.refreshing ? '更新中…' : '刷新' }}</button></div>
             </div>
-            <p>按各自来源热度排列。点击订阅会搜索并验证夸克分享，视频和字幕直接保存到 {{ formData.discovery.savepath }}，按“片名 S01E01”命名，不再创建作品或分享子目录。{{ formData.discovery.auto_download ? '转存后默认只提交视频到 Aria2；字幕保留在网盘。' : '当前仅转存到夸克网盘；本地视频下载可在系统配置中开启。' }}</p>
+            <p>按各自来源热度排列。点击订阅会按资源介绍匹配片名，定位分享内直接含视频的最内层文件夹，不用文件名校验片名、季度或年份。视频和字幕直接保存到 {{ formData.discovery.savepath }}，按“片名 S01E01”命名，不再创建作品或分享子目录。{{ formData.discovery.auto_download ? '转存后默认只提交视频到 Aria2；字幕保留在网盘。' : '当前仅转存到夸克网盘；本地视频下载可在系统配置中开启。' }}</p>
             <p class="text-muted" v-if="calendar.week_start">{{ calendar.week_start }} — {{ calendar.week_end }} · 北京时间 · {{ calendar.refreshing ? '后台更新中' : calendar.stale ? '部分为本周缓存' : calendar.cached ? '缓存数据' : '已更新' }}</p>
             <div v-for="note in calendar.notes" :key="note" class="small text-muted mb-1">{{ note }}</div>
             <div v-if="discoveryError" class="alert alert-danger" role="alert">

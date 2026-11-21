@@ -92,7 +92,7 @@ class EpisodeRepairTests(unittest.TestCase):
         numbered_title = {**task, "taskname": "86 (2021)", "search_aliases": []}
         self.assertEqual(qas._resource_episode_number(numbered_title, "[Group] 86 - 02 [WebRip 1080p HEVC].mkv"), 2)
 
-    def test_missing_year_release_groups_require_current_strict_primary_and_keep_one_group(self):
+    def test_description_matched_release_groups_find_missing_episode_without_year_recheck(self):
         self.task["replace"] = "{TASKNAME} S01E{EXX}.{EXT}"
         groups = ["a" * 32, "b" * 32]
         candidate = self.candidate("releasegroups")
@@ -116,8 +116,8 @@ class EpisodeRepairTests(unittest.TestCase):
         self.assertEqual(result["candidate"]["pdir_fid"], groups[1])
         self.assertTrue(result["candidate"]["shareurl"].endswith(groups[1]))
         self.assertEqual(list(result["candidate"]["episode_fids"].values()), [2])
-        self.assertEqual(sum(call.args[0] == "original" for call in tokens.call_args_list), 1)
-        self.assertIn("候选未标年份", self.output.getvalue())
+        self.assertEqual(sum(call.args[0] == "original" for call in tokens.call_args_list), 0)
+        self.assertIn("按资源介绍匹配", self.output.getvalue())
 
     def test_unknown_year_exception_is_only_for_verified_first_season_gap_videos(self):
         ordinary = "[Group] Black Summoner - 02 [WebRip 1080p HEVC].mkv"

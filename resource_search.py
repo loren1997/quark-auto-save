@@ -107,8 +107,9 @@ def search_telegram_resources(query, config, health_path=None, limit=20, deadlin
           + ("；还有结果待继续查询" if result.get("partial") else ""), flush=True)
     errors = []
     bot = result.get("bot") or {}
-    if any(bot.values()):
-        print(f"Telegram归档资源按钮：Oscar4KBot 请求 {bot.get('requests', 0)} 次，"
+    if bot:
+        channel_state = "Oscar 频道在归档中" if bot.get("channel_archived") else "未检测到已归档的 Oscar 频道"
+        print(f"Telegram归档资源按钮：{channel_state}；本批定向查询 {bot.get('channel_posts', 0)} 条帖子，发现 {bot.get('buttons', 0)} 个按钮；Oscar4KBot 请求 {bot.get('requests', 0)} 次，"
               f"新增 {bot.get('links', 0)} 条夸克候选，待获取 {bot.get('pending', 0)} 项，"
               f"未取得可关联资源回复 {bot.get('failed', 0)} 项", flush=True)
         if bot.get("failed"):

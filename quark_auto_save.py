@@ -103,6 +103,48 @@ def share_listing_complete(response):
     return type(total) is int and 0 <= total <= len(files)
 
 
+def share_validation_error(response):
+    """Report API failure categories without echoing tokens, URLs or server text."""
+    if not isinstance(response, dict):
+        return "夸克返回格式异常"
+    message = str(response.get("message", "")).lower()
+    status = response.get("status")
+    if message == "invalid response":
+        reason = "夸克返回格式异常"
+    elif is_expired_share(response):
+        reason = "分享已明确取消、过期或不存在"
+    elif re.search(r"提取码|访问码|密[码碼]|passcode|password", message):
+        reason = "提取码缺失或不正确"
+    elif status == 401 or re.search(r"登录|登陆|认证|login|auth", message):
+        reason = "夸克登录或认证失败"
+    elif status == 429 or re.search(r"频繁|繁忙|风控|验证码|captcha|too many", message):
+        reason = "夸克限流或访问验证"
+    elif status == 403:
+        reason = "夸克拒绝访问"
+    elif re.search(r"request error|timeout|网络|超时", message):
+        reason = "夸克网络请求失败"
+    elif str(status).startswith("5"):
+        reason = "夸克服务暂不可用"
+    else:
+        reason = "夸克未返回可用的验证结果"
+    codes = [f"{label}={response[field]}" for field, label in
+             (("http_status", "HTTP"), ("status", "状态"), ("code", "错误码"))
+             if re.fullmatch(r"-?\d{1,8}", str(response.get(field, "")))]
+    return reason + ("（" + "，".join(codes) + "）" if codes else "")
+
+
+def resource_description_matches(task, candidate, aliases):
+    """The user's selected policy: identify the work from the resource introduction."""
+    names = {_resource_title_parts(value)[0] for value in [task["taskname"], *aliases]} - {""}
+    text = "\n".join(str(candidate.get(field) or "")[:8000] for field in ("taskname", "content"))
+    for line in re.split(r"[\r\n|｜#]+", text):
+        line = re.sub(r"^\s*(?:资源名称|资源名|名称|片名|标题)\s*[:：]\s*", "", line)
+        values = [line, *re.findall(r"[《【]([^》】]{1,200})[》】]", line), *line.split()]
+        if any(_resource_title_parts(value)[0] in names for value in values if len(value) <= 300):
+            return True
+    return False
+
+
 _RESOURCE_SEASON_PATTERN = r"第\s*([\d零一二三四五六七八九十两]+)\s*[季部]|\bseason\s*(\d{1,2})\b|(?<![a-z])s(\d{1,2})(?=e\d|\b)"
 _RESOURCE_CHINESE_CONVERTER = OpenCC("t2s")
 _RESOURCE_RELEASE_SUFFIX = re.compile(
@@ -203,6 +245,12 @@ def _resource_episode_number(task, filename):
     title = task.get("taskname", "")
     name, seasons, years = _resource_title_parts(title)
     season = next(iter(seasons)) if len(seasons) == 1 else (1 if not seasons and years else None)
+    rename_seasons = {int(value) for value in re.findall(r"(?i)(?<![a-z])s(\d{1,2})e(?=\{)", task.get("replace", ""))}
+    if len(rename_seasons) == 1:
+        configured = next(iter(rename_seasons))
+        if seasons and seasons != {configured}:
+            return None
+        season = configured or None
     if not name or not season:
         return None
     stem = _resource_release_labels(filename.rsplit(".", 1)[0])
@@ -1016,7 +1064,7 @@ class Quark:
             # response.raise_for_status()  # 检查请求是否成功，但返回非200也会抛出异常
             return response
         except Exception as e:
-            print(f"_send_request error:\n{e}")
+            print(f"_send_request error: {type(e).__name__}")
             fake_response = requests.Response()
             fake_response.status_code = 500
             fake_response._content = (
@@ -1090,9 +1138,21 @@ class Quark:
         url = f"{self.BASE_URL}/1/clouddrive/share/sharepage/token"
         querystring = {"pr": "ucpro", "fr": "pc"}
         payload = {"pwd_id": pwd_id, "passcode": passcode}
-        response = self._send_request(
+        http = self._send_request(
             "POST", url, json=payload, params=querystring, timeout=(5, 15)
-        ).json()
+        )
+        try:
+            response = http.json()
+        except ValueError:
+            response = None
+        if not isinstance(response, dict):
+            response = {"status": 503, "code": 1, "message": "invalid response"}
+        if response.get("data") is not None and not isinstance(response["data"], dict):
+            response = {**response, "data": None}
+        if type(http.status_code) is int:
+            response["http_status"] = http.status_code
+            if http.status_code >= 400:
+                response["status"] = http.status_code
         return response
 
     def get_detail(
@@ -1511,7 +1571,7 @@ class Quark:
             queries = _resource_search_queries(title, aliases)
             history_result = self._find_verified_resource(
                 task, history, seen, aliases, visited=visited, required_episodes=required_episodes,
-                repair_context=repair_context,
+                repair_context=repair_context, description_only=True,
             )
             if history_result["success"]:
                 print("已从本地资源记录重新验证到可用分享")
@@ -1628,7 +1688,8 @@ class Quark:
 
             archive_result = self._find_verified_resource(
                 task, archive_candidates(), seen, aliases, visited=visited, max_checked=24,
-                verify_index_title=False, required_episodes=required_episodes, repair_context=repair_context)
+                verify_index_title=False, required_episodes=required_episodes, repair_context=repair_context,
+                description_only=True)
             if archive_result["success"]:
                 print("已从 Telegram归档 验证到可用分享")
                 return archive_result
@@ -1642,7 +1703,7 @@ class Quark:
                 result = self._find_verified_resource(task, search_candidates(words, web), seen, aliases,
                                                       visited=visited, max_checked=(8 if web else 12) if required_episodes else (3 if web else 5),
                                                       verify_index_title=not web, required_episodes=required_episodes,
-                                                      repair_context=repair_context)
+                                                      repair_context=repair_context, description_only=True)
             except (requests.RequestException, ValueError, TypeError) as exc:
                 record_error("网页搜索" if web else "索引搜索", type(exc).__name__)
                 result = {"success": False, "candidate": None, "code": "unavailable",
@@ -1666,9 +1727,111 @@ class Quark:
                 result["code"] = "unavailable"
         return result
 
+    def _video_leaf_folders(self, pwd_id, stoken, start_fid, scan):
+        leaves, visited = [], set()
+        deadline = time.monotonic() + 25
+
+        def visit(fid, depth):
+            if str(fid) in visited or len(visited) >= 32 or depth > 12 or time.monotonic() >= deadline:
+                scan["limited"] = True
+                return False, False
+            visited.add(str(fid))
+            report_progress("verify", source="夸克视频目录", query=f"第 {len(visited)} 个目录，深度 {depth}")
+            detail = self.get_detail(pwd_id, stoken, fid, max_pages=3)
+            if detail.get("code") != 0:
+                print("读取候选目录失败：" + share_validation_error(detail))
+                scan["limited"] = True
+                return False, False
+            if not share_listing_complete(detail):
+                scan["limited"] = True
+                return False, False
+            files = detail["data"]["list"]
+            videos = [item for item in files if is_video_file(item)]
+            child_video, complete = False, True
+            for folder in (item for item in files if item.get("dir")):
+                if not re.fullmatch(r"[A-Za-z0-9_]{32}", str(folder.get("fid", ""))):
+                    scan["limited"] = True
+                    complete = False
+                    continue
+                found, child_complete = visit(folder["fid"], depth + 1)
+                child_video |= found
+                complete &= child_complete
+            # Empty/image-only children do not hide a folder's direct video files.
+            if videos and not child_video and complete:
+                leaves.append((fid, videos))
+            return bool(videos) or child_video, complete
+
+        visit(start_fid, 0)
+        return leaves
+
+    def _find_described_video_resource(self, task, candidates, seen, aliases, visited,
+                                       max_checked, required_episodes):
+        visited = visited if visited is not None else set()
+        checked, missing, found_results = 0, 0, False
+        scan = {"limited": False}
+        for candidate in candidates:
+            found_results = True
+            if not isinstance(candidate, dict) or not resource_description_matches(task, candidate, aliases):
+                continue
+            shareurl = candidate.get("shareurl", "")
+            try:
+                parsed = urllib.parse.urlsplit(shareurl)
+                if parsed.scheme != "https" or parsed.netloc != "pan.quark.cn":
+                    continue
+                pwd_id, passcode, pdir_fid, _ = self.extract_url(shareurl)
+            except (ValueError, TypeError):
+                continue
+            attempt = (pwd_id, pdir_fid, passcode, "description")
+            if not pwd_id or pwd_id in seen or attempt in visited or (pwd_id, pdir_fid, passcode) in visited:
+                continue
+            if checked >= max_checked:
+                scan["limited"] = True
+                break
+            visited.add(attempt)
+            checked += 1
+            source = "Telegram归档" if candidate.get("source_type") == "telegram_web" else "夸克分享"
+            report_progress("verify", task=task["taskname"], source=source, query=f"候选 {checked}：定位视频目录")
+            print(f"{source}：资源介绍片名匹配，验证候选 {checked} 的有效性并定位最内层视频目录")
+            try:
+                token = self.get_stoken(pwd_id, passcode)
+                stoken = (token.get("data") or {}).get("stoken")
+                if token.get("status") != 200 or not stoken:
+                    print(f"{source}：跳过候选，{share_validation_error(token)}")
+                    continue
+                candidate_scan = {"limited": False}
+                leaves = self._video_leaf_folders(pwd_id, stoken, pdir_fid, candidate_scan)
+                scan["limited"] |= candidate_scan["limited"]
+                if not leaves:
+                    print(f"{source}：跳过候选，" + ("目录读取未完成或达到扫描上限" if candidate_scan["limited"] else "分享内未找到视频文件"))
+                for fid, videos in leaves:
+                    if (pwd_id, fid, passcode) in visited:
+                        continue
+                    episode_fids = _episode_repair_files(task, videos, required_episodes) if required_episodes is not None else None
+                    if required_episodes is not None and not episode_fids:
+                        missing += 1
+                        continue
+                    leaf_url = urllib.parse.urlunsplit(parsed._replace(
+                        fragment=f"/list/share/{fid}" if str(fid) != "0" else ""))
+                    Config.remember_resources(self.resource_history_path, [{"taskname": task["taskname"],
+                                              "shareurl": leaf_url, "search_aliases": aliases}])
+                    print(f"{source}：已定位直接含 {len(videos)} 个视频的最内层目录；按资源介绍匹配，不校验文件名片名")
+                    return {"success": True, "candidate": {**candidate, "shareurl": leaf_url,
+                            "pwd_id": pwd_id, "passcode": passcode, "pdir_fid": fid, "stoken": stoken,
+                            "search_aliases": aliases, **({"episode_fids": episode_fids} if episode_fids is not None else {})}, "error": ""}
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                scan["limited"] = True
+                print(f"候选目录验证暂未完成：{type(exc).__name__}")
+        return {"success": False, "candidate": None, "code": "no_match" if found_results else "no_results",
+                "validation_limited": scan["limited"], "missing_in_candidates": missing,
+                "error": "目录读取达到上限或暂不可用，尚未完整确认视频目录" if scan["limited"] else
+                "尚未找到介绍片名匹配且可读取视频目录的资源"}
+
     def _find_verified_resource(self, task, candidates, seen, aliases, visited=None,
                                 max_checked=5, verify_index_title=True, required_episodes=None,
-                                repair_context=None):
+                                repair_context=None, description_only=False):
+        if description_only:
+            return self._find_described_video_resource(task, candidates, seen, aliases, visited,
+                                                       max_checked, required_episodes)
         title = task["taskname"]
         checked, found_results, missing_in_candidates = 0, False, 0
         limited = False
@@ -1729,7 +1892,7 @@ class Quark:
                 stoken = (token.get("data") or {}).get("stoken")
                 if token.get("status") != 200 or not stoken:
                     if candidate_source == "Telegram归档":
-                        print("Telegram归档：跳过候选，分享失效、提取码不符或夸克暂不可访问")
+                        print("Telegram归档：跳过候选，" + share_validation_error(token))
                     continue
                 detail = self.get_detail(pwd_id, stoken, pdir_fid, _fetch_share=1, max_pages=3)
                 files = (detail.get("data") or {}).get("list", [])
