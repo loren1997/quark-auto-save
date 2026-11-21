@@ -432,7 +432,7 @@
                   </div>
                 </template>
                 <button v-if="telegramStatus && (telegramStatus.authorized || formData.source.telegram_web.enable || ['starting', 'waiting_qr', 'waiting_password'].includes(telegramStatus.state))" id="telegram-disconnect" type="button" class="btn btn-outline-secondary mt-2" @click="disconnectTelegram" :disabled="telegramBusy">{{ telegramStatus.authorized || formData.source.telegram_web.enable ? '断开 Telegram Web' : '取消登录' }}</button>
-                <small class="text-muted d-block mt-2">浏览器会话只保存在 NAS；不会自动加入频道、发送消息或修改归档。仅提取搜索命中的夸克分享，不保存完整聊天记录。两步验证密码不会写入配置或日志。</small>
+                <small class="text-muted d-block mt-2">浏览器会话只保存在 NAS；不会自动加入频道或修改归档。搜索命中的归档帖子若含 Oscar4KBot“获取资源”按钮，会自动向该机器人发送对应的 /start 资源请求并读取回复。仅提取夸克候选，不保存完整聊天记录；两步验证密码不会写入配置或日志。</small>
               </div>
             </div>
             <div class="form-group row ml-3">

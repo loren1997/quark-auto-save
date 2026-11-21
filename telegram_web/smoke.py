@@ -91,6 +91,44 @@ def check_password_login(page, folder):
     print("Official-style 2FA DOM: decoys, wrong password, success, revealed field, ambiguous input and delayed verification passed", flush=True)
 
 
+def check_resource_button(page):
+    page.unroute_all()
+    page.route("**/*", lambda route: route.fulfill(content_type="text/html", body="<!doctype html>")
+               if route.request.url == WEB_URL else route.abort())
+    page.goto(WEB_URL)
+    page.evaluate("""() => {
+      const peer={_: 'peerChannel',channel_id:3};
+      const channel={_: 'channel',id:3,access_hash:'fixture',username:'archivefixture',title:'归档影视'};
+      const bot={_: 'user',id:42,access_hash:'fixture-bot',username:'Oscar4KBot',pFlags:{bot:true}};
+      const botPeer={_: 'peerUser',user_id:42};
+      const post={_: 'message',id:12,peer_id:peer,date:1,message:'一念永恒 第4季',reply_markup:{rows:[{buttons:[
+        {_: 'keyboardButtonUrl',text:'获取资源',url:'tg://resolve?domain=Oscar4KBot&start=get59171'}]}]}};
+      window.calls=[];
+      window.rootScope={myId:777,managers:{apiManager:{invokeApi:async(method,params)=>{
+        window.calls.push(method);
+        if(method==='messages.getPinnedDialogs')return {dialogs:[],messages:[],chats:[],users:[]};
+        if(method==='messages.getDialogs')return {_: 'messages.dialogs',dialogs:[{_: 'dialog',folder_id:1,peer}],messages:[],chats:[channel]};
+        if(method==='messages.searchGlobal')return {_: 'messages.messages',messages:[post],chats:[channel]};
+        if(method==='contacts.resolveUsername')return {peer:botPeer,users:[bot]};
+        if(method==='messages.startBot'){
+          if(params.start_param!=='get59171'||params.bot.user_id!==42)throw Error('Wrong bot request');
+          return {updates:[{message:{_: 'message',id:101,peer_id:botPeer,pFlags:{out:true},message:'/start get59171'}}]};
+        }
+        if(method==='messages.getHistory')return {messages:params.limit===1?[]:[{
+          _: 'message',id:102,peer_id:botPeer,from_id:botPeer,reply_to:{reply_to_msg_id:101},message:'资源',
+          reply_markup:{rows:[{buttons:[{_: 'keyboardButtonCopy',copy_text:'https://pan.quark.cn/s/fixture123456'}]}]}}]};
+        throw Error('Unexpected API call');
+      }}}};
+    }""")
+    bridge = Path(__file__).with_name("archive_bridge.js").read_text(encoding="utf-8")
+    result = page.evaluate(bridge, {"query": "一念永恒", "limit": 6, "timeout": 5})
+    assert result["success"] and len(result["results"]) == 1, result
+    assert result["bot"]["requests"] == 1 and result["bot"]["links"] == 1, result
+    assert result["results"][0]["source_url"] == "https://t.me/archivefixture/12", result
+    assert page.evaluate("calls.filter(m=>m==='messages.startBot').length") == 1
+    print("Archived Oscar resource button and reply extraction: passed (offline fixture)", flush=True)
+
+
 def main():
     with tempfile.TemporaryDirectory() as folder, sync_playwright() as driver:
         profile = Path(folder) / "profile"
@@ -103,6 +141,7 @@ def main():
                 context.add_cookies([{"name": "profile-check", "value": "ok",
                                      "domain": "example.invalid", "path": "/", "expires": 2147483647}])
                 check_password_login(page, folder)
+                check_resource_button(page)
             else:
                 assert any(item["name"] == "profile-check" for item in context.cookies())
             context.close()

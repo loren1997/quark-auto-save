@@ -106,6 +106,13 @@ def search_telegram_resources(query, config, health_path=None, limit=20, deadlin
           f"已检查 {progress.get('current', 0)} 条消息，返回 {len(candidates)} 条夸克候选"
           + ("；还有结果待继续查询" if result.get("partial") else ""), flush=True)
     errors = []
+    bot = result.get("bot") or {}
+    if any(bot.values()):
+        print(f"Telegram归档资源按钮：Oscar4KBot 请求 {bot.get('requests', 0)} 次，"
+              f"新增 {bot.get('links', 0)} 条夸克候选，待获取 {bot.get('pending', 0)} 项，"
+              f"未取得可关联资源回复 {bot.get('failed', 0)} 项", flush=True)
+        if bot.get("failed"):
+            errors.append({"source": "Telegram归档资源按钮", "message": "Oscar4KBot 暂不可用或未返回可关联的夸克资源，稍后自动重试"})
     # A full candidate batch is pagination, not a failed source.
     if not result.get("success") or result.get("code"):
         reason = data.get("reason") or "Telegram 归档查询未完成"

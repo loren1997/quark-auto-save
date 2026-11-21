@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.sdk.common import SearchError
-from resource_search import search_resources, search_web_resources
+from resource_search import search_resources, search_web_resources, search_telegram_resources
 
 
 class TelegramArchiveSearchIntegrationTests(unittest.TestCase):
@@ -95,6 +95,14 @@ class TelegramArchiveSearchIntegrationTests(unittest.TestCase):
     def test_web_only_phase_does_not_search_archive_again(self):
         search_web_resources("测试动画", self.config, include_archive=False)
         self.browser.search.assert_not_called()
+
+    def test_resource_button_failure_is_logged_without_losing_candidates(self):
+        self.browser.search.return_value.update(bot={"requests": 1, "links": 1, "pending": 0, "failed": 1})
+        with patch("resource_search.print") as log:
+            result = search_telegram_resources("测试动画", self.config)
+        self.assertEqual(result["data"], [self.candidate])
+        self.assertEqual(result["errors"][0]["source"], "Telegram归档资源按钮")
+        self.assertTrue(any("Oscar4KBot 请求 1 次" in call.args[0] for call in log.call_args_list))
 
     def test_unavailable_browser_is_not_retried_for_every_alias_in_same_run(self):
         self.browser.search.return_value = {"success": False, "results": [],

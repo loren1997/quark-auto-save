@@ -181,11 +181,13 @@ class TelegramWebWorkerTests(unittest.TestCase):
 
     def test_search_budget_and_progress(self):
         self.authorize()
+        self.page.search_result["bot"] = {"requests": 1, "links": 2, "pending": 0, "failed": 0}
         result = self.worker.submit("search", {"query": " 测试作品 ", "limit": 300, "timeout": 90})
         self.assertTrue(result["success"])
         self.assertEqual(self.page.last_search, {"query": "测试作品", "limit": 100, "timeout": 45.0})
         self.assertEqual(result["data"]["archived_count"], 9)
         self.assertEqual(result["progress"]["phase"], "complete")
+        self.assertEqual(result["bot"]["links"], 2)
 
     def test_flood_wait_skips_following_browser_request(self):
         self.authorize()
@@ -308,8 +310,12 @@ global.location = {origin: 'https://web.telegram.org', pathname: '/k/'};
 let calls = [];
 global.rootScope = {myId: 777, managers: {apiManager: {invokeApi: async (method, params, options) => {
   calls.push({method, params, options});
-  assert.equal(params.folder_id, 1);
-  assert.ok(['messages.getDialogs', 'messages.getPinnedDialogs', 'messages.searchGlobal'].includes(method));
+  if (global.validateBotCall && ['contacts.resolveUsername','messages.startBot','messages.getHistory'].includes(method)) {
+    global.validateBotCall(method, params);
+  } else {
+    assert.equal(params.folder_id, 1);
+    assert.ok(['messages.getDialogs', 'messages.getPinnedDialogs', 'messages.searchGlobal'].includes(method));
+  }
   assert.equal(options.floodMaxTimeout, 0);
   return await response(method, params);
 }}}};
@@ -359,6 +365,163 @@ global.response=async (method,params)=>{
  return {_: 'messages.messages',messages:[message(peers[2],19,'作品 https://pan.quark.cn/s/abcdef222222')],users:[],chats:[channel]};
 };
 const result=await run();assert.equal(archivePage,2);assert.equal(searchPage,2);assert.equal(result.results.length,2);assert.equal(result.partial,false);
+""")
+
+    def test_resource_url_and_copy_buttons_are_indexed_without_clicking(self):
+        self.run_bridge(r"""
+const post=message(peers[2],12,'作品名 提取码: a1b2');
+post.reply_markup={_: 'replyInlineMarkup',rows:[{buttons:[
+ {_: 'keyboardButtonUrl',text:'获取资源',url:'https://pan.quark.cn/s/abcdef111111'},
+ {_: 'keyboardButtonCopy',text:'复制链接',copy_text:'https://pan.quark.cn/s/abcdef111111'},
+ {_: 'keyboardButtonUrl',text:'广告',url:'https://example.com/tracker'},
+ {_: 'keyboardButtonCallback',text:'领取',data:'NO_CALLBACK'}]}]};
+global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'
+ ? allDialogs() : {_: 'messages.messages',messages:[post],users:[],chats:[channel]};
+const result=await run();assert.equal(result.results.length,1);
+assert.equal(result.results[0].url,'https://pan.quark.cn/s/abcdef111111?pwd=a1b2');
+assert.equal(calls.length,3);
+""")
+
+    def run_bot_bridge(self, scenario):
+        self.run_bridge(r"""
+const oscar={_: 'user',id:42,access_hash:'BOT_PRIVATE_HASH',username:'Oscar4KBot',pFlags:{bot:true}};
+const botPeer={_: 'peerUser',user_id:42};
+const post=message(peers[2],12,'作品 第4季');
+post.reply_markup={rows:[{buttons:[{_: 'keyboardButtonUrl',text:'📥 获取资源',url:'tg://resolve?domain=Oscar4KBot&start=get59171'}]}]};
+let posts=[post], starts=0, historyReads=0, botResolved=oscar, replyOverride, archived=true;
+const reply=(id,body,extra={})=>({...message(botPeer,id,body),from_id:botPeer,...extra});
+global.validateBotCall=(method,params)=>{
+  if(method==='contacts.resolveUsername')assert.equal(params.username,'Oscar4KBot');
+  else {assert.equal(params.peer.user_id,42);assert.equal(params.peer.access_hash,'BOT_PRIVATE_HASH');}
+  if(method==='messages.startBot'){
+    assert.equal(params.bot.user_id,42);assert.equal(params.start_param,'get59171');
+    assert.match(params.random_id,/^-?\d+$/);
+  }
+};
+global.response=async(method,params)=>{
+  if(method==='messages.getPinnedDialogs')return emptyPinned();
+  if(method==='messages.getDialogs')return {...allDialogs(),dialogs:archived?allDialogs().dialogs:[]};
+  if(method==='messages.searchGlobal')return {_: 'messages.messages',messages:posts,users:[],chats:[channel]};
+  if(method==='contacts.resolveUsername')return {peer:botPeer,users:[botResolved]};
+  if(method==='messages.startBot'){
+    starts++;return {updates:[{_: 'updateNewMessage',message:reply(101,'/start get59171',{pFlags:{out:true}})}]};
+  }
+  if(method==='messages.getHistory'){
+    historyReads++;
+    if(params.limit===1)return {messages:[reply(100,'作品 https://pan.quark.cn/s/OLD000111111')]};
+    assert.equal(params.min_id,100);
+    return {messages:replyOverride?replyOverride():[reply(102,'#作品 https://pan.quark.cn/s/NEW000111111')]};
+  }
+  throw Error('unexpected method');
+};
+""" + scenario)
+
+    def test_oscar_start_reply_is_prioritized_and_keeps_archived_provenance(self):
+        self.run_bot_bridge(r"""
+posts.unshift(message(peers[2],15,'作品 https://pan.quark.cn/s/STALE0111111'));
+const result=await run('作品',1);
+assert.equal(starts,1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
+assert.equal(result.results[0].title,'作品 第4季');assert.equal(result.results[0].source_url,'https://t.me/publicchannel/12');
+assert.equal(result.bot.requests,1);assert.equal(result.bot.links,1);assert.equal(result.partial,true);
+assert.ok(!JSON.stringify(result).includes('BOT_PRIVATE_HASH'));assert.ok(!JSON.stringify(result).includes('get59171'));
+const second=await run('作品',1);assert.equal(starts,1);assert.equal(second.results[0].url,'https://pan.quark.cn/s/STALE0111111');
+""")
+
+    def test_oscar_https_buttons_and_delayed_reply_copy_buttons(self):
+        self.run_bot_bridge(r"""
+post.reply_markup.rows[0].buttons[0].url='https://t.me/Oscar4KBot?start=get59171';
+let polls=0;
+replyOverride=()=>++polls===1?[reply(102,'正在获取')]:[reply(102,'#作品',{
+ reply_markup:{rows:[{buttons:[{_: 'keyboardButtonCopy',copy_text:'https://pan.quark.cn/s/NEW000111111'}]}]}})];
+const result=await run();assert.equal(polls,2);assert.equal(starts,1);assert.equal(result.results.length,1);
+""")
+
+    def test_oscar_ignores_old_unrelated_and_forged_replies(self):
+        self.run_bot_bridge(r"""
+replyOverride=()=>[
+ reply(100,'作品 https://pan.quark.cn/s/OLD000111111'),
+ reply(102,'其他作品 https://pan.quark.cn/s/OTHER0111111'),
+ reply(103,'一念永恒 https://pan.quark.cn/s/FORGED111111',{from_id:{_: 'peerUser',user_id:43}}),
+ reply(104,'一念永恒 https://pan.quark.cn/s/OUT000111111',{pFlags:{out:true}}),
+ reply(105,'资源 https://pan.quark.cn/s/RIGHT0111111',{reply_to:{reply_to_msg_id:101}})];
+const result=await run('一念永恒');assert.equal(result.results.length,1);assert.ok(result.results[0].url.includes('RIGHT0'));
+""")
+
+    def test_unsupported_or_unarchived_resource_buttons_never_start_a_bot(self):
+        self.run_bot_bridge(r"""
+const urls=[
+ 'tg://resolve?domain=OtherBot&start=get59171','tg://resolve?domain=Oscar4KBot&start=pay59171',
+ 'tg://resolve?domain=Oscar4KBot&start=get59171&start=other',
+ 'tg://resolve?domain=Oscar4KBot&start=get59171&admin=1',
+ 'https://t.me@evil.example/Oscar4KBot?start=get59171',
+ 'https://t.me/Oscar4KBot?start=get59171#extra'];
+posts=urls.map((url,i)=>({...post,id:i+1,reply_markup:{rows:[{buttons:[{_: 'keyboardButtonUrl',text:'获取资源',url}]}]}}));
+posts.push({...post,peer_id:{_: 'peerChannel',channel_id:99}});
+posts.push({...post,id:88,reply_markup:{rows:[{buttons:[{_: 'keyboardButtonCallback',text:'获取资源',data:'NO'}]}]}});
+const result=await run();assert.equal(starts,0);assert.equal(result.results.length,0);
+assert.ok(!calls.some(c=>c.method==='contacts.resolveUsername'));
+""")
+
+    def test_non_bot_resolution_preserves_direct_candidates_and_reports_failure(self):
+        self.run_bot_bridge(r"""
+botResolved={...oscar,pFlags:{}};
+posts.push(message(peers[2],14,'作品 https://pan.quark.cn/s/DIRECT111111'));
+const result=await run();assert.equal(starts,0);assert.equal(result.results.length,1);assert.equal(result.bot.failed,1);
+""")
+
+    def test_ambiguous_start_timeout_is_not_repeated_and_resumes_reply_read(self):
+        self.run_bot_bridge(r"""
+const original=response;
+global.response=async(method,params)=>{
+ if(method==='messages.startBot'){starts++;throw {type:'BUDGET_EXHAUSTED'};}
+ return original(method,params);
+};
+const first=await run();assert.equal(first.code,'BUDGET_EXHAUSTED');assert.equal(first.bot.pending,1);
+const second=await run();assert.equal(starts,1);assert.equal(second.results.length,1);
+""")
+
+    def test_pending_bot_button_removed_from_archive_is_not_read(self):
+        self.run_bot_bridge(r"""
+const original=response;
+global.response=async(method,params)=>{
+ if(method==='messages.startBot'){starts++;throw {type:'BUDGET_EXHAUSTED'};}
+ return original(method,params);
+};
+await run();archived=false;const previous=historyReads;
+const result=await run();assert.equal(starts,1);assert.equal(historyReads,previous);assert.equal(result.results.length,0);
+""")
+
+    def test_oscar_cache_reuses_reply_then_expires_and_honors_account_change(self):
+        self.run_bot_bridge(r"""
+await run();await run();assert.equal(starts,1);
+const job=window.__qasArchiveReadState.botJobs.get('get59171');job.created-=16*60*1000;
+await run();assert.equal(starts,2);
+rootScope.myId=778;await run();assert.equal(starts,3);
+""")
+
+    def test_oscar_flood_wait_stops_requests_and_account_switch_prevents_start(self):
+        self.run_bot_bridge(r"""
+const original=response;
+global.response=async(method,params)=>{
+ if(method==='contacts.resolveUsername')throw {type:'FLOOD_WAIT_30'};
+ return original(method,params);
+};
+const first=await run();assert.equal(first.code,'FLOOD_WAIT');assert.equal(first.retry_after,30);assert.equal(starts,0);
+global.response=async(method,params)=>{
+ const value=await original(method,params);
+ if(method==='contacts.resolveUsername')rootScope.myId=888;
+ return value;
+};
+const second=await run();assert.equal(second.code,'AUTH_REQUIRED');assert.equal(starts,0);
+""")
+
+    def test_oscar_pending_replies_resume_without_resending_then_report_exhaustion(self):
+        self.run_bot_bridge(r"""
+replyOverride=()=>[reply(102,'请稍候')];
+const first=await run();assert.equal(first.bot.pending,1);assert.equal(first.partial,true);assert.equal(starts,1);
+window.__qasArchiveReadState.botJobs.get('get59171').polls=2;
+const second=await run();assert.equal(second.bot.failed,1);assert.equal(second.bot.pending,0);assert.equal(starts,1);
+assert.equal(second.partial,false);assert.equal(second.results.length,0);
 """)
 
     def test_forbidden_last_dialog_can_page_to_readable_archive(self):

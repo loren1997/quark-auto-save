@@ -427,4 +427,5 @@ class TelegramWebWorker:
         if code == "AUTH_REQUIRED":
             self._state, self._reason = "disconnected", code
         return self._result(bool(result.get("success")), code, results=result.get("results", []),
-                            partial=bool(result.get("partial")), progress=result.get("progress", {}))
+                            partial=bool(result.get("partial")), progress=result.get("progress", {}),
+                            bot=result.get("bot", {}))

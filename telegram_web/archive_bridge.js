@@ -16,6 +16,11 @@ async ({query, limit, timeout}) => {
     state.account = account;
     state.archives = null;
     state.searches = new Map();
+    state.botJobs = new Map();
+  }
+  const botJobs = state.botJobs ||= new Map();
+  for (const [payload, job] of botJobs) {
+    if (job.created < Date.now() - 15 * 60 * 1000) botJobs.delete(payload);
   }
   const searches = state.searches;
   for (const [name, cached] of searches) {
@@ -32,14 +37,24 @@ async ({query, limit, timeout}) => {
   const results = [];
   let phase = 'archives';
   let archive = state.archives;
+  let botPeer, activeJob;
+  let botChecked = false;
+  const bot = {requests: 0, links: 0, pending: 0, failed: 0};
   function assertAccount() {
     if (String(window.rootScope?.myId) !== account) throw {type: 'ACCOUNT_CHANGED'};
   }
   async function invoke(method, params) {
     assertAccount();
-    // The only permitted history query is server-side archive scoped, never a fallback.
-    if (!['messages.getDialogs', 'messages.getPinnedDialogs', 'messages.searchGlobal'].includes(method)
-      || params.folder_id !== 1) throw {type: 'BRIDGE_UNAVAILABLE'};
+    const archiveRead = ['messages.getDialogs', 'messages.getPinnedDialogs', 'messages.searchGlobal'].includes(method)
+      && params.folder_id === 1;
+    // Only a validated archived resource button can authorize this one bot's private history/start.
+    const botRead = activeJob && (method === 'contacts.resolveUsername' && params.username === 'Oscar4KBot'
+      || botPeer && params.peer?._ === 'inputPeerUser' && params.peer.user_id === botPeer.user_id
+        && params.peer.access_hash === botPeer.access_hash && (method === 'messages.getHistory'
+          || method === 'messages.startBot' && params.start_param === activeJob.payload
+            && params.bot?._ === 'inputUser' && params.bot.user_id === botPeer.user_id
+            && params.bot.access_hash === botPeer.access_hash));
+    if (!archiveRead && !botRead) throw {type: 'BRIDGE_UNAVAILABLE'};
     const remaining = until - Date.now();
     if (remaining < 250) throw {type: 'BUDGET_EXHAUSTED'};
     let timer;
@@ -87,6 +102,116 @@ async ({query, limit, timeout}) => {
     return {phase, current: phase === 'archives' ? archive?.peers.size || 0 : search?.seen || 0,
       total: phase === 'archives' ? archive?.total || 0 : search?.total || 0};
   }
+  const buttons = message => (message.reply_markup?.rows || []).flatMap(row => row.buttons || []);
+  function shares(message) {
+    const text = String(message.message || '');
+    const links = [text,
+      ...(message.entities || []).filter(e => e._ === 'messageEntityTextUrl').map(e => e.url || ''),
+      ...buttons(message).filter(b => b._ === 'keyboardButtonUrl').map(b => b.url || ''),
+      ...buttons(message).filter(b => b._ === 'keyboardButtonCopy').map(b => b.copy_text || '')].join('\n');
+    const ids = new Set([...links.matchAll(/https?:\/\/pan\.quark\.cn\/s\/([A-Za-z0-9]{6,32})(?![A-Za-z0-9])/g)].map(m => m[1]));
+    return [...links.matchAll(/https?:\/\/pan\.quark\.cn\/s\/[A-Za-z0-9]{6,32}(?![A-Za-z0-9])(?:[?#][^\s<>"'，。；、）】]*)?/g)].map(match => {
+      const parsed = new URL(match[0]);
+      parsed.protocol = 'https:';
+      if (!parsed.searchParams.has('pwd') && ids.size === 1) {
+        const passcode = /(?:提取码|访问码|密码)\s*[:：]?\s*([A-Za-z0-9]{4})(?![A-Za-z0-9])/i.exec(text);
+        if (passcode) parsed.searchParams.set('pwd', passcode[1]);
+      }
+      return parsed.toString();
+    });
+  }
+  function addShares(message, post, entity, priority = false) {
+    const text = String(post.message || '');
+    for (const url of shares(message)) {
+      if (search.urls.has(url)) continue;
+      search.urls.add(url);
+      const title = text.split('\n').map(s => s.trim()).find(s => s && !/^https?:\/\//.test(s)) || entity.title || '';
+      const candidate = {title: title.slice(0,240), url, content: text.slice(0,1600), source_type: 'telegram_web'};
+      if (entity.publicMessages && /^[a-zA-Z][a-zA-Z0-9_]{4,31}$/.test(entity.username || '') && Number.isInteger(post.id) && post.id > 0) {
+        candidate.source_url = `https://t.me/${entity.username}/${post.id}`;
+      }
+      const item = {peerKey: key(post.peer_id), candidate};
+      if (priority) { search.pending.unshift(item); bot.links++; }
+      else search.pending.push(item);
+    }
+  }
+  function resourcePayload(button) {
+    if (button._ !== 'keyboardButtonUrl' || !/(获取资源|獲取資源)/.test(button.text || '')) return;
+    try {
+      const url = new URL(button.url);
+      if (url.username || url.password || url.port || url.hash) return;
+      const tg = url.protocol === 'tg:' && url.hostname === 'resolve' && !url.pathname
+        && url.searchParams.get('domain')?.toLowerCase() === 'oscar4kbot';
+      const web = url.protocol === 'https:' && url.hostname === 't.me' && url.pathname.toLowerCase() === '/oscar4kbot';
+      if (!tg && !web) return;
+      const keys = [...url.searchParams.keys()];
+      if (new Set(keys).size !== keys.length || keys.some(k => k !== 'start' && !(tg && k === 'domain'))) return;
+      const payload = url.searchParams.get('start');
+      if (/^get[0-9]{1,20}$/.test(payload || '')) return payload;
+    } catch (_) { /* An unsupported button is not an executable action. */ }
+  }
+  async function resolveResourceButton() {
+    if (botChecked || !search.botPending.length || until - Date.now() < 1000) return;
+    botChecked = true;
+    const item = search.botPending[0], entity = archive.peers.get(item.peerKey);
+    if (!entity) { search.botPending.shift(); return; }
+    let job = botJobs.get(item.payload);
+    if (!job) {
+      while (botJobs.size >= 100) botJobs.delete(botJobs.keys().next().value);
+      job = {payload: item.payload, created: Date.now(), polls: 0};
+      botJobs.set(item.payload, job);
+    }
+    activeJob = job;
+    try {
+      if (!job.replies && !job.failed) {
+        const resolved = await invoke('contacts.resolveUsername', {username: 'Oscar4KBot'});
+        const user = (resolved.users || []).find(u => u._ === 'user' && u.id === resolved.peer?.user_id);
+        if (!user?.pFlags?.bot || user.pFlags.deleted || user.pFlags.restricted || !user.access_hash
+          || user.username?.toLowerCase() !== 'oscar4kbot') throw {type: 'BOT_UNAVAILABLE'};
+        botPeer = {_: 'inputPeerUser', user_id: user.id, access_hash: user.access_hash};
+        const history = min => invoke('messages.getHistory', {peer: botPeer, offset_id: 0, offset_date: 0,
+          add_offset: 0, limit: min === null ? 1 : 10, max_id: 0, min_id: min || 0, hash: '0'});
+        if (!job.started) {
+          const before = await history(null);
+          if (!Array.isArray(before.messages)) throw {type: 'BOT_UNAVAILABLE'};
+          job.baseline = Math.max(0, ...before.messages.map(m => Number(m.id) || 0));
+          if (until - Date.now() < 500) throw {type: 'BUDGET_EXHAUSTED'};
+          const random = crypto.getRandomValues(new Uint32Array(2));
+          job.randomId = (BigInt.asIntN(64, (BigInt(random[0]) << 32n) | BigInt(random[1])) || 1n).toString();
+          job.started = true; // An ambiguous timeout must not send another /start on the next batch.
+          bot.requests++;
+          const started = await invoke('messages.startBot', {bot: {_: 'inputUser', user_id: user.id,
+            access_hash: user.access_hash}, peer: botPeer, random_id: job.randomId, start_param: job.payload});
+          job.requestId = (started.updates || []).map(u => u.message).find(m => m?.pFlags?.out
+            && key(m.peer_id) === `u:${user.id}` && m.message === `/start ${job.payload}`)?.id;
+        }
+        const end = Math.min(until - 300, Date.now() + 6000);
+        const normalize = value => String(value).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+        do {
+          const response = await history(job.baseline);
+          if (!Array.isArray(response.messages)) throw {type: 'BOT_UNAVAILABLE'};
+          const replies = response.messages.filter(m => m._ === 'message' && !m.pFlags?.out
+            && m.id > job.baseline && key(m.peer_id) === `u:${user.id}` && (!m.from_id || key(m.from_id) === `u:${user.id}`)
+            && (job.requestId && m.reply_to?.reply_to_msg_id === job.requestId
+              || normalize(m.message || '').includes(normalize(query))) && shares(m).length);
+          if (replies.length) { job.replies = replies; break; }
+          if (Date.now() + 600 >= end) break;
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } while (Date.now() < end);
+        if (!job.replies && ++job.polls >= 3) job.failed = true;
+      }
+      if (job.replies) {
+        for (const reply of job.replies) addShares(reply, item.post, entity, true);
+        search.botPending.shift();
+      } else if (job.failed) { bot.failed++; search.botPending.shift(); }
+    } catch (error) {
+      const type = String(error?.type || '');
+      if (/FLOOD|ACCOUNT_CHANGED|AUTH_KEY|SESSION_|BUDGET_EXHAUSTED/.test(type)) throw error;
+      job.failed = true; bot.failed++; search.botPending.shift();
+    } finally {
+      activeJob = null; botPeer = null;
+    }
+  }
   try {
     // Refresh the complete archive membership for every request. A timed-out
     // archive listing resumes from its cursor; it is never treated as the whole folder.
@@ -119,7 +244,7 @@ async ({query, limit, timeout}) => {
     if (!search) {
       while (searches.size >= 20) searches.delete(searches.keys().next().value);
       search = {query, id: 0, peer: empty(), rate: 0, cursor: '', seen: 0, total: 0,
-        done: false, exhausted: false, pending: [], urls: new Set(), used: Date.now()};
+        done: false, exhausted: false, pending: [], urls: new Set(), botPending: [], botSeen: new Set(), used: Date.now()};
       searches.set(query, search);
     }
     const drain = () => {
@@ -128,6 +253,7 @@ async ({query, limit, timeout}) => {
         if (archive.peers.has(item.peerKey)) results.push(item.candidate);
       }
     };
+    await resolveResourceButton();
     drain();
     while (!search.exhausted && results.length < limit && archive.peers.size) {
       const response = await invoke('messages.searchGlobal', {folder_id: 1, q: query,
@@ -140,28 +266,17 @@ async ({query, limit, timeout}) => {
         search.seen++;
         const entity = archive.peers.get(key(message.peer_id));
         if (!entity || message._ !== 'message') continue;
-        // Only messages carrying real Quark shares cross the browser boundary.
-        const text = String(message.message || '');
-        const links = [text, ...(message.entities || []).filter(e => e._ === 'messageEntityTextUrl').map(e => e.url || '')].join('\n');
-        const shareIds = new Set([...links.matchAll(/https?:\/\/pan\.quark\.cn\/s\/([A-Za-z0-9]{6,32})(?![A-Za-z0-9])/g)].map(m => m[1]));
-        for (const match of links.matchAll(/https?:\/\/pan\.quark\.cn\/s\/[A-Za-z0-9]{6,32}(?![A-Za-z0-9])(?:[?#][^\s<>"'，。；、）】]*)?/g)) {
-          const parsed = new URL(match[0]);
-          parsed.protocol = 'https:';
-          if (!parsed.searchParams.has('pwd') && shareIds.size === 1) {
-            const passcode = /(?:提取码|访问码|密码)\s*[:：]?\s*([A-Za-z0-9]{4})(?![A-Za-z0-9])/i.exec(text);
-            if (passcode) parsed.searchParams.set('pwd', passcode[1]);
+        addShares(message, message, entity);
+        for (const button of buttons(message)) {
+          const payload = resourcePayload(button);
+          if (payload && !search.botSeen.has(payload)) {
+            search.botSeen.add(payload);
+            search.botPending.push({payload, post: {id: message.id, peer_id: message.peer_id,
+              message: message.message}, peerKey: key(message.peer_id)});
           }
-          const url = parsed.toString();
-          if (search.urls.has(url)) continue;
-          search.urls.add(url);
-          const title = text.split('\n').map(s => s.trim()).find(s => s && !/^https?:\/\//.test(s)) || entity.title || '';
-          const candidate = {title: title.slice(0,240), url, content: text.slice(0,1600), source_type: 'telegram_web'};
-          if (entity.publicMessages && /^[a-zA-Z][a-zA-Z0-9_]{4,31}$/.test(entity.username || '') && Number.isInteger(message.id) && message.id > 0) {
-            candidate.source_url = `https://t.me/${entity.username}/${message.id}`;
-          }
-          search.pending.push({peerKey: key(message.peer_id), candidate});
         }
       }
+      await resolveResourceButton();
       drain();
       if (response._ === 'messages.messages' || !response.messages.length) { search.exhausted = true; break; }
       const last = response.messages[response.messages.length - 1];
@@ -172,10 +287,11 @@ async ({query, limit, timeout}) => {
       search.cursor = cursor; search.id = last.id; search.peer = entity.input; search.rate = nextRate;
     }
     if (!archive.peers.size) search.exhausted = true;
-    search.done = search.exhausted && !search.pending.length;
+    bot.pending = search.botPending.length;
+    search.done = search.exhausted && !search.pending.length && !bot.pending;
     if (search.done) phase = 'complete';
     return {success: true, results, archived_count: archive.peers.size,
-      partial: !search.done, progress: progress()};
+      partial: !search.done, progress: progress(), bot};
   } catch (error) {
     const type = String(error?.type || error?.message || '');
     const flood = /FLOOD(?:_PREMIUM)?_WAIT_(\d+)/.exec(type);
@@ -183,6 +299,7 @@ async ({query, limit, timeout}) => {
       ? 'AUTH_REQUIRED' : ['BUDGET_EXHAUSTED','PAGINATION_FAILED','BRIDGE_UNAVAILABLE'].includes(type) ? type : 'SEARCH_FAILED';
     return {success: code === 'BUDGET_EXHAUSTED', code, results,
       partial: true, archived_count: archive?.peers.size || 0, progress: progress(),
+      bot: {...bot, pending: search?.botPending.length || 0},
       retry_after: flood ? Math.min(86400, Number(flood[1])) : 0};
   }
 }

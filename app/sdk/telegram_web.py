@@ -113,6 +113,9 @@ def _safe_result(result, action):
                 "source_url": row.get("source_url", "")[:2048] if isinstance(row.get("source_url", ""), str) else "",
             })
         clean["partial"] = result.get("partial") is True
+        bot = result.get("bot")
+        if isinstance(bot, dict):
+            clean["bot"] = {key: _number(bot.get(key)) for key in ("requests", "links", "pending", "failed")}
         progress = result.get("progress")
         if isinstance(progress, dict) and progress.get("phase") in ("archives", "search", "complete"):
             clean["progress"] = {"phase": progress["phase"], "current": _number(progress.get("current")),

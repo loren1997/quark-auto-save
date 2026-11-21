@@ -107,12 +107,14 @@ class TelegramWebClientTests(unittest.TestCase):
             {"title": "作品 第二集", "url": "https://pan.quark.cn/s/abcdef123456", "content": "已归档的消息",
              "source_type": "telegram_web", "peer_id": "private-id"},
             {"title": "无关链接", "url": "https://example.com", "source_type": "telegram_web"},
-        ], partial=True, progress={"phase": "search", "current": 10, "total": 15, "cursor": "private-cursor"}))
+        ], partial=True, progress={"phase": "search", "current": 10, "total": 15, "cursor": "private-cursor"},
+            bot={"requests": 1, "links": 1, "pending": 0, "failed": 0, "payload": "private-start"}))
         returned = self.client.search("作品", limit=20, deadline=time.monotonic() + 10)
         self.assertEqual(returned["results"][0]["taskname"], "作品 第二集")
         self.assertEqual(returned["results"][0]["shareurl"], "https://pan.quark.cn/s/abcdef123456")
         self.assertEqual(len(returned["results"]), 1)
         self.assertTrue(returned["partial"])
+        self.assertEqual(returned["bot"], {"requests": 1, "links": 1, "pending": 0, "failed": 0})
         self.assertNotIn("private-", json.dumps(returned))
         call = self.http.request.call_args
         self.assertEqual(call.args[1], "http://telegram-web:8765/search")
