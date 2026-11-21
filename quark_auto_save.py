@@ -138,6 +138,11 @@ def resource_description_matches(task, candidate, aliases):
     names = {_resource_title_parts(value)[0] for value in [task["taskname"], *aliases]} - {""}
     text = "\n".join(str(candidate.get(field) or "")[:8000] for field in ("taskname", "content"))
     for line in re.split(r"[\r\n|｜#]+", text):
+        line = re.sub(r"[\u200b-\u200f\ufeff]", "", line)
+        normalized = _resource_title_parts(line)[0]
+        # Resource introductions often attach season numbers and promotional text to Chinese titles.
+        if any(len(name) >= 2 and re.search(r"[\u4e00-\u9fff]", name) and name in normalized for name in names):
+            return True
         line = re.sub(r"^\s*(?:资源名称|资源名|名称|片名|标题)\s*[:：]\s*", "", line)
         values = [line, *re.findall(r"[《【]([^》】]{1,200})[》】]", line), *line.split()]
         if any(_resource_title_parts(value)[0] in names for value in values if len(value) <= 300):
@@ -1665,26 +1670,35 @@ class Quark:
             def archive_candidates():
                 nonlocal interrupted
                 active_queries = list(web_queries)
-                # Each fetched batch fits the dedicated verification allowance;
-                # anonymous web candidates cannot consume the archive's slots.
-                for page in range(4):
+                checked_start = len(visited)
+                # Filtered introductions do not consume the 24-share verification allowance.
+                for page in range(40):
                     if not active_queries or time.monotonic() >= archive_deadline:
                         interrupted = bool(active_queries)
+                        return
+                    allowance = 24 - (len(visited) - checked_start)
+                    if allowance <= 0:
+                        interrupted = True
+                        print("Telegram归档：本轮已校验 24 条分享；其余候选保留到下次继续查询")
                         return
                     query = active_queries.pop(0)
                     attempted.append(("telegram", query))
                     response = search_telegram_resources(query, config, health_path=self.search_health_path,
-                                                         limit=6, deadline=archive_deadline)
+                                                         limit=min(6, allowance), deadline=archive_deadline)
                     for error in response.get("errors", []):
                         record_error(error.get("source"), error.get("message"))
-                    yield from response.get("data", [])
+                    rows = response.get("data", [])
+                    matched = sum(isinstance(row, dict) and resource_description_matches(task, row, aliases) for row in rows)
+                    checked_before = len(visited)
+                    yield from rows
+                    print(f"Telegram归档：本批介绍匹配 {matched}/{len(rows)} 条，新增校验 {len(visited) - checked_before} 条分享；重复或已排除的候选不重复校验")
                     if response.get("partial") and response.get("success") and not response.get("code"):
                         active_queries.append(query)
                     if response.get("code") or not response.get("success"):
                         break
                 if active_queries:
                     interrupted = True
-                    print("Telegram归档：本轮分批验证已达上限，未读取的候选将在下次运行继续查询")
+                    print("Telegram归档：本轮候选筛选达到 40 批，未读取的候选将在下次运行继续查询")
 
             archive_result = self._find_verified_resource(
                 task, archive_candidates(), seen, aliases, visited=visited, max_checked=24,

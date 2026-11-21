@@ -30,6 +30,8 @@ def search_error_reason(message):
     if status:
         return f"HTTP {status.group(1)}"
     for pattern, reason in (
+        (r"没有启用的搜索源|未启用其他索引来源", "未启用其他索引来源"),
+        (r"本次查找已跳过此前失败的来源", "本次查找已跳过此前失败的来源"),
         (r"非公网", "地址解析为非公网 IP，已拒绝访问"),
         (r"域名解析|\bdns\b|NameResolution|gaierror", "DNS 域名解析失败"),
         (r"InvalidProxyURL|代理配置", "代理配置无效"),

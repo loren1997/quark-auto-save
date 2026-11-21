@@ -450,6 +450,38 @@ channel.username='Oscar_4Kmovies';archived=false;
 await run();assert.ok(!calls.some(c=>c.method==='messages.search'));assert.equal(starts,0);
 """)
 
+    def test_archived_oscar_title_and_active_secondary_username_are_recognized(self):
+        for identity in ("channel.title='奥斯卡4K蓝光(精品)影视磁力站🍿';delete channel.username;",
+                         "delete channel.username;channel.usernames=[{username:'Oscar_4Kmovies',pFlags:{active:true}}];"):
+            self.run_bot_bridge(identity + r"""
+const original=response;
+global.response=async(method,params)=>method==='messages.search'?{messages:[post]}:original(method,params);
+const result=await run('作品',1);
+assert.equal(result.bot.channel_archived,1);assert.equal(starts,1);
+assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
+assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));
+""")
+
+    def test_unarchived_oscar_title_and_inactive_username_do_not_authorize_search(self):
+        for identity in ("channel.title='奥斯卡4K蓝光(精品)影视磁力站';archived=false;",
+                         "channel.usernames=[{username:'Oscar_4Kmovies',pFlags:{}}];posts=[];"):
+            self.run_bot_bridge(identity + r"""
+const result=await run();assert.equal(result.bot.channel_archived,0);
+assert.ok(!calls.some(c=>c.method==='messages.search'));assert.equal(starts,0);
+""")
+
+    def test_oscar_recognition_is_retried_for_unfinished_query_after_metadata_changes(self):
+        self.run_bot_bridge(r"""
+posts=[message(peers[2],11,'作品 https://pan.quark.cn/s/STALE0111111'),
+       message(peers[2],10,'作品 https://pan.quark.cn/s/STALE0222222')];
+assert.equal((await run('作品',1)).partial,true);assert.equal(starts,0);
+channel.title='奥斯卡4K蓝光(精品)影视磁力站';
+const original=response;
+global.response=async(method,params)=>method==='messages.search'?{messages:[post]}:original(method,params);
+const result=await run('作品',1);assert.equal(result.bot.channel_archived,1);assert.equal(starts,1);
+assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
+""")
+
     def test_oscar_https_buttons_and_delayed_reply_copy_buttons(self):
         self.run_bot_bridge(r"""
 post.reply_markup.rows[0].buttons[0].url='https://t.me/Oscar4KBot?start=get59171';

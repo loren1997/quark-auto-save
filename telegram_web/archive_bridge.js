@@ -40,6 +40,9 @@ async ({query, limit, timeout}) => {
   let botPeer, activeJob;
   let botChecked = false;
   const bot = {requests: 0, links: 0, pending: 0, failed: 0, channel_posts: 0, buttons: 0, channel_archived: 0};
+  const isOscarChannel = entity => entity.input._ === 'inputPeerChannel' && (
+    [entity.username, ...(entity.usernames || [])].some(name => name?.toLowerCase() === 'oscar_4kmovies')
+    || /奥斯卡.*(?:4k|蓝光).*(?:影视|磁力)/i.test(String(entity.title || '').normalize('NFKC')));
   function assertAccount() {
     if (String(window.rootScope?.myId) !== account) throw {type: 'ACCOUNT_CHANGED'};
   }
@@ -55,7 +58,7 @@ async ({query, limit, timeout}) => {
             && params.bot?._ === 'inputUser' && params.bot.user_id === botPeer.user_id
             && params.bot.access_hash === botPeer.access_hash));
     const channelRead = method === 'messages.search' && archive?.complete
-      && [...archive.peers.values()].some(entity => entity.username?.toLowerCase() === 'oscar_4kmovies'
+      && [...archive.peers.values()].some(entity => isOscarChannel(entity)
         && entity.input._ === 'inputPeerChannel' && params.peer?._ === 'inputPeerChannel'
         && params.peer.channel_id === entity.input.channel_id && params.peer.access_hash === entity.input.access_hash);
     if (!archiveRead && !botRead && !channelRead) throw {type: 'BRIDGE_UNAVAILABLE'};
@@ -90,7 +93,9 @@ async ({query, limit, timeout}) => {
         input: {_: 'inputPeerChat', chat_id: chat.id}, title: chat.title, readable});
       if (chat._ === 'channel' || chat._ === 'channelForbidden') entities.set(`c:${chat.id}`, {
         input: {_: 'inputPeerChannel', channel_id: chat.id, access_hash: chat.access_hash},
-        title: chat.title, username: chat.username, publicMessages: true, readable});
+        title: chat.title, username: chat.username,
+        usernames: (chat.usernames || []).filter(item => item.pFlags?.active).map(item => item.username),
+        publicMessages: true, readable});
     }
     return entities;
   }
@@ -273,9 +278,10 @@ async ({query, limit, timeout}) => {
         if (archive.peers.has(item.peerKey)) results.push(item.candidate);
       }
     };
-    const channel = [...archive.peers.values()].find(entity => entity.username?.toLowerCase() === 'oscar_4kmovies');
+    const channel = [...archive.peers.values()].find(isOscarChannel);
     bot.channel_archived = channel ? 1 : 0;
-    if (!search.channelChecked) {
+    const channelKey = channel ? `c:${channel.input.channel_id}` : '';
+    if (channel && search.channelChecked !== channelKey) {
       if (channel) {
         try {
           const response = await invoke('messages.search', {peer: channel.input, q: query,
@@ -289,7 +295,7 @@ async ({query, limit, timeout}) => {
           bot.failed++;
         }
       }
-      search.channelChecked = true;
+      search.channelChecked = channelKey;
     }
     await resolveResourceButton();
     drain();

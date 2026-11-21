@@ -225,7 +225,7 @@ class AutoRepairTests(unittest.TestCase):
                 self.assertEqual(self.strict_candidate()["success"], accepted)
 
 
-    def test_other_season_video_or_document_cannot_supply_missing_season_evidence(self):
+    def test_strict_other_season_video_or_document_cannot_supply_missing_season_evidence(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")
         for files in ([{"file_name": "S03E09 1080p-GyWEB.mp4"}, {"file_name": "S02E09 1080p-GyWEB.mp4"}],
                       [{"file_name": "S03E09 1080p-GyWEB.mp4"}, {"file_name": "S02E09 Other Show.mp4"}],
@@ -234,7 +234,7 @@ class AutoRepairTests(unittest.TestCase):
                 {"fid": str(index), "dir": False, **file} for index, file in enumerate(files)
             ]}}
             with self.subTest(files=files), self.search([self.candidate(title="大理寺日志3 (2026)")]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=detail):
-                self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+                self.assertFalse(self.strict_candidate()["success"])
 
     def test_strict_old_movie_and_mixed_season_collection_do_not_validate_a_new_season(self):
         self.task.update(taskname="罗小黑战记 第3季", resource_type="anime")
@@ -381,6 +381,43 @@ class AutoRepairTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertIn("validindex", result["candidate"]["shareurl"])
         index.assert_called()
+
+    def test_archive_filtered_batches_do_not_exhaust_verification_allowance(self):
+        ignored = [dict(self.candidate(f"ignored{i}", "其他作品"), source_type="telegram_web") for i in range(24)]
+        batches = [{"success": True, "data": ignored[start:start + 6], "partial": True}
+                   for start in range(0, 24, 6)]
+        batches.append({"success": True, "data": [dict(self.candidate("goodarchive"), source_type="telegram_web")], "partial": False})
+        with patch("resource_search.search_telegram_resources", side_effect=batches) as archive, \
+                self.search([]) as index, patch.object(self.account, "get_stoken", return_value=TOKEN) as token, \
+                patch.object(self.account, "get_detail", return_value=FILES):
+            result = self.account.find_valid_resource(self.task, {"source": {"telegram_web": {"enable": True}}})
+        self.assertTrue(result["success"])
+        self.assertEqual(archive.call_count, 5)
+        token.assert_called_once()
+        index.assert_not_called()
+
+    def test_archive_last_batch_fits_remaining_verification_allowance(self):
+        rows = [dict(self.candidate(f"archive{i:02d}"), source_type="telegram_web") for i in range(24)]
+        batches = [{"success": True, "data": rows[start:start + 6], "partial": True} for start in range(0, 18, 6)]
+        batches.append({"success": True, "data": rows[18:23] + [dict(self.candidate("ignored01", "其他作品"), source_type="telegram_web")], "partial": True})
+        batches.append({"success": True, "data": rows[23:], "partial": False})
+        with patch("resource_search.search_telegram_resources", side_effect=batches) as archive, \
+                self.search([]), patch.object(self.account, "get_stoken", side_effect=[EXPIRED] * 23 + [TOKEN]) as token, \
+                patch.object(self.account, "get_detail", return_value=FILES):
+            result = self.account.find_valid_resource(self.task, {"source": {"telegram_web": {"enable": True}}})
+        self.assertTrue(result["success"])
+        self.assertEqual(archive.call_args.kwargs["limit"], 1)
+        self.assertEqual(token.call_count, 24)
+
+    def test_archive_verification_limit_does_not_fetch_and_drop_another_batch(self):
+        rows = [dict(self.candidate(f"archive{i:02d}"), source_type="telegram_web") for i in range(24)]
+        batches = [{"success": True, "data": rows[start:start + 6], "partial": True} for start in range(0, 24, 6)]
+        with patch("resource_search.search_telegram_resources", side_effect=batches) as archive, \
+                self.search([]), patch.object(self.account, "get_stoken", return_value=EXPIRED) as token:
+            result = self.account.find_valid_resource(self.task, {"source": {"telegram_web": {"enable": True}}})
+        self.assertFalse(result["success"])
+        self.assertEqual(archive.call_count, 4)
+        self.assertEqual(token.call_count, 24)
 
     def test_web_fallback_retries_arabic_season_with_chinese_numeral(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")

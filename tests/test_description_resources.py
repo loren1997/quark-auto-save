@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import requests
 import quark_auto_save as qas
+from resource_search import search_error_reason
 
 
 def listing(*files, **extra):
@@ -42,8 +43,19 @@ class DescriptionResourceTests(unittest.TestCase):
         for row in (self.row, {"taskname": "网站资源", "content": "名称：一念永恒 第4季"},
                     {"content": "简介\n#国漫 #一念永恒"}, {"taskname": "A Will Eternal (2026)"}):
             self.assertTrue(qas.resource_description_matches(self.task, row, ["A Will Eternal"]))
-        for row in ({"taskname": "一念永恒幕后"}, {"content": "其他作品 第4季"}, {"content": ""}):
+        for row in ({"taskname": "念永恒"}, {"content": "其他作品 第4季"}, {"content": ""}):
             self.assertFalse(qas.resource_description_matches(self.task, row, []))
+
+    def test_description_contains_title_with_number_promotion_and_hidden_spacing(self):
+        for content in ("🔥一念永恒4（2026）国漫·更20集·4K臻彩MAX",
+                        "资源推荐：一念永恒全集持续更新，点击获取资源",
+                        "【一念\u200b永恒】夸克网盘", "今天分享《一念永恆》第四季"):
+            with self.subTest(content=content):
+                self.assertTrue(qas.resource_description_matches(self.task, {"content": content}, []))
+
+    def test_disabled_fallback_sources_are_not_reported_as_transport_failure(self):
+        self.assertEqual(search_error_reason("没有启用的搜索源，请启用 PanSou、网页搜索或配置 CloudSaver"), "未启用其他索引来源")
+        self.assertEqual(search_error_reason("未启用其他索引来源"), "未启用其他索引来源")
 
     def test_obfuscated_nested_title_uses_innermost_video_folder(self):
         first, leaf = "a" * 32, "b" * 32
