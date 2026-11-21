@@ -96,12 +96,24 @@ jobs:
           tags: ${{ steps.web-meta.outputs.tags }}
           build-args: |
             BUILD_SHA=${{ github.sha }}
-      - name: Verify browser on both architectures
+  browser-smoke:
+    needs: publish
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            architecture: x86_64
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Verify browser on native architecture
         env:
           IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          EXPECTED_ARCH: ${{ matrix.architecture }}
         run: |
-          for platform in linux/amd64 linux/arm64; do
-            docker run --rm --init --platform "$platform" --shm-size=128m --memory=768m --cpus=1 \
-              "$IMAGE_REPOSITORY:telegram-web-sha-${GITHUB_SHA:0:7}" \
-              python -m telegram_web.smoke
-          done
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          docker run --rm --init --shm-size=128m --memory=768m --cpus=1 \
+            "$IMAGE_REPOSITORY:telegram-web-sha-${GITHUB_SHA:0:7}" \
+            python -m telegram_web.smoke

@@ -371,16 +371,10 @@
               </div>
             </div>
             <div class="form-group row ml-3">
-              <label class="col-sm-2 col-form-label">搜索频道</label>
-              <div class="col-sm-10">
-                <input v-model="formData.source.pansou.channels" class="form-control" placeholder="可选，频道 ID 用逗号分隔；留空使用服务器配置的全部频道">
-              </div>
-            </div>
-            <div class="form-group row ml-3">
               <label class="col-sm-2 col-form-label">搜索插件</label>
               <div class="col-sm-10">
                 <input v-model="formData.source.pansou.plugins" class="form-control" placeholder="可选，插件名用逗号分隔；留空使用服务器启用的插件">
-                <small class="text-muted">频道、网站索引和 CloudSaver 的结果会合并，并自动提取文本中的夸克分享链接。插件需先在 PanSou 服务中启用；部署环境还可通过 PANSOU_FALLBACK_SERVERS 补充聚合源。</small>
+                <small class="text-muted">网站索引和 CloudSaver 的结果会合并，并自动提取文本中的夸克分享链接。PanSou 仅查询插件，Telegram 使用下方归档搜索。插件需先在 PanSou 服务中启用；部署环境还可通过 PANSOU_FALLBACK_SERVERS 补充聚合源。</small>
               </div>
             </div>
             <div class="form-group row ml-3">
