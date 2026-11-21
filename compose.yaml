@@ -14,11 +14,13 @@ services:
       WEBUI_PASSWORD: ${WEBUI_PASSWORD:?请在 .env 中设置管理密码}
       PANSOU_SERVER: http://pansou:8888
       PANSOU_FALLBACK_SERVERS: https://so.252035.xyz
+      TELEGRAM_WEB_URL: http://telegram-web:8765
       HTTP_PROXY: ${QAS_PROXY:-}
       HTTPS_PROXY: ${QAS_PROXY:-}
-      NO_PROXY: localhost,127.0.0.1,pansou,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      NO_PROXY: localhost,127.0.0.1,pansou,telegram-web,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
     depends_on:
       - pansou
+      - telegram-web
     logging:
       driver: json-file
       options:
@@ -34,11 +36,33 @@ services:
       HTTPS_PROXY: ${QAS_PROXY:-}
       NO_PROXY: localhost,127.0.0.1,pansou,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
       ENABLED_PLUGINS: labi,zhizhen,shandian,duoduo,muou,quark4k,quarkres
-      CHANNELS: tgsearchers7,Quark_Movies,guoman4K,leoziyuan,kuakedongman
     volumes:
       - pansou-data:/app/data
       - pansou-logs:/app/logs
 
+  telegram-web:
+    build:
+      context: .
+      dockerfile: telegram_web/Dockerfile
+    image: quark-auto-save:telegram-web-local
+    restart: unless-stopped
+    init: true
+    shm_size: 128m
+    mem_limit: 768m
+    cpus: 1.0
+    environment:
+      TZ: Asia/Shanghai
+      TELEGRAM_WEB_PROXY: ${QAS_PROXY:-}
+    volumes:
+      - ./config:/app/config:ro
+      - telegram-web-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
 volumes:
   pansou-data:
   pansou-logs:
+  telegram-web-data:

@@ -1,20 +1,15 @@
-"""Discover and recheck bounded public Telegram channels from local source choices."""
+"""Retain legacy channel state; Telegram now reads archived chats only."""
 
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
-from itertools import zip_longest
 import json
-import hashlib
 import logging
 import re
 import sqlite3
 import time
 from urllib.parse import urlsplit
 
-from .channel_search import DEFAULT_TELEGRAM_CHANNELS, channel_results
 from .common import SearchError
 from .source_health import SourceHealth
-from .websearch import WebSearch
 
 
 DIRECTORY_URL = "https://api.github.com/repos/fish2018/pansou/issues/4"
@@ -158,40 +153,14 @@ class ChannelRegistry:
                 result["origins"] = [{"kind": row[0] if row[0] in {"directory", "account"} else "folder",
                                       "last_checked": row[1], "next_check": row[2], "reason": row[3]}
                                      for row in db.execute("SELECT origin, last_checked, next_check, reason FROM channel_origins ORDER BY origin")]
-                generation = ""
-                if db.execute("SELECT 1 FROM channel_joins LIMIT 1").fetchone():
-                    from .telegram_account import TelegramAccount
-                    generation = TelegramAccount(self.path).authorization_generation()
-                joins = db.execute("SELECT status, reason, next_check, joined_at FROM channel_joins "
-                                   "WHERE generation=?", (generation,)).fetchall() if generation else []
-                pending = [row for row in joins if row[0] != "joined"]
-                result["joins"] = {"joined_count": sum(row[0] == "joined" for row in joins),
-                                   "recent_join_count": sum(row[3] > max(0, time.time() - 86400) for row in joins),
-                                   "pending_count": len(pending),
-                                   "next_check": min((row[2] for row in pending), default=0),
-                                   "reason": next((row[1] for row in pending if row[1]), "")}
         except (sqlite3.Error, OSError) as error:
             logging.warning("频道状态读取失败 (%s)", type(error).__name__)
             result["discovery_reason"] = "频道状态读取失败"
         return result
 
     def active_channels(self, configured=None, check_health=True):
-        if not self.path:
-            return []
-        if isinstance(configured, str):
-            configured = re.split(r"[,，\s]+", configured)
-        existing = {name.lstrip("@").casefold() for name in (configured or []) if isinstance(name, str)}
-        if check_health:
-            try:
-                self.health.check("https://t.me/")
-            except SearchError:
-                return []
-        names = [row["name"] for row in self.status()["channels"]
-                 if row["status"] in ("active", "standby") and row["name"].casefold() not in existing]
-        if len(names) > 6:
-            offset = int(time.time() // 300) % len(names)
-            names = names[offset:] + names[:offset]
-        return names[:6]
+        """Public channel discovery is retired; archived chats use their own source."""
+        return []
 
     def available_channels(self, names):
         if not self.path:
@@ -232,13 +201,7 @@ class ChannelRegistry:
 
     @staticmethod
     def _probe(client, name, deadline):
-        started = time.time()
-        body, final = client._fetch("https://t.me/s/" + name, deadline)
-        if final.rstrip("/").casefold() != ("https://t.me/s/" + name).casefold():
-            raise SearchError("频道重定向地址不符合访问规则")
-        rows = channel_results("Telegram @" + name, body, final, "quark")
-        ChannelRegistry._validate_media(rows)
-        return started
+        raise SearchError("Telegram 仅支持读取已归档对话")
 
     @staticmethod
     def _validate_media(rows):
@@ -255,230 +218,17 @@ class ChannelRegistry:
         raise SearchError("未发现影视夸克链接")
 
     def _refresh_origins(self, client, folders, account, deadline, now, configured):
-        origins = {"directory": DIRECTORY_URL}
-        if account is not None:
-            origins["account"] = ""
-        origins.update({"folder:" + hashlib.sha256(url.encode()).hexdigest(): url for url in (folders or [])})
-        with self._connect() as db:
-            if account is None:
-                db.execute("DELETE FROM channel_origins WHERE origin='account'")
-            if folders is not None:
-                db.execute("DELETE FROM channel_origins WHERE origin NOT IN (" + ",".join("?" for _ in origins) + ")", list(origins))
-            db.executemany("INSERT OR IGNORE INTO channel_origins VALUES (?, '[]', 0, 0, '')", [(key,) for key in origins])
-            due = [row[0] for row in db.execute("SELECT origin FROM channel_origins WHERE next_check<=? ORDER BY origin", (now,))
-                   if row[0] in origins]
-        for origin in due:
-            if time.monotonic() >= deadline:
-                break
-            names, reason, retry = None, "", 86400
-            try:
-                if origin == "directory":
-                    body, final = client._fetch(DIRECTORY_URL, deadline, allow_json=True)
-                    if final != DIRECTORY_URL:
-                        raise SearchError("频道目录重定向地址不符合访问规则")
-                    names = self._directory(body)[:40]
-                elif account is None:
-                    reason, retry = "未启用 Telegram 账号", 300
-                else:
-                    if origin == "account":
-                        result = account.discover_channels(
-                            seeds=self.active_channels(check_health=False), cursor=int(now // 86400), deadline=deadline)
-                    else:
-                        result = account.read_folder(origins[origin], deadline=deadline)
-                    if result.get("ok"):
-                        names = [item.get("name") for item in result.get("channels", [])
-                                 if isinstance(item, dict) and _valid_name(item.get("name"))][:40]
-                    else:
-                        reason = _reason(result.get("error") or "Telegram 账号查询失败")
-                        retry = max(300, min(int(result.get("retry_after") or 0), 7 * 86400))
-            except (SearchError, ValueError, TypeError) as error:
-                reason = _reason(error)
-                if origin != "directory":
-                    retry = 300
-            with self._connect() as db:
-                if names is not None:
-                    if origin == "account":
-                        previous = json.loads(db.execute("SELECT names FROM channel_origins WHERE origin=?", (origin,)).fetchone()[0])
-                        active = {row[0].casefold() for row in db.execute("SELECT name FROM discovered_channels WHERE status='active' LIMIT 6")}
-                        # 保留已验证种子，同时让新发现先进入有限候选池。
-                        names = [name for name in previous if name.casefold() in active] + names + previous
-                    unique = {name.casefold(): name for name in names}
-                    db.execute("UPDATE channel_origins SET names=? WHERE origin=?", (json.dumps(list(unique.values())[:40]), origin))
-                db.execute("UPDATE channel_origins SET last_checked=?, next_check=?, reason=? WHERE origin=?",
-                           (now, now + retry, reason, origin))
-        with self._connect() as db:
-            entries = db.execute("SELECT origin, names, last_checked, next_check, reason FROM channel_origins "
-                                 "ORDER BY CASE WHEN origin='directory' THEN 1 ELSE 0 END, origin").fetchall()
-            pool, groups = {}, []
-            for _origin, encoded, *_state in entries:
-                names = json.loads(encoded)
-                names = [name for name in names if _valid_name(name)] if isinstance(names, list) else []
-                groups.append(names)
-                for name in names:
-                    pool.setdefault(name.casefold(), name)
-            known = [row[0] for row in db.execute("SELECT name FROM discovered_channels WHERE status='active' LIMIT 6")
-                     if row[0].casefold() in pool]
-            manual = [row[0] for row in db.execute("SELECT name FROM discovered_channels") if row[0].casefold() in configured]
-            ordered = {}
-            # 各来源轮流给候选名额，旧备用池不能占满容量而饿死新文件夹。
-            interleaved = [name for row in zip_longest(*groups) for name in row if name is not None]
-            for name in manual + known + interleaved:
-                ordered.setdefault(name.casefold(), name)
-            names = list(ordered.values())[:MAX_CHANNELS]
-            if names:
-                db.execute("DELETE FROM discovered_channels WHERE name NOT IN (" + ",".join("?" for _ in names) + ")", names)
-                db.executemany("INSERT OR IGNORE INTO discovered_channels VALUES (?, 'pending', '', 0, 0)", [(name,) for name in names])
-            else:
-                db.execute("DELETE FROM discovered_channels")
-            db.execute("UPDATE channel_discovery SET last_checked=?, next_check=?, reason=? WHERE id=1",
-                       (max(row[2] for row in entries), min(row[3] for row in entries),
-                        next((row[4] for row in entries if row[4]), "")))
+        """Keep old origin records without importing or discovering external chats."""
+        return None
 
     @staticmethod
     def _probe_account(account, name, deadline):
-        started = time.time()
-        result = account.search("pan.quark.cn", [name], limit=5, deadline=deadline)
-        for item in result.get("unavailable_channels") or []:
-            if item.get("name", "").casefold() == name.casefold():
-                error = SearchError("频道不可访问")
-                error.retry_after = item.get("retry_after")
-                raise error
-        if not result.get("ok"):
-            raise SearchError(result.get("error") or "Telegram 账号查询失败")
-        if not result.get("candidates") and result.get("errors"):
-            raise SearchError(result["errors"][0].get("error") or "Telegram 账号查询失败")
-        ChannelRegistry._validate_media(result.get("candidates") or [])
-        return started
+        raise SearchError("Telegram 仅支持读取已归档对话")
 
     def _join_verified(self, account, deadline, now):
-        if time.monotonic() >= deadline:
-            return
-        generation = account.authorization_generation()
-        if not isinstance(generation, str) or not generation:
-            return
-        with self._connect() as db:
-            db.commit()  # 表初始化事务先提交，再原子预留本轮加入名额。
-            db.execute("BEGIN IMMEDIATE")
-            recent = db.execute("SELECT COUNT(*) FROM channel_joins WHERE generation=? AND (joined_at>? "
-                                "OR (status='joining' AND next_check>?))", (generation, max(0, now - 86400), now)).fetchone()[0]
-            if recent >= 6:
-                return
-            discovered = {name.casefold() for (encoded,) in db.execute("SELECT names FROM channel_origins")
-                          for name in json.loads(encoded) if _valid_name(name)}
-            rows = db.execute("SELECT c.name, j.status FROM discovered_channels c LEFT JOIN channel_joins j "
-                              "ON j.name=c.name AND j.generation=? "
-                              "WHERE c.status IN ('active','standby') AND c.next_check>? "
-                              "AND (j.name IS NULL OR (j.status<>'joined' AND j.next_check<=?)) "
-                              "ORDER BY CASE WHEN j.status='joining' THEN 0 ELSE 1 END, "
-                              "COALESCE(j.last_checked,0), c.last_checked DESC", (generation, now, now)).fetchall()
-            selected = next((row for row in rows if row[0].casefold() in discovered), None)
-            if selected is None:
-                return
-            name, previous_state = selected
-            db.execute("INSERT OR REPLACE INTO channel_joins VALUES (?, ?, 'joining', '', ?, ?, 0)",
-                       (generation, name, now, now + 300))
-        # 公开消息验证与实际加入各自独立；加入失败不能停用搜索来源。
-        result = account.join_channel(name, deadline=deadline, expected_generation=generation)
-        joined = bool(result.get("ok") and (result.get("joined") or result.get("already_member")))
-        reason = "" if joined else _reason(result.get("error") or "Telegram 账号查询失败")
-        if result.get("code") in {"CHANNEL_APPROVAL_REQUIRED", "CHANNEL_PAID"}:
-            reason = "频道需要审核或付费，未自动加入"
-        elif result.get("code") == "ACCOUNT_CHANGED":
-            reason = "Telegram 账号已切换，等待下轮巡检"
-        retry = max(300, min(int(result.get("retry_after") or 0), 7 * 86400))
-        if result.get("code") in {"CHANNEL_UNAVAILABLE", "CHANNEL_RESTRICTED", "CHANNEL_APPROVAL_REQUIRED", "CHANNEL_PAID"}:
-            retry = max(retry, 86400)
-        with self._connect() as db:
-            db.execute("UPDATE channel_joins SET status=?, reason=?, next_check=?, joined_at=? "
-                       "WHERE generation=? AND name=?",
-                       ("joined" if joined else "joining" if result.get("code") in {"TIMEOUT", "NETWORK_ERROR"} else "cooldown",
-                        reason, 0 if joined else now + retry,
-                        now if joined and (not result.get("already_member") or previous_state == "joining") else 0,
-                        generation, name))
+        """Legacy compatibility: channel membership is managed by the user only."""
+        return None
 
     def maintain(self, config):
-        sources = config.get("source") or {} if isinstance(config, dict) else {}
-        channels = (sources.get("channelsearch") or {}) if isinstance(sources, dict) else {}
-        if (not self.path or not isinstance(channels, dict)
-                or str(channels.get("enable", True)).lower() != "true"):
-            return self.status()
-        discover_enabled = str(channels.get("auto_discover", True)).lower() == "true"
-        telegram = sources.get("telegram") or {}
-        join_enabled = (str(telegram.get("enable", False)).lower() == "true"
-                        and str(telegram.get("auto_join", False)).lower() == "true")
-        configured = channels.get("telegram_channels", DEFAULT_TELEGRAM_CHANNELS)
-        if isinstance(configured, str):
-            configured = re.split(r"[,，\s]+", configured)
-        configured = {name.lstrip("@").casefold() for name in configured if isinstance(name, str)} if isinstance(configured, list) else set()
-        if not discover_enabled and not join_enabled and not any(row["name"].casefold() in configured and row["status"] == "cooldown"
-                                           and row["reason"] == "频道不可访问" and row["next_check"] <= time.time()
-                                           for row in self.status()["channels"]):
-            return self.status()
-        try:
-            folders = folder_urls(channels.get("telegram_folders", []))
-        except SearchError:
-            logging.warning("Telegram 文件夹配置无效，保留已有候选并跳过目录变更")
-            folders = None
-        account = None
-        if str((sources.get("telegram") or {}).get("enable", False)).lower() == "true":
-            from .telegram_account import TelegramAccount
-            account = TelegramAccount(self.path)
-        account_probe = account if account is not None and account.status().get("authorized") else None
-        now, deadline = time.time(), time.monotonic() + 30
-        lease = now + 60
-        client = None
-        claimed = False
-        try:
-            with self._connect() as db:
-                claimed = bool(db.execute("UPDATE channel_discovery SET lease=? WHERE id=1 AND lease<=?", (lease, now)).rowcount)
-            if not claimed:
-                return self.status()
-            client = WebSearch(health_path=self.path)
-            if discover_enabled:
-                self._refresh_origins(client, folders, account, deadline, now, configured)
-            with self._connect() as db:
-                active = db.execute("SELECT COUNT(*) FROM discovered_channels WHERE status='active'").fetchone()[0]
-                ready = db.execute("SELECT name FROM discovered_channels WHERE status='standby' AND next_check>? ORDER BY last_checked DESC LIMIT ?",
-                                   (now, max(0, 6 - active))).fetchall()
-                db.executemany("UPDATE discovered_channels SET status='active' WHERE name=?", ready)
-                active += len(ready)
-                rows = db.execute("SELECT name, status, reason FROM discovered_channels WHERE next_check<=? "
-                                  "ORDER BY last_checked, rowid", (now,)).fetchall()
-                eligible = [row for row in rows if _valid_name(row[0]) and (
-                    (discover_enabled and row[0].casefold() not in configured)
-                    or (row[0].casefold() in configured and row[1] == "cooldown" and row[2] == "频道不可访问"))]
-                pending = [row[0] for row in eligible if row[1] == "pending"]
-                retry = [row[0] for row in eligible if row[1] != "pending"]
-                names = (pending[:1] + retry[:2] + pending[1:])[:3]
-            if time.monotonic() < deadline:
-                with ThreadPoolExecutor(max_workers=1 if account_probe else 2) as executor:
-                    jobs = [(name, executor.submit(self._probe_account, account_probe, name, deadline) if account_probe
-                             else executor.submit(self._probe, client, name, deadline)) for name in names]
-                    for name, future in jobs:
-                        try:
-                            started = future.result()
-                            checked = time.time()
-                            with self._connect() as db:
-                                active = db.execute("SELECT COUNT(*) FROM discovered_channels WHERE status='active' AND name<>?", (name,)).fetchone()[0]
-                                state = "active" if active < 6 else "standby"
-                                restored = db.execute("UPDATE discovered_channels SET status=?, reason='', last_checked=?, next_check=? "
-                                                      "WHERE name=? AND last_checked<=?", (state, checked, checked + 3600, name, started)).rowcount
-                            if restored and account_probe is None:
-                                self.health.clear("https://t.me/s/" + name, checked_after=started)
-                        except (SearchError, ValueError, TypeError) as error:
-                            self.record_failure(name, error, check_health=account_probe is None,
-                                                retry_after=getattr(error, "retry_after", None))
-            if join_enabled and account_probe is not None:
-                self._join_verified(account_probe, deadline, time.time())
-        except (sqlite3.Error, OSError) as error:
-            logging.warning("频道自动维护失败 (%s)", type(error).__name__)
-        finally:
-            if client:
-                client.session.close()
-            if claimed:
-                try:
-                    with self._connect() as db:
-                        db.execute("UPDATE channel_discovery SET lease=0 WHERE id=1 AND lease=?", (lease,))
-                except (sqlite3.Error, OSError):
-                    logging.warning("频道维护租约释放失败，下轮将按到期时间重试")
+        """Retain historical state without network requests or membership changes."""
         return self.status()

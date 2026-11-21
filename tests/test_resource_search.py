@@ -55,7 +55,8 @@ class SearchAdapterTests(unittest.TestCase):
         self.assertEqual([item["shareurl"] for item in result], [URL + "?pwd=ab12", "https://pan.quark.cn/s/def456?pwd=cd34"])
         self.assertEqual(result[0]["channel"], "tg:anime")
         params = client.session.post.call_args.kwargs["json"]
-        self.assertEqual((params["src"], params["res"], params["channels"], params["plugins"]), ("all", "all", ["anime"], ["labi"]))
+        self.assertEqual((params["src"], params["res"], params["plugins"]), ("plugin", "all", ["labi"]))
+        self.assertNotIn("channels", params)
 
     def test_raw_links_keep_per_work_title(self):
         client = self.pansou({"results": [{"title": "本周作品合集", "links": [{"type": "quark", "url": URL, "password": "ab12", "work_title": "作品第二季"}]}]})

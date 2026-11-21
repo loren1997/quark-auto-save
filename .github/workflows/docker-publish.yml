@@ -80,3 +80,28 @@ jobs:
             docker rm -f "$smoke_container"
             smoke_container=
           done
+      - uses: docker/metadata-action@v5
+        id: web-meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=telegram-web-sha-
+      - name: Build Telegram Web browser service
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: telegram_web/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.web-meta.outputs.tags }}
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+      - name: Verify browser on both architectures
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --init --platform "$platform" --shm-size=128m --memory=768m --cpus=1 \
+              "$IMAGE_REPOSITORY:telegram-web-sha-${GITHUB_SHA:0:7}" \
+              python -m telegram_web.smoke
+          done

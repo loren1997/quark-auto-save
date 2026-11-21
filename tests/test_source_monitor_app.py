@@ -126,19 +126,18 @@ class SourceMonitorAppTests(unittest.TestCase):
         self.maintain.assert_not_called()
         self.run_manager.assert_not_called()
 
-    def test_status_join_summary_is_sanitized_and_preserves_zero_defaults(self):
+    def test_status_does_not_expose_retired_join_summary(self):
         registry = self.patch("ChannelRegistry")
         summary = {"joined_count": 4, "recent_join_count": 2, "pending_count": 3, "next_check": 123, "reason": "等待下次执行"}
         registry.return_value.status.return_value = {
             "channels": [], "joins": {**summary, "authorization_generation": "private-generation",
                                      "url": "private-url", "phone": "private-phone", "session": "private-session"}}
         response = self.client.get("/source_status")
-        self.assertEqual(response.json["data"]["registry"]["joins"], summary)
+        self.assertNotIn("joins", response.json["data"]["registry"])
         self.assertNotIn("private-", response.get_data(as_text=True))
         registry.return_value.status.return_value["joins"] = {
             "joined_count": True, "recent_join_count": -1, "pending_count": "3", "next_check": float("nan"), "reason": []}
-        self.assertEqual(self.client.get("/source_status").json["data"]["registry"]["joins"],
-                         {"joined_count": 0, "recent_join_count": 0, "pending_count": 0, "next_check": 0, "reason": ""})
+        self.assertNotIn("joins", self.client.get("/source_status").json["data"]["registry"])
         self.maintain.assert_not_called()
 
     def test_status_config_error_does_not_leak_credentials(self):

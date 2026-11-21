@@ -28,13 +28,6 @@ import os
 import re
 import threading
 import uuid
-from math import isfinite
-from urllib.parse import urlsplit
-try:
-    import qrcode
-    from qrcode.image.svg import SvgPathFillImage
-except ImportError:
-    qrcode = SvgPathFillImage = None
 
 from run_manager import RunManager, validate_payload
 
@@ -46,10 +39,7 @@ from resource_search import search_resources
 from app.sdk.source_monitor import maintain_sources
 from app.sdk.channel_registry import ChannelRegistry
 from app.sdk.source_health import SourceHealth
-try:
-    from app.sdk.telegram_account import TelegramAccount
-except ImportError:
-    TelegramAccount = None
+from app.sdk.telegram_web import TelegramWeb
 
 print(
     r"""
@@ -114,7 +104,6 @@ scheduler = BackgroundScheduler()
 SOURCE_MONITOR_JOB = "source-monitor"
 run_managers = {}
 run_manager_lock = threading.Lock()
-telegram_account_lock = threading.Lock()
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="[%(asctime)s][%(levelname)s] %(message)s",
@@ -181,15 +170,6 @@ def source_status():
                 key: row.get(key) for key in ("kind", "last_checked", "next_check", "reason")})
             if len(data["registry"]["origins"]) == 5:
                 break
-        joins = registry.get("joins")
-        joins = joins if isinstance(joins, dict) else {}
-        data["registry"]["joins"] = {
-            key: joins[key] if type(joins.get(key)) is int and joins[key] >= 0 else 0
-            for key in ("joined_count", "recent_join_count", "pending_count")}
-        next_check = joins.get("next_check")
-        data["registry"]["joins"]["next_check"] = (
-            next_check if type(next_check) in (int, float) and isfinite(next_check) and next_check >= 0 else 0)
-        data["registry"]["joins"]["reason"] = joins.get("reason", "") if isinstance(joins.get("reason", ""), str) else ""
         return jsonify({"success": True, "data": data})
     except (OSError, ValueError, TypeError):
         logging.warning("无法读取渠道巡检状态")
@@ -205,7 +185,7 @@ def telegram_response_headers(response):
     return response
 
 
-def telegram_payload(action):
+def telegram_web_payload(action):
     origin = request.headers.get("Origin")
     if request.headers.get("Sec-Fetch-Site") == "cross-site" or (
             origin is not None and origin != request.host_url.rstrip("/")):
@@ -222,144 +202,110 @@ def telegram_payload(action):
     except (ValueError, UnicodeError):
         payload = None
     valid = isinstance(payload, dict)
-    if valid and action in ("code", "qr"):
-        allowed = {"api_id", "api_hash", "proxy"} | ({"phone"} if action == "code" else set())
-        valid = set(payload) <= allowed
-        if action == "code" or "api_id" in payload or "api_hash" in payload:
-            valid = (valid and type(payload.get("api_id")) is int and 0 < payload["api_id"] <= 2147483647
-                     and isinstance(payload.get("api_hash"), str)
-                     and re.fullmatch(r"[0-9a-fA-F]{32}", payload["api_hash"]) is not None)
-        if action == "code":
-            valid = (valid and isinstance(payload.get("phone"), str)
-                     and re.fullmatch(r"\+[1-9][0-9]{6,14}", payload["phone"]) is not None)
-        proxy = payload.get("proxy")
-        if valid and proxy not in (None, ""):
-            try:
-                parsed = urlsplit(proxy) if isinstance(proxy, str) and len(proxy) <= 2048 else None
-                valid = bool(parsed and parsed.scheme in ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
-                             and parsed.hostname and parsed.path in ("", "/") and not parsed.query and not parsed.fragment
-                             and (parsed.port is None or 0 < parsed.port <= 65535)
-                             and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in proxy))
-            except ValueError:
-                valid = False
-        if valid and proxy == "":
-            payload["proxy"] = None
-    elif valid and action == "signin":
-        valid = (set(payload) == {"code"} and isinstance(payload["code"], str)
-                 and re.fullmatch(r"[0-9]{5,8}", payload["code"]) is not None) or (
-                     set(payload) == {"password"} and isinstance(payload["password"], str)
-                     and 1 <= len(payload["password"]) <= 1024)
-    elif valid and action == "logout":
+    if valid and action in ("start", "logout"):
         valid = not payload
-    elif valid and action == "qr_poll":
-        valid = (set(payload) == {"id"} and isinstance(payload["id"], str)
-                 and re.fullmatch(r"[A-Za-z0-9_-]{16,128}", payload["id"]) is not None)
+    elif valid and action in ("poll", "password"):
+        valid = (set(payload) == ({"id", "password"} if action == "password" else {"id"})
+                 and isinstance(payload.get("id"), str)
+                 and re.fullmatch(r"[a-f0-9]{32}", payload["id"]) is not None)
+        if action == "password":
+            valid = valid and isinstance(payload.get("password"), str) and 1 <= len(payload["password"]) <= 1024
     if not valid:
         return None, (jsonify(success=False, message="账户参数格式错误，请检查必填项、类型和长度"), 400)
     return payload, None
 
 
-def telegram_qr_image(result):
-    url, identifier, expires = result.get("qr_url"), result.get("qr_id"), result.get("expires_at", 0)
-    if not url and not identifier:
-        return None
-    if (not isinstance(identifier, str) or re.fullmatch(r"[A-Za-z0-9_-]{16,128}", identifier) is None
-            or type(expires) not in (int, float) or not isfinite(expires) or expires < 0):
-        raise ValueError("Invalid Telegram QR response")
-    if url in (None, "") and expires == 0:
-        return {"id": identifier, "image": "", "expires_at": 0}
-    if (not isinstance(url, str) or re.fullmatch(r"tg://login\?token=[A-Za-z0-9_-]{8,512}={0,2}", url) is None
-            or expires == 0):
-        raise ValueError("Invalid Telegram QR response")
-    image = qrcode.make(url, image_factory=SvgPathFillImage, box_size=8, border=4).to_string()
-    return {"id": identifier, "image": "data:image/svg+xml;base64," + base64.b64encode(image).decode("ascii"),
-            "expires_at": expires}
-
-
-def telegram_api(action):
+def telegram_web_api(action):
     global config_data
     if not is_login():
         return jsonify(success=False, message="未登录"), 401
     payload = {}
     if action != "status":
-        payload, error = telegram_payload(action)
+        payload, error = telegram_web_payload(action)
         if error:
             return error
     try:
-        if TelegramAccount is None:
+        result = getattr(TelegramWeb(Config.search_health_path(CONFIG_PATH)), action)(**payload)
+        state = result.get("data") or {}
+        data = {key: state.get(key) for key in (
+            "available", "authorized", "state", "reason", "retry_after", "archived_count")}
+        data["scope"] = "archived"
+        if state.get("scope") != "archived":
+            raise ValueError("Invalid Telegram Web scope")
+        enabled = True if action in ("start", "poll", "password") and result.get("success") is True and data["authorized"] is True else (
+            False if action == "logout" and result.get("success") is True and data["authorized"] is False else None)
+        previous_revision = revision = None
+        with Config.locked(CONFIG_PATH):
             current = Config.read_json(CONFIG_PATH)
-            enabled = str(current.get("source", {}).get("telegram", {}).get("enable", False)).lower() == "true"
-            return jsonify(success=False, message="当前安装未提供 Telegram 账户组件",
-                           data={"available": False, "authorized": False, "state": "unavailable",
-                                 "reason": "当前安装未提供 Telegram 账户组件", "retry_after": 0,
-                                 "credentials_saved": False, "enabled": enabled}), 503
-        if action in ("qr", "qr_poll") and qrcode is None:
-            return jsonify(success=False, message="当前安装未提供本地二维码组件，请更新镜像或使用验证码登录"), 503
-        with telegram_account_lock:
-            account = TelegramAccount(Config.search_health_path(CONFIG_PATH))
-            methods = {"status": "status", "code": "request_code", "signin": "sign_in", "logout": "logout",
-                       "qr": "request_qr", "qr_poll": "poll_qr"}
-            if action == "qr_poll":
-                payload = {"qr_id": payload["id"]}
-            result = getattr(account, methods[action])(**payload)
-            data = {key: result.get(key) for key in ("available", "authorized", "state", "reason", "retry_after")}
-            data["credentials_saved"] = result.get("credentials_saved") is True
-            revision = previous_revision = None
-            enable = True if action in ("signin", "qr", "qr_poll") and result.get("ok", True) and result.get("authorized") is True else (
-                False if action == "logout" and result.get("authorized") is False
-                and (result.get("ok") is True or result.get("state") == "disconnected") else None)
-            with Config.locked(CONFIG_PATH):
-                current = Config.read_json(CONFIG_PATH)
-                if enable is not None:
-                    previous_revision = config_revision(current)
-                    current.setdefault("source", {}).setdefault("telegram", {})["enable"] = enable
-                    Config.write_json(CONFIG_PATH, current)
-                    config_data = current
-                    revision = config_revision(current)
-                data["enabled"] = str(current.get("source", {}).get("telegram", {}).get("enable", False)).lower() == "true"
-            response = {"success": bool(result.get("ok", True)), "data": data}
-            if revision is not None:
-                response["config_revision"] = revision
-                response["previous_config_revision"] = previous_revision
-            if action in ("qr", "qr_poll"):
-                qr = telegram_qr_image(result)
-                if qr is not None:
-                    response["qr"] = qr
-            return jsonify(response)
+            if enabled is not None:
+                previous_revision = config_revision(current)
+                current.setdefault("source", {}).setdefault("telegram_web", {})["enable"] = enabled
+                Config.write_json(CONFIG_PATH, current)
+                config_data = current
+                revision = config_revision(current)
+            data["enabled"] = str(current.get("source", {}).get("telegram_web", {}).get("enable", False)).lower() == "true"
+        response = {"success": result.get("success") is True, "data": data}
+        if revision is not None:
+            response.update(config_revision=revision, previous_config_revision=previous_revision)
+        attempt = result.get("attempt_id")
+        if action != "status" and isinstance(attempt, str) and re.fullmatch(r"[a-f0-9]{32}", attempt):
+            response["attempt_id"] = attempt
+        qr = result.get("qr")
+        if action in ("start", "poll") and isinstance(qr, dict):
+            identifier, picture = qr.get("id"), qr.get("image")
+            if (isinstance(identifier, str) and re.fullmatch(r"[a-f0-9]{32}", identifier)
+                    and isinstance(picture, str) and len(picture) <= 2 * 1024 * 1024
+                    and (picture == "" or re.fullmatch(r"data:image/png;base64,[A-Za-z0-9+/]+={0,2}", picture))):
+                response["qr"] = {"id": identifier, "image": picture}
+        return jsonify(response)
     except Exception:
-        # SDK/网络异常可能携带手机号、代理密码或会话资料，禁止回显原始异常。
-        logging.warning("Telegram 账户操作暂未完成")
-        return jsonify(success=False, message="Telegram 账户操作暂未完成，请稍后重试"), 503
+        logging.warning("Telegram Web 账户操作暂未完成")
+        return jsonify(success=False, message="Telegram Web 账户操作暂未完成，请稍后重试"), 503
+
+
+@app.route("/api/telegram/web/status")
+def telegram_web_status():
+    return telegram_web_api("status")
+
+
+@app.route("/api/telegram/web/start", methods=["POST"])
+def telegram_web_start():
+    return telegram_web_api("start")
+
+
+@app.route("/api/telegram/web/poll", methods=["POST"])
+def telegram_web_poll():
+    return telegram_web_api("poll")
+
+
+@app.route("/api/telegram/web/password", methods=["POST"])
+def telegram_web_password():
+    return telegram_web_api("password")
+
+
+@app.route("/api/telegram/web/session", methods=["DELETE"])
+def telegram_web_session():
+    return telegram_web_api("logout")
 
 
 @app.route("/api/telegram/status")
-def telegram_status():
-    return telegram_api("status")
+def telegram_legacy_status():
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    return jsonify(success=False, data={
+        "available": False, "authorized": False, "state": "unavailable", "enabled": False,
+        "credentials_saved": False, "retry_after": 0, "reason": "旧 Telegram API 接入已停用，请使用 Telegram Web 浏览器接入"})
 
 
 @app.route("/api/telegram/code", methods=["POST"])
-def telegram_code():
-    return telegram_api("code")
-
-
 @app.route("/api/telegram/signin", methods=["POST"])
-def telegram_signin():
-    return telegram_api("signin")
-
-
-@app.route("/api/telegram/session", methods=["DELETE"])
-def telegram_session():
-    return telegram_api("logout")
-
-
 @app.route("/api/telegram/qr", methods=["POST"])
-def telegram_qr():
-    return telegram_api("qr")
-
-
 @app.route("/api/telegram/qr/poll", methods=["POST"])
-def telegram_qr_poll():
-    return telegram_api("qr_poll")
+@app.route("/api/telegram/session", methods=["DELETE"])
+def telegram_legacy_unavailable():
+    if not is_login():
+        return jsonify(success=False, message="未登录"), 401
+    return jsonify(success=False, message="旧 Telegram API 接入已停用，请使用 Telegram Web；已有会话文件保留"), 410
 
 
 # 设置icon
@@ -447,6 +393,10 @@ def update():
     if "source" in payload and (not isinstance(payload["source"], dict)
             or any(not isinstance(value, dict) for value in payload["source"].values())):
         return jsonify(success=False, message="搜索配置格式错误"), 400
+    if "telegram_web" in payload.get("source", {}):
+        browser = payload["source"]["telegram_web"]
+        if set(browser) - {"enable"} or not isinstance(browser.get("enable", False), bool):
+            return jsonify(success=False, message="Telegram Web 配置仅支持启用开关；连接凭据单独保存"), 400
     if "plugins" in payload and (not isinstance(payload["plugins"], dict)
             or any(not isinstance(value, dict) for value in payload["plugins"].values())):
         return jsonify(success=False, message="插件配置格式错误"), 400
@@ -465,6 +415,10 @@ def update():
         for key, value in payload.items():
             if key in allowed_keys:
                 updated[key] = value
+        # 自动加入频道已取消；旧页面和历史配置不得重新启用它。
+        telegram = (updated.get("source") or {}).get("telegram")
+        if isinstance(telegram, dict):
+            telegram["auto_join"] = False
         if "discovery" in payload:
             auto_download = updated["discovery"].get("auto_download", False)
             if auto_download and not aria2_download_configured(updated):
@@ -1068,9 +1022,10 @@ def init():
         source.setdefault("websearch", {"enable": True})
         source.setdefault("monitor", {"enable": True})
         source.setdefault("telegram", {}).setdefault("enable", False)
-        source["telegram"].setdefault("auto_join", False)
-        source.setdefault("channelsearch", {"enable": True, "auto_discover": True,
-                                            "telegram_channels": ["guoman4K", "kuakedongman"],
+        source["telegram"]["auto_join"] = False
+        source.setdefault("telegram_web", {}).setdefault("enable", False)
+        source.setdefault("channelsearch", {"enable": True, "auto_discover": False,
+                                            "telegram_channels": [],
                                             "qq_channels": ["pd26778899"]})
         source["channelsearch"].setdefault("telegram_folders", [])
         if new_config and os.getenv("PANSOU_SERVER"):

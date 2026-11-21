@@ -87,7 +87,7 @@ class SourceMonitorTests(unittest.TestCase):
         self.assertEqual(result['checked'], 2)
         self.assertEqual(len(self.health.status()), 1)
 
-    def test_configured_telegram_recovers_when_auto_discovery_is_off(self):
+    def test_configured_telegram_is_not_probed_in_archived_only_mode(self):
         self.expire('https://t.me/s/manual_movies')
         config = {'source': {'channelsearch': {'enable': True, 'auto_discover': False,
                   'telegram_channels': ['manual_movies'], 'qq_channels': []}}}
@@ -97,9 +97,9 @@ class SourceMonitorTests(unittest.TestCase):
         with patch('app.sdk.websearch.WebSearch._fetch',
                    side_effect=lambda url, deadline: (body, url)) as fetch:
             result = maintain_sources(config, self.path)
-        self.assertEqual(result, {'checked': 1, 'recovered': ['t.me']})
-        self.assertTrue(fetch.call_args.args[0].startswith('https://t.me/s/manual_movies?q='))
-        self.assertEqual(self.health.status(), [])
+        self.assertEqual(result, {'checked': 0, 'recovered': []})
+        fetch.assert_not_called()
+        self.assertEqual(len(self.health.status()), 1)
         self.expire('https://t.me/s/manual_movies')
         config['source']['channelsearch']['enable'] = False
         with patch('app.sdk.websearch.WebSearch._fetch') as fetch:

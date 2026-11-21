@@ -99,6 +99,22 @@ class AppIntegrationTests(unittest.TestCase):
                 self.assertEqual(self.client.post("/update", json=payload).status_code, 400)
                 self.assertEqual(self.saved_config(), self.config)
 
+    def test_update_always_disables_retired_telegram_auto_join(self):
+        self.config["source"] = {
+            "telegram": {"enable": True, "auto_join": True},
+            "channelsearch": {"telegram_channels": ["preserve_channel"]},
+        }
+        for payload in ({"crontab": "0 9 * * *"},
+                        {"source": copy.deepcopy(self.config["source"])}):
+            with self.subTest(payload=payload):
+                self.write_config()
+                response = self.client.post("/update", json=payload)
+                self.assertTrue(response.json["success"])
+                saved = self.saved_config()
+                self.assertFalse(saved["source"]["telegram"]["auto_join"])
+                self.assertTrue(saved["source"]["telegram"]["enable"])
+                self.assertEqual(saved["source"]["channelsearch"]["telegram_channels"], ["preserve_channel"])
+
     def test_startup_saves_factory_path_migration_and_preserves_custom_paths(self):
         legacy = {"taskname": "测试动漫 第二季 (2024)", "resource_id": "bangumi:42",
                   "shareurl": "https://pan.quark.cn/s/old", "savepath": "/追更/测试动漫 第二季 (2024)",
@@ -595,7 +611,8 @@ class AppIntegrationTests(unittest.TestCase):
             web.init()
             defaults = self.saved_config()["source"]["channelsearch"]
             self.assertTrue(defaults["enable"])
-            self.assertEqual(defaults["telegram_channels"], ["guoman4K", "kuakedongman"])
+            self.assertEqual(defaults["telegram_channels"], [])
+            self.assertFalse(defaults["auto_discover"])
             self.assertEqual(defaults["qq_channels"], ["pd26778899"])
             current = self.saved_config()
             current["source"]["channelsearch"] = {"enable": False, "telegram_channels": ["my_channel"]}

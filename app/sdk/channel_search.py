@@ -6,7 +6,7 @@ from urllib.parse import urlencode, urljoin, urlsplit
 from .common import SearchError
 
 
-DEFAULT_TELEGRAM_CHANNELS = ["guoman4K", "kuakedongman"]
+DEFAULT_TELEGRAM_CHANNELS = []
 DEFAULT_QQ_CHANNELS = ["pd26778899"]
 
 
@@ -17,7 +17,6 @@ def channel_queries(config, query):
         return []
     jobs = []
     for key, defaults, pattern in (
-        ("telegram_channels", DEFAULT_TELEGRAM_CHANNELS, r"[A-Za-z][A-Za-z0-9_]{3,31}"),
         ("qq_channels", DEFAULT_QQ_CHANNELS, r"pd\d{5,20}"),
     ):
         channels = config.get(key, defaults)
@@ -25,13 +24,10 @@ def channel_queries(config, query):
             channels = [item.lstrip("@") for item in re.split(r"[,，\s]+", channels.strip()) if item]
         if (not isinstance(channels, list) or len(channels) > 6
                 or any(not isinstance(item, str) or not re.fullmatch(pattern, item) for item in channels)):
-            raise SearchError("频道列表每类最多 6 项，请填写有效的 Telegram 用户名或腾讯 pd 数字频道号")
+            raise SearchError("腾讯频道列表最多 6 项，请填写有效的 pd 数字频道号")
         for channel in dict.fromkeys(channels):
             # shortcut: 每个频道只读一页；有实际漏搜证据时再加入有界翻页。
-            if key == "telegram_channels":
-                jobs.append((f"Telegram @{channel}", f"https://t.me/s/{channel}?" + urlencode({"q": query})))
-            else:
-                jobs.append((f"腾讯频道 {channel}", f"https://pd.qq.com/g/{channel}"))
+            jobs.append((f"腾讯频道 {channel}", f"https://pd.qq.com/g/{channel}"))
     return jobs
 
 

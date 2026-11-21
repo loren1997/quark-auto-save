@@ -28,9 +28,7 @@ class PanSou:
         try:
             server = self.server.rstrip("/")
             url = server if server.endswith("/api/search") else f"{server}/api/search"
-            params = {"kw": keyword, "cloud_types": ["quark"], "res": "all", "src": "all", "refresh": refresh}
-            if channels:
-                params["channels"] = channels
+            params = {"kw": keyword, "cloud_types": ["quark"], "res": "all", "src": "plugin", "refresh": refresh}
             if plugins:
                 params["plugins"] = plugins
             response = self.session.post(url, json=params, timeout=(5, 25), stream=True)
@@ -105,6 +103,8 @@ class PanSou:
         link_array = set()
         for item in search_results:
             if not isinstance(item, dict):
+                continue
+            if re.match(r"^tg(?::|$)", str(item.get("source") or "").strip(), re.I):
                 continue
             note = str(item.get("note") or item.get("title") or "")
             body = str(item.get("content") or "")

@@ -56,6 +56,10 @@ def _validate_url(url):
                 or parts.username or parts.password or "%" in parts.hostname
                 or parts.port not in (None, 80, 443)):
             raise ValueError()
+        host = parts.hostname.rstrip(".").lower()
+        if any(host == domain or host.endswith("." + domain)
+               for domain in ("t.me", "telegram.me", "telegram.dog", "telegram.org")):
+            raise SearchError("Telegram 仅支持读取已归档对话，已跳过公开链接")
         _public_addresses(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80))
         return parts.hostname
     except (TypeError, ValueError) as error:

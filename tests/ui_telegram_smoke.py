@@ -1,14 +1,16 @@
-"""Optional, fully mocked Telegram UI smoke: python tests/ui_telegram_smoke.py."""
+"""Optional headless Web-sidecar UI test; no real Telegram account or browser profile."""
+import base64
 import copy
 import json
+from pathlib import Path
+import struct
 import sys
 import tempfile
 import threading
-import time
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
+import zlib
 
 from playwright.sync_api import sync_playwright
 from werkzeug.serving import make_server
@@ -19,99 +21,80 @@ sys.path.insert(0, str(ROOT))
 import run as web
 
 
+def png(color):
+    def chunk(name, data):
+        return struct.pack(">I", len(data)) + name + data + struct.pack(">I", zlib.crc32(name + data))
+    data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\0" + bytes(color))) + chunk(b"IEND", b""))
+    return "data:image/png;base64," + base64.b64encode(data).decode()
+
+
 def main():
     output = ROOT / "test-results"
     output.mkdir(exist_ok=True)
     errors, console, calls, writes = [], [], [], []
-    state = {"available": True, "authorized": False, "state": "disconnected", "reason": "",
-             "retry_after": 0, "credentials_saved": False}
-    credentials = {"api_id": 456789, "api_hash": "abcdef0123456789abcdef0123456789",
-                   "phone": "+15550001111", "proxy": "socks5://smoke-user:smoke-secret@127.0.0.1:1080"}
-    password = "smoke-only-two-factor-password"
-    folders = "https://t.me/addlist/SmokeFolderOne\nhttps://t.me/addlist/SmokeFolderTwo"
-    qr_control = {"created": 0, "phase": "waiting", "version": 0, "id": ""}
-    qr_secrets = []
+    attempt = "a" * 32
+    pictures = [png((0, 0, 0)), png((10, 20, 30))]
+    secret = "fake-web-two-factor-password"
+    state = {"available": True, "authorized": False, "state": "disconnected", "scope": "archived",
+             "reason": "", "retry_after": 0, "archived_count": 7}
+    control = {"phase": "qr", "polls": 0}
 
-    class FakeAccount:
+    def response(success=True, **extra):
+        return {"success": success, "data": dict(state, profile="private-profile", cookie="private-cookie"), **extra}
+
+    class FakeWeb:
         def __init__(self, health_path):
             pass
 
         def status(self):
             calls.append(("status", {}))
-            return dict(state)
+            return response()
 
-        def request_code(self, **payload):
-            calls.append(("code", payload))
-            assert payload == credentials
-            state.update(state="waiting_code", reason="", authorized=False, credentials_saved=True)
-            return dict(state, ok=True)
+        def start(self):
+            calls.append(("start", {}))
+            state.update(state="starting", authorized=False, reason="")
+            return response(attempt_id=attempt)
 
-        def sign_in(self, **payload):
-            calls.append(("signin", payload))
-            if payload == {"code": "00000"}:
-                state.update(reason="验证码错误（模拟）")
-                return dict(state, ok=False)
-            if payload == {"code": "12345"}:
+        def poll(self, id):
+            calls.append(("poll", {"id": id}))
+            assert id == attempt
+            if control["phase"] == "password":
                 state.update(state="waiting_password", reason="请输入两步验证密码（模拟）")
-            elif payload == {"password": password}:
-                state.update(state="authorized", authorized=True, reason="")
-            else:
-                raise AssertionError("Unexpected mock login input")
-            return dict(state, ok=True, session="must-not-leak-session")
+                return response(attempt_id=attempt)
+            state.update(state="waiting_qr")
+            control["polls"] += 1
+            return response(attempt_id=attempt, qr={"id": attempt, "image": pictures[min(control["polls"] - 1, 1)]})
 
-        def request_qr(self, **payload):
-            calls.append(("qr", payload))
-            if payload:
-                assert payload == {key: value for key, value in credentials.items() if key != "phone"}
-            else:
-                assert state["credentials_saved"]
-            qr_control["created"] += 1
-            qr_control.update(id=f'{qr_control["created"]:032x}', version=0, phase="waiting")
-            state.update(state="waiting_qr", authorized=False, reason="", credentials_saved=True)
-            return dict(state, ok=True, qr_id=qr_control["id"], qr_url="", expires_at=0)
-
-        def qr_result(self):
-            url = f'tg://login?token=SmokeToken{qr_control["created"]}Version{qr_control["version"]}'
-            qr_secrets.extend([url, qr_control["id"]])
-            return dict(state, ok=True, qr_id=qr_control["id"], qr_url=url, expires_at=time.time() + 30)
-
-        def poll_qr(self, qr_id):
-            calls.append(("qr_poll", {"qr_id": qr_id}))
-            if qr_id != qr_control["id"]:
-                return dict(state, ok=False, reason="二维码已失效（模拟）")
-            if qr_control["phase"] == "expired":
-                state.update(state="reauthorize", reason="二维码已失效，请重新生成（模拟）")
-                return dict(state, ok=False)
-            if qr_control["phase"] == "password":
-                state.update(state="waiting_password", reason="请输入两步验证密码（模拟）")
-                return dict(state, ok=True)
-            qr_control["version"] += 1
-            return self.qr_result()
+        def password(self, id, password):
+            calls.append(("password", {"id": id}))
+            assert id == attempt
+            if password != secret:
+                state.update(reason="两步验证密码错误（模拟）")
+                return response(success=False, attempt_id=attempt)
+            state.update(state="authorized", authorized=True, reason="")
+            return response()
 
         def logout(self):
             calls.append(("logout", {}))
-            state.update(state="disconnected", authorized=False, credentials_saved=False,
-                         reason="本地已注销；远端撤销未确认（模拟）")
-            return dict(state, ok=False)
+            state.update(state="disconnected", authorized=False, reason="")
+            return response()
 
-    def no_network(*args, **kwargs):
-        raise AssertionError("Unexpected backend HTTP request")
-
-    with tempfile.TemporaryDirectory() as folder, \
-            patch.object(web, "TelegramAccount", FakeAccount), \
+    with tempfile.TemporaryDirectory() as directory, patch.object(web, "TelegramWeb", FakeWeb), \
             patch.object(web, "reload_tasks", return_value=True), \
             patch.object(web, "get_run_manager", return_value=SimpleNamespace(list=lambda: [])), \
-            patch("requests.sessions.Session.request", side_effect=no_network):
-        web.CONFIG_PATH = str(Path(folder) / "config.json")
+            patch("requests.sessions.Session.request", side_effect=AssertionError("Unexpected backend network")):
+        web.CONFIG_PATH = str(Path(directory) / "config.json")
         config = json.loads((ROOT / "quark_config.json").read_text(encoding="utf-8"))
         config.update(webui={"username": "test", "password": "test-password"}, cookie=["TEST_COOKIE"],
                       crontab="0 8 * * *", tasklist=[], discovery={"savepath": "/cartoon", "auto_download": False})
-        config.setdefault("source", {})["telegram"] = {"enable": False}
-        config["source"]["telegram"]["auto_join"] = False
-        config["source"].setdefault("channelsearch", {})["telegram_folders"] = []
+        config.setdefault("source", {}).update(telegram_web={"enable": False}, telegram={"enable": True, "auto_join": False})
         web.Config.write_json(web.CONFIG_PATH, config)
         web.config_data = copy.deepcopy(config)
         web.task_plugins_config_default = {}
+        health = Path(web.Config.search_health_path(web.CONFIG_PATH))
+        legacy = health.with_name("." + health.name + ".telegram.json")
+        legacy.write_text("private-legacy-session", encoding="utf-8")
         server = make_server("127.0.0.1", 0, web.app, threaded=True)
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
@@ -139,194 +122,95 @@ def main():
                 page.locator('input[name="password"]').fill("test-password")
                 page.locator('button[type="submit"]').click()
                 page.wait_for_function("typeof app !== 'undefined' && app.formData.config_revision && app.telegramStatus && !app.telegramBusy")
-                section = page.locator('[aria-label="Telegram 账号连接"]')
                 page.locator("a.nav-link").filter(has_text="系统配置").click()
-                assert calls == [("status", {})], "mount must only read local account state"
-                assert section.get_by_text("未连接", exact=True).is_visible()
-
-                def save():
-                    with page.expect_response(lambda response: urlsplit(response.url).path == "/update") as result:
-                        page.locator('button[data-original-title="保存 CTRL+S"], button[title="保存 CTRL+S"]').click()
-                    assert result.value.json()["success"], "config save unexpectedly failed"
-                    page.wait_for_function("!app.configModified")
+                assert calls == [("status", {})], "mount must not start the NAS browser"
+                for old in ("telegram-api-id", "telegram-api-hash", "telegram-phone", "telegram-mode-code", "telegram-auto-join"):
+                    assert page.locator("#" + old).count() == 0
 
                 def action(selector, endpoint):
-                    with page.expect_response(lambda response: urlsplit(response.url).path == endpoint) as result:
+                    with page.expect_response(lambda reply: urlsplit(reply.url).path == endpoint) as returned:
                         page.locator(selector).click()
                     page.wait_for_function("!app.telegramBusy")
-                    return result.value.json()
+                    return returned.value.json()
 
-                # QR is opt-in and local: no credentials or image travel through config,
-                # external image services, or the ordinary status endpoint.
-                assert page.locator("#telegram-start-qr").is_visible()
-                assert not page.locator("#telegram-auto-join").is_checked()
-                for key, value in credentials.items():
-                    if key != "phone":
-                        page.locator("#telegram-" + key.replace("_", "-")).fill(str(value))
-                page.locator("#discovery-savepath").fill("/qr-unsaved")
-                first_qr = action("#telegram-start-qr", "/api/telegram/qr")["qr"]
-                assert first_qr["image"] == "" and first_qr["id"]
+                page.locator("#discovery-savepath").fill("/unsaved-web-path")
+                started = action("#telegram-start-qr", "/api/telegram/web/start")
+                assert started["attempt_id"] == attempt
+                assert started["data"]["scope"] == "archived"
+                assert not page.locator("#telegram-account-enabled").is_checked()
                 page.wait_for_function("document.querySelector('#telegram-qr-image')?.naturalWidth > 0")
-                first_image = page.locator("#telegram-qr-image").get_attribute("src")
-                assert first_image.startswith("data:image/svg+xml;base64,")
-                assert page.evaluate("app.telegramLogin.api_hash === '' && app.telegramLogin.proxy === '' && app.telegramLogin.phone === ''")
-                page.wait_for_function("image => app.telegramQr.image !== image", arg=first_image)
-                assert qr_control["created"] == 1, "poll must rotate the image without resending login credentials"
-                qr_secrets.append(page.locator("#telegram-qr-image").get_attribute("src"))
+                assert page.locator("#telegram-qr-image").get_attribute("src") == pictures[0]
+                page.wait_for_function("image => app.telegramQr.image === image", arg=pictures[1])
                 page.wait_for_function("!app.telegramBusy")
                 page.locator("a.nav-link").filter(has_text="任务列表").click()
-                polls_away = sum(action == "qr_poll" for action, _ in calls)
+                before = len([kind for kind, _ in calls if kind == "poll"])
                 page.wait_for_timeout(2300)
-                assert sum(action == "qr_poll" for action, _ in calls) == polls_away
-                qr_control["phase"] = "expired"
+                assert len([kind for kind, _ in calls if kind == "poll"]) == before
+                control["phase"] = "password"
                 page.locator("a.nav-link").filter(has_text="系统配置").click()
-                page.wait_for_function("app.telegramStatus.state === 'reauthorize' && !app.telegramBusy")
-                assert page.locator("#telegram-qr-image").count() == 0
-                assert "二维码已失效" in section.get_by_role("alert").inner_text()
-                assert page.locator("#telegram-api-id").count() == 0, "saved application credentials should be reused"
-                second_qr = action("#telegram-start-qr", "/api/telegram/qr")["qr"]
-                assert second_qr["id"] != first_qr["id"]
-                assert [payload for action, payload in calls if action == "qr"][-1] == {}
-                stale = page.evaluate("""async id => {
-                    const response = await fetch('/api/telegram/qr/poll', {
-                        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id})
-                    });
-                    return await response.json();
-                }""", first_qr["id"])
-                assert not stale["success"] and "qr" not in stale
-                assert page.evaluate("app.telegramQr.id") == second_qr["id"]
-                qr_control["phase"] = "password"
                 page.locator("#telegram-password").wait_for(timeout=7000)
+                assert page.evaluate("app.telegramAttemptId") == attempt
                 assert page.locator("#telegram-qr-image").count() == 0
-                polls_before_password = sum(action == "qr_poll" for action, _ in calls)
-                page.wait_for_timeout(2300)
-                assert sum(action == "qr_poll" for action, _ in calls) == polls_before_password
-                page.locator("#telegram-password").fill(password)
-                qr_login = action("#telegram-submit-password", "/api/telegram/signin")
-                assert qr_login["data"]["authorized"] and page.locator("#telegram-account-enabled").is_checked()
-                assert page.locator("#discovery-savepath").input_value() == "/qr-unsaved"
-                assert page.evaluate("app.formData.config_revision") == qr_login["config_revision"]
-                assert page.evaluate("app.telegramLogin.password") == ""
-                action("#telegram-disconnect", "/api/telegram/session")
-                page.locator("#discovery-savepath").fill("/cartoon")
-                page.locator("#telegram-mode-code").click()
-
-                # Login input is independent from application config, even before submission.
-                page.locator("#telegram-folders").fill(folders)
-                page.locator("#telegram-auto-join").check()
-                for key, value in credentials.items():
-                    page.locator("#telegram-" + key.replace("_", "-")).fill(str(value))
-                save()
-                assert web.Config.read_json(web.CONFIG_PATH)["source"]["channelsearch"]["telegram_folders"] == folders
-                assert web.Config.read_json(web.CONFIG_PATH)["source"]["telegram"]["auto_join"]
-                page.locator("#discovery-savepath").fill("/edited-before-login")
-                page.locator("#telegram-folders").fill(folders + "\nhttps://t.me/addlist/UnsavedThird")
-                old_revision = page.evaluate("app.formData.config_revision")
-
-                result = action("#telegram-send-code", "/api/telegram/code")
-                assert result["success"] and result["data"]["state"] == "waiting_code"
-                assert page.evaluate("app.telegramLogin.api_hash === '' && app.telegramLogin.phone === '' && app.telegramLogin.proxy === ''")
-                assert not page.locator("#telegram-account-enabled").is_checked()
-                assert page.evaluate("app.formData.config_revision") == old_revision
-
-                page.locator("#telegram-code").fill("00000")
-                result = action("#telegram-submit-code", "/api/telegram/signin")
-                assert not result["success"]
-                assert section.get_by_role("alert").inner_text() == "验证码错误（模拟）"
-                assert page.locator("#telegram-code").input_value() == ""
-                page.locator("#telegram-code").fill("12345")
-                result = action("#telegram-submit-code", "/api/telegram/signin")
-                assert result["data"]["state"] == "waiting_password"
-                page.locator("#telegram-password").wait_for()
-                assert page.evaluate("app.telegramLogin.code") == ""
-                assert section.get_by_role("alert").count() == 0
-
-                page.locator("#telegram-password").fill(password)
-                result = action("#telegram-submit-password", "/api/telegram/signin")
-                assert result["success"] and result["data"]["authorized"]
+                page.locator("#telegram-password").fill("wrong-password")
+                failed = action("#telegram-submit-password", "/api/telegram/web/password")
+                assert not failed["success"]
+                assert page.locator("#telegram-password").input_value() == ""
+                assert page.get_by_role("alert").filter(has_text="两步验证密码错误").is_visible()
+                assert page.evaluate("app.telegramAttemptId") == attempt
+                page.locator("#telegram-password").fill(secret)
+                authorized = action("#telegram-submit-password", "/api/telegram/web/password")
+                assert authorized["data"]["authorized"]
                 assert page.locator("#telegram-account-enabled").is_checked()
-                assert page.evaluate("app.telegramLogin.code === '' && app.telegramLogin.password === ''")
-                assert page.evaluate("app.formData.config_revision") == result["config_revision"] != old_revision
-                assert page.locator("#discovery-savepath").input_value() == "/edited-before-login"
-                assert page.locator("#telegram-folders").input_value().endswith("UnsavedThird")
+                assert page.evaluate("app.telegramAttemptId") is None
+                assert page.evaluate("app.telegramLogin.password") == ""
+                assert page.evaluate("app.formData.config_revision") == authorized["config_revision"]
+                assert page.locator("#discovery-savepath").input_value() == "/unsaved-web-path"
                 assert web.Config.read_json(web.CONFIG_PATH)["discovery"]["savepath"] == "/cartoon"
-                section.get_by_text("已连接", exact=True).wait_for()
-                section.screenshot(path=str(output / "telegram-ui-authorized.png"))
-                save()
-                saved = web.Config.read_json(web.CONFIG_PATH)
-                assert saved["source"]["telegram"]["enable"]
-                assert saved["discovery"]["savepath"] == "/edited-before-login"
-                assert saved["source"]["channelsearch"]["telegram_folders"].endswith("UnsavedThird")
+                page.locator("#telegram-status").scroll_into_view_if_needed()
+                page.screenshot(path=str(output / "telegram-web-authorized.png"))
 
-                # Business failure still applies the locally disconnected state/revision.
-                page.locator("#discovery-savepath").fill("/edited-before-logout")
-                result = action("#telegram-disconnect", "/api/telegram/session")
-                assert not result["success"] and not result["data"]["enabled"]
-                assert not page.locator("#telegram-account-enabled").is_checked()
-                assert page.evaluate("app.formData.config_revision") == result["config_revision"]
-                assert page.locator("#discovery-savepath").input_value() == "/edited-before-logout"
-                assert page.evaluate("Object.values(app.telegramLogin).every(value => value === '')")
-                assert "远端撤销未确认" in section.get_by_role("alert").inner_text()
-                assert ("/api/telegram/session", "DELETE", {}) in writes
-                save()
-                assert web.Config.read_json(web.CONFIG_PATH)["discovery"]["savepath"] == "/edited-before-logout"
-                assert not web.Config.read_json(web.CONFIG_PATH)["source"]["telegram"]["enable"]
+                with page.expect_response(lambda reply: urlsplit(reply.url).path == "/update") as saved:
+                    page.locator('button[data-original-title="保存 CTRL+S"], button[title="保存 CTRL+S"]').click()
+                assert saved.value.json()["success"]
+                page.wait_for_function("!app.configModified")
+                assert web.Config.read_json(web.CONFIG_PATH)["source"]["telegram_web"]["enable"]
 
-                # A concurrent worker update cannot be hidden by adopting the login's
-                # newer revision while retaining an older task list in the editor.
-                page.locator("#discovery-savepath").fill("/unsaved-during-worker-update")
+                # A later worker write must keep the editor stale when logout returns a newer revision.
+                page.locator("#discovery-savepath").fill("/unsaved-after-worker-change")
                 stale_revision = page.evaluate("app.formData.config_revision")
-                latest = web.Config.read_json(web.CONFIG_PATH)
-                latest["tasklist"].append({"taskname": "后台新增任务", "shareurl": "", "savepath": "/cartoon"})
-                web.Config.write_json(web.CONFIG_PATH, latest)
-                for key, value in credentials.items():
-                    page.locator("#telegram-" + key.replace("_", "-")).fill(str(value))
-                action("#telegram-send-code", "/api/telegram/code")
-                page.locator("#telegram-code").fill("12345")
-                action("#telegram-submit-code", "/api/telegram/signin")
-                page.locator("#telegram-password").fill(password)
-                result = action("#telegram-submit-password", "/api/telegram/signin")
-                assert result["previous_config_revision"] == web.config_revision(latest)
-                assert result["previous_config_revision"] != stale_revision
+                current = web.Config.read_json(web.CONFIG_PATH)
+                current["tasklist"].append({"taskname": "后台新增任务", "shareurl": "", "savepath": "/cartoon"})
+                web.Config.write_json(web.CONFIG_PATH, current)
+                disconnected = action("#telegram-disconnect", "/api/telegram/web/session")
+                assert not disconnected["data"]["enabled"]
                 assert page.evaluate("app.formData.config_revision") == stale_revision
-                assert "后台配置也有变更" in section.get_by_role("alert").inner_text()
-                assert page.locator("#discovery-savepath").input_value() == "/unsaved-during-worker-update"
-                with page.expect_response(lambda response: urlsplit(response.url).path == "/update") as rejected:
+                assert page.get_by_role("alert").filter(has_text="后台配置也有变更").is_visible()
+                assert page.locator("#discovery-savepath").input_value() == "/unsaved-after-worker-change"
+                assert ("/api/telegram/web/session", "DELETE", {}) in writes
+                with page.expect_response(lambda reply: urlsplit(reply.url).path == "/update") as rejected:
                     page.locator('button[data-original-title="保存 CTRL+S"], button[title="保存 CTRL+S"]').click()
                 assert rejected.value.status == 409
-                assert web.Config.read_json(web.CONFIG_PATH)["tasklist"] == latest["tasklist"]
-                assert page.locator("#discovery-savepath").input_value() == "/unsaved-during-worker-update"
-                action("#telegram-disconnect", "/api/telegram/session")
+                assert web.Config.read_json(web.CONFIG_PATH)["tasklist"] == current["tasklist"]
+                assert legacy.read_text(encoding="utf-8") == "private-legacy-session"
+                assert web.Config.read_json(web.CONFIG_PATH)["source"]["telegram"]["enable"]
 
-                # Reading status must not overwrite an unsaved enable switch. HTTP errors
-                # with structured state still update the account panel without leaking inputs.
+                # Read-only status cannot reset an unsaved switch.
                 page.locator("#telegram-account-enabled").check()
-                action("#telegram-status", "/api/telegram/status")
-                assert page.locator("#telegram-account-enabled").is_checked()
-                page.route("**/api/telegram/status", lambda route: route.fulfill(
-                    status=503, json={"success": False, "message": "连接组件未就绪（模拟）",
-                                      "data": dict(state, available=False, state="unavailable", enabled=False)}))
-                action("#telegram-status", "/api/telegram/status")
-                section.get_by_text("连接组件不可用", exact=True).wait_for()
-                assert section.get_by_role("alert").inner_text() == "连接组件未就绪（模拟）"
+                action("#telegram-status", "/api/telegram/web/status")
                 assert page.locator("#telegram-account-enabled").is_checked()
                 page.set_viewport_size({"width": 390, "height": 844})
                 page.locator("#telegram-status").scroll_into_view_if_needed()
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
-                page.screenshot(path=str(output / "telegram-ui-mobile.png"), full_page=True)
-
-                config_posts = [body for path, method, body in writes if path == "/update"]
-                assert len(config_posts) == 4
-                non_account_payloads = json.dumps(config_posts, ensure_ascii=False) + "\n".join(console)
-                for secret in (*credentials.values(), "00000", "12345", password, "must-not-leak-session", *qr_secrets):
-                    assert str(secret) not in non_account_payloads, "account credential escaped its dedicated request"
+                page.screenshot(path=str(output / "telegram-web-mobile.png"), full_page=True)
+                config_posts = [body for path, _, body in writes if path == "/update"]
+                output_text = json.dumps(config_posts, ensure_ascii=False) + "\n".join(console)
+                for private in (secret, "wrong-password", "private-profile", "private-cookie", "private-legacy-session", *pictures):
+                    assert private not in output_text, "private account material escaped a dedicated route"
                 assert not errors, errors
                 browser.close()
-            print("Telegram UI smoke passed: local status only; local QR/image rotation/expiry/nonce/2FA; no polling away; "
-                  "saved app credential reuse; code/error/2FA/authorized flow; cleared credentials; "
-                  "JSON logout and revision; unsaved edits preserved; opt-in toggle and folder save; "
-                  "concurrent worker task protected by stale revision; no credentials in /update or console; "
-                  "HTTP error state; mobile layout; no JS errors")
+            print("Telegram Web UI smoke passed: status never starts browser; QR refresh; no polling away; "
+                  "2FA failure/success and cleared password; archive-only toggle; logout; revision conflict "
+                  "preserves worker task and edits; legacy session untouched; no secrets in config/console; mobile; no JS errors")
         finally:
             server.shutdown()
             worker.join(timeout=5)
