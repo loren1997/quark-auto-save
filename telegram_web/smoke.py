@@ -102,7 +102,8 @@ def check_resource_button(page):
       const bot={_: 'user',id:42,access_hash:'fixture-bot',username:'Oscar4KBot',pFlags:{bot:true}};
       const botPeer={_: 'peerUser',user_id:42};
       const post={_: 'message',id:12,peer_id:peer,date:1,message:'一念永恒 第4季',reply_markup:{rows:[{buttons:[
-        {_: 'keyboardButtonUrl',text:'📥 获取資源',url:'https://telegram.me/Oscar4KBot/?start=get59171&utm_source=channel#resource'}]}]}};
+        {_: 'keyboardInlineButton',text:'📥 获取資源',type:{_: 'inlineButtonTypeUrl',
+          url:'https://telegram.me/Oscar4KBot/?start=get59171&utm_source=channel#resource'}}]}]}};
       window.calls=[];
       window.rootScope={myId:777,managers:{apiManager:{invokeApi:async(method,params)=>{
         window.calls.push(method);
@@ -121,7 +122,8 @@ def check_resource_button(page):
         }
         if(method==='messages.getHistory')return {messages:params.limit===1?[]:[{
           _: 'message',id:102,peer_id:botPeer,from_id:botPeer,reply_to:{reply_to_msg_id:101},message:'资源',
-          reply_markup:{rows:[{buttons:[{_: 'keyboardButtonCopy',copy_text:'https://pan.quark.cn/s/fixture123456'}]}]}}]};
+          reply_markup:{rows:[{buttons:[{_: 'keyboardInlineButton',text:'复制链接',type:{_: 'inlineButtonTypeCopy',
+            copy_text:'https://pan.quark.cn/s/fixture123456'}}]}]}}]};
         throw Error('Unexpected API call');
       }}}};
     }""")

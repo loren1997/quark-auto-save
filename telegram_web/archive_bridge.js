@@ -18,6 +18,11 @@ async ({query, limit, timeout}) => {
     state.searches = new Map();
     state.botJobs = new Map();
   }
+  // Re-read posts skipped by the old button parser, retaining already-started bot requests.
+  if (state.buttonSchema !== 2) {
+    state.searches = new Map();
+    state.buttonSchema = 2;
+  }
   const botJobs = state.botJobs ||= new Map();
   for (const [payload, job] of botJobs) {
     if (job.created < Date.now() - 15 * 60 * 1000) botJobs.delete(payload);
@@ -117,7 +122,13 @@ async ({query, limit, timeout}) => {
     return {phase, current: phase === 'archives' ? archive?.peers.size || 0 : search?.seen || 0,
       total: phase === 'archives' ? archive?.total || 0 : search?.total || 0};
   }
-  const buttons = message => (message.reply_markup?.rows || []).flatMap(row => row.buttons || []);
+  const buttons = message => (message.reply_markup?.rows || []).flatMap(row => row.buttons || [])
+    .filter(button => button && typeof button === 'object').map(button => {
+      const type = button._ === 'keyboardInlineButton' ? button.type : null;
+      if (type?._ === 'inlineButtonTypeUrl') return {_: 'keyboardButtonUrl', text: button.text, url: type.url};
+      if (type?._ === 'inlineButtonTypeCopy') return {_: 'keyboardButtonCopy', text: button.text, copy_text: type.copy_text};
+      return button;
+    });
   function shares(message) {
     const text = String(message.message || '');
     const links = [text,

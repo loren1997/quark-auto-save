@@ -449,6 +449,67 @@ global.response=async(method,params)=>{
 };
 """ + scenario)
 
+    def test_current_webk_nested_resource_button_and_reply_types(self):
+        self.run_bot_bridge(r"""
+post.reply_markup.rows[0].buttons[0]={_: 'keyboardInlineButton',text:'获取资源',
+ type:{_: 'inlineButtonTypeUrl',url:'tg://resolve?domain=Oscar4KBot&start=get59171'}};
+replyOverride=()=>[reply(102,'#作品', {reply_markup:{rows:[{buttons:[
+ {_: 'keyboardInlineButton',text:'获取资源',type:{_: 'inlineButtonTypeUrl',url:'https://pan.quark.cn/s/NEW000111111'}},
+ {_: 'keyboardInlineButton',text:'复制链接',type:{_: 'inlineButtonTypeCopy',copy_text:'https://pan.quark.cn/s/NEW000111111'}}]}]}})];
+const result=await run();
+assert.equal(starts,1);assert.equal(result.bot.buttons,1);assert.equal(result.bot.links,1);
+assert.equal(result.results.length,1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
+assert.equal(result.results[0].source_url,'https://t.me/publicchannel/12');
+assert.deepEqual(result.bot.button_rejections,{});
+""")
+
+    def test_current_webk_direct_url_and_copy_buttons(self):
+        self.run_bridge(r"""
+const post=message(peers[2],12,'作品 提取码: a1b2');
+post.reply_markup={_: 'replyInlineMarkup',rows:[{_: 'keyboardInlineButtonRow',buttons:[
+ {_: 'keyboardInlineButton',text:'获取资源',type:{_: 'inlineButtonTypeUrl',url:'https://pan.quark.cn/s/abcdef111111'}},
+ {_: 'keyboardInlineButton',text:'复制链接',type:{_: 'inlineButtonTypeCopy',copy_text:'https://pan.quark.cn/s/abcdef111111'}}]}]};
+global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'
+ ? allDialogs() : {_: 'messages.messages',messages:[post],users:[],chats:[channel]};
+const result=await run();assert.equal(result.results.length,1);
+assert.equal(result.results[0].url,'https://pan.quark.cn/s/abcdef111111?pwd=a1b2');
+assert.equal(calls.length,3);
+""")
+
+    def test_current_webk_callback_auth_and_other_targets_are_not_executed(self):
+        self.run_bot_bridge(r"""
+post.reply_markup.rows[0].buttons=[
+ ...['inlineButtonTypeCallback','inlineButtonTypeUrlAuth','inlineButtonTypeWebView'].map(kind=>({
+  _: 'keyboardInlineButton',text:'获取资源',url:'tg://resolve?domain=Oscar4KBot&start=get59171',
+  type:{_:kind,url:'tg://resolve?domain=Oscar4KBot&start=get59171',data:'get59171'}})),
+ {_: 'keyboardInlineButton',text:'获取资源',type:{_: 'inlineButtonTypeUrl',url:'https://t.me/OtherBot?start=get59171'}},
+ {_: 'keyboardInlineButton',text:'获取资源',type:{_: 'inlineButtonTypeUrl',url:'https://t.me/Oscar4KBot?startgroup=get59171'}},
+ {_: 'keyboardInlineButton',text:'获取资源',type:null},null];
+const result=await run();assert.equal(starts,0);assert.equal(result.results.length,0);
+assert.deepEqual(result.bot.button_rejections,{not_url:4,other_target:1,other_action:1});
+assert.ok(!calls.some(c=>c.method==='contacts.resolveUsername'));
+""")
+
+    def test_old_button_cache_rechecks_posts_without_resending_started_bot_request(self):
+        self.run_bot_bridge(r"""
+channel.title='奥斯卡4K蓝光(精品)影视磁力站';
+post.reply_markup.rows[0].buttons[0]={_: 'keyboardInlineButton',text:'获取资源',
+ type:{_: 'inlineButtonTypeUrl',url:'tg://resolve?domain=Oscar4KBot&start=get59171'}};
+window.__qasArchiveReadState={account:'777',archives:null,searches:new Map([['作品',{
+ query:'作品',id:999,channelChecked:'c:3',done:false,used:Date.now(),
+ pending:[{peerKey:'c:3',candidate:{title:'旧的无关候选',url:'https://pan.quark.cn/s/STALE0111111'}}]}]]),
+ botJobs:new Map([['get59171',{payload:'get59171',created:Date.now(),started:true,baseline:100,requestId:101,polls:0}]])};
+const original=response;
+global.response=async(method,params)=>method==='messages.search'
+ ? {_: 'messages.channelMessages',messages:posts,chats:[channel]}:original(method,params);
+const result=await run('作品',1);
+assert.equal(starts,0);assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
+assert.equal(result.bot.channel_posts,1);assert.equal(result.bot.buttons,1);
+assert.equal(window.__qasArchiveReadState.buttonSchema,2);
+assert.equal(window.__qasArchiveReadState.searches.get('作品').id,0);
+assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));
+""")
+
     def test_oscar_start_reply_is_prioritized_and_keeps_archived_provenance(self):
         self.run_bot_bridge(r"""
 posts.unshift(message(peers[2],15,'作品 https://pan.quark.cn/s/STALE0111111'));
