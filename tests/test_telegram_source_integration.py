@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.sdk.common import SearchError
-from resource_search import search_resources, search_web_resources, search_telegram_resources
+from resource_search import search_resources, search_web_resources, search_telegram_resources, search_error_reason
 
 
 class TelegramArchiveSearchIntegrationTests(unittest.TestCase):
@@ -103,6 +103,31 @@ class TelegramArchiveSearchIntegrationTests(unittest.TestCase):
         self.assertEqual(result["data"], [self.candidate])
         self.assertEqual(result["errors"][0]["source"], "Telegram归档资源按钮")
         self.assertTrue(any("Oscar4KBot 请求 1 次" in call.args[0] for call in log.call_args_list))
+
+    def test_partial_archive_flood_reports_wait_without_saying_channel_is_missing(self):
+        self.browser.search.return_value = {"success": False, "code": "FLOOD_WAIT", "results": [], "partial": True,
+            "data": {"archived_count": 28, "retry_after": 60, "reason": "Telegram 暂时限制查询，请等待后自动重试"},
+            "progress": {"phase": "archives", "current": 5, "total": 28}, "bot": {"channel_archived": 0}}
+        with patch("resource_search.print") as log:
+            result = search_telegram_resources("测试动画", self.config)
+        text = "\n".join(call.args[0] for call in log.call_args_list)
+        self.assertIn("归档列表尚未读完", text)
+        self.assertNotIn("未检测到已归档", text)
+        self.assertNotIn("已检查 5 条消息", text)
+        self.assertEqual(result["errors"][0]["message"], "Telegram 查询限流，剩余 60 秒后自动重试")
+        self.assertEqual(search_error_reason(result["errors"][0]["message"]), result["errors"][0]["message"])
+
+    def test_message_details_failure_is_reported_without_exposing_channel_text(self):
+        self.browser.search.return_value.update(bot={"channel_archived": 1, "channel_posts": 9,
+                                                   "details_read": 8, "details_failed": 1, "button_count": 3, "buttons": 1})
+        with patch("resource_search.print") as log:
+            result = search_telegram_resources("测试动画", self.config)
+        text = "\n".join(call.args[0] for call in log.call_args_list)
+        self.assertIn("奥斯卡资源频道在归档中", text)
+        self.assertIn("补读 8 条详情", text)
+        self.assertIn("读取 3 个按钮", text)
+        self.assertIn("详情未读完整", text)
+        self.assertEqual(result["errors"][0]["source"], "Telegram归档消息详情")
 
     def test_unavailable_browser_is_not_retried_for_every_alias_in_same_run(self):
         self.browser.search.return_value = {"success": False, "results": [],

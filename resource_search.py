@@ -26,10 +26,15 @@ def search_error_reason(message):
         return cooldown.group(0)
     if message == "搜索源上游协议错误":
         return message
+    telegram_wait = re.fullmatch(r"Telegram 查询限流，剩余 (\d{1,8}) 秒后自动重试", message)
+    if telegram_wait:
+        return telegram_wait.group(0)
     status = re.search(r"HTTP\s*(\d{3})", message, re.I)
     if status:
         return f"HTTP {status.group(1)}"
     for pattern, reason in (
+        (r"Telegram 暂时限制查询|Telegram 查询限流|FLOOD(?:_PREMIUM)?_WAIT", "Telegram 查询限流，等待冷却后自动重试"),
+        (r"归档消息详情读取失败", "归档消息详情读取失败，稍后自动重试"),
         (r"没有启用的搜索源|未启用其他索引来源", "未启用其他索引来源"),
         (r"本次查找已跳过此前失败的来源", "本次查找已跳过此前失败的来源"),
         (r"非公网", "地址解析为非公网 IP，已拒绝访问"),
@@ -104,21 +109,30 @@ def search_telegram_resources(query, config, health_path=None, limit=20, deadlin
         result = {"success": False, "data": {"reason": "Telegram 归档查询暂不可用"}}
     candidates = result.get("results") or []
     data, progress = result.get("data") or {}, result.get("progress") or {}
-    print(f"Telegram归档：{data.get('archived_count', 0)} 个归档对话，"
-          f"已检查 {progress.get('current', 0)} 条消息，返回 {len(candidates)} 条夸克候选"
-          + ("；还有结果待继续查询" if result.get("partial") else ""), flush=True)
+    reading_archives = progress.get("phase") == "archives"
+    if reading_archives:
+        print(f"Telegram归档：归档列表尚未读完，本次已读 {progress.get('current', 0)} 个对话；暂不判断频道是否缺失", flush=True)
+    else:
+        print(f"Telegram归档：{data.get('archived_count', 0)} 个归档对话，"
+              f"已检查 {progress.get('current', 0)} 条消息，返回 {len(candidates)} 条夸克候选"
+              + ("；还有结果待继续查询" if result.get("partial") else ""), flush=True)
     errors = []
     bot = result.get("bot") or {}
     if bot:
-        channel_state = "Oscar 频道在归档中" if bot.get("channel_archived") else "未检测到已归档的 Oscar 频道"
-        print(f"Telegram归档资源按钮：{channel_state}；本批定向查询 {bot.get('channel_posts', 0)} 条帖子，发现 {bot.get('buttons', 0)} 个按钮；Oscar4KBot 请求 {bot.get('requests', 0)} 次，"
+        channel_state = "归档列表未读完，奥斯卡频道状态待确认" if reading_archives else ("奥斯卡资源频道在归档中" if bot.get("channel_archived") else "未检测到已归档的奥斯卡资源频道")
+        print(f"Telegram归档资源按钮：{channel_state}；本批定向查询 {bot.get('channel_posts', 0)} 条帖子，补读 {bot.get('details_read', 0)} 条详情，读取 {bot.get('button_count', 0)} 个按钮，识别 {bot.get('buttons', 0)} 个资源按钮；Oscar4KBot 请求 {bot.get('requests', 0)} 次，"
               f"新增 {bot.get('links', 0)} 条夸克候选，待获取 {bot.get('pending', 0)} 项，"
               f"未取得可关联资源回复 {bot.get('failed', 0)} 项", flush=True)
         if bot.get("failed"):
             errors.append({"source": "Telegram归档资源按钮", "message": "Oscar4KBot 暂不可用或未返回可关联的夸克资源，稍后自动重试"})
+        if bot.get("details_failed"):
+            print(f"Telegram归档资源按钮：{bot['details_failed']} 条消息详情未读完整，不能据此判断帖子没有资源按钮", flush=True)
+            errors.append({"source": "Telegram归档消息详情", "message": "归档消息详情读取失败，稍后自动重试"})
     # A full candidate batch is pagination, not a failed source.
     if not result.get("success") or result.get("code"):
         reason = data.get("reason") or "Telegram 归档查询未完成"
+        if result.get("code") == "FLOOD_WAIT":
+            reason = f"Telegram 查询限流，剩余 {int(data.get('retry_after') or 0)} 秒后自动重试"
         errors.append({"source": "Telegram归档", "message": reason})
         print(f"Telegram归档：{reason}", flush=True)
     return {"success": bool(result.get("success") or candidates), "data": candidates, "errors": errors,

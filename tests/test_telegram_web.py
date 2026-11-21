@@ -81,6 +81,11 @@ class FakePage:
     def wait_for_function(self, *args, **kwargs):
         return None
 
+    def wait_for_timeout(self, milliseconds):
+        self.waited = getattr(self, "waited", []) + [milliseconds]
+        if hasattr(self, "on_wait"):
+            self.on_wait(milliseconds / 1000)
+
 
 class FakeContext:
     def __init__(self, page):
@@ -100,6 +105,7 @@ class TelegramWebWorkerTests(unittest.TestCase):
         self.page = FakePage()
         self.context = FakeContext(self.page)
         self.now = 100.0
+        self.page.on_wait = lambda seconds: setattr(self, "now", self.now + seconds)
         self.launches = []
 
         def factory(path):
@@ -197,6 +203,27 @@ class TelegramWebWorkerTests(unittest.TestCase):
         result = self.worker.submit("search", {"query": "另一作品"})
         self.assertEqual(result["code"], "FLOOD_WAIT")
         self.assertEqual(len(self.page.threads), calls)
+
+    def test_search_batches_are_paced_and_wait_counts_against_timeout(self):
+        self.authorize()
+        self.worker.submit("search", {"query": "作品"})
+        result = self.worker.submit("search", {"query": "作品", "timeout": 8})
+        self.assertTrue(result["success"])
+        self.assertEqual(self.page.waited, [3000])
+        self.assertEqual(self.page.last_search["timeout"], 5)
+        result = self.worker.submit("search", {"query": "作品", "timeout": 1})
+        self.assertEqual(result["code"], "TIMEOUT")
+        self.assertEqual(self.page.waited, [3000])
+
+    def test_flood_during_archive_refresh_keeps_last_complete_count(self):
+        self.authorize()
+        self.page.search_result["archived_count"] = 28
+        self.worker.submit("search", {"query": "作品"})
+        self.page.search_result = {"success": False, "code": "FLOOD_WAIT", "retry_after": 60,
+                                   "archived_count": 5, "progress": {"phase": "archives", "current": 5, "total": 28}}
+        result = self.worker.submit("search", {"query": "作品"})
+        self.assertEqual(result["data"]["archived_count"], 28)
+        self.assertEqual(result["data"]["retry_after"], 60)
 
     def test_logout_clears_profile_even_when_remote_fails(self):
         self.authorize()
@@ -310,7 +337,7 @@ global.location = {origin: 'https://web.telegram.org', pathname: '/k/'};
 let calls = [];
 global.rootScope = {myId: 777, managers: {apiManager: {invokeApi: async (method, params, options) => {
   calls.push({method, params, options});
-  if (global.validateBotCall && ['contacts.resolveUsername','messages.startBot','messages.getHistory','messages.search'].includes(method)) {
+  if (global.validateBotCall && ['contacts.resolveUsername','messages.startBot','messages.getHistory','messages.search','channels.getMessages'].includes(method)) {
     global.validateBotCall(method, params);
   } else {
     assert.equal(params.folder_id, 1);
@@ -393,6 +420,11 @@ const reply=(id,body,extra={})=>({...message(botPeer,id,body),from_id:botPeer,..
 global.validateBotCall=(method,params)=>{
   if(method==='contacts.resolveUsername')assert.equal(params.username,'Oscar4KBot');
   else if(method==='messages.search'){assert.equal(params.peer.channel_id,3);assert.equal(params.limit,20);}
+  else if(method==='channels.getMessages'){
+    assert.equal(params.channel._,'inputChannel');assert.equal(params.channel.channel_id,3);
+    assert.equal(params.channel.access_hash,'PRIVATE_ACCESS_HASH');
+    assert.ok(params.id.length<=20);assert.ok(params.id.every(id=>id._==='inputMessageID'&&id.id>0));
+  }
   else {assert.equal(params.peer.user_id,42);assert.equal(params.peer.access_hash,'BOT_PRIVATE_HASH');}
   if(method==='messages.startBot'){
     assert.equal(params.bot.user_id,42);assert.equal(params.start_param,'get59171');
@@ -448,6 +480,57 @@ await run('作品',1);assert.equal(calls.filter(c=>c.method==='messages.search')
         self.run_bot_bridge(r"""
 channel.username='Oscar_4Kmovies';archived=false;
 await run();assert.ok(!calls.some(c=>c.method==='messages.search'));assert.equal(starts,0);
+""")
+
+    def test_search_preview_missing_keyboard_reads_full_archived_post(self):
+        self.run_bot_bridge(r"""
+channel.title='奥斯卡4K蓝光(精品)影视磁力站';
+const preview={...post};delete preview.reply_markup;
+const original=response;
+global.response=async(method,params)=>{
+ if(method==='messages.search')return {messages:[preview]};
+ if(method==='channels.getMessages'){
+  assert.deepEqual(params.id,[{_: 'inputMessageID',id:12}]);return {messages:[post]};
+ }
+ return original(method,params);
+};
+const result=await run('作品',1);
+assert.equal(result.bot.details_read,1);assert.equal(result.bot.details_failed,0);
+assert.equal(result.bot.button_count,1);assert.equal(result.bot.buttons,1);assert.equal(starts,1);
+assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
+""")
+
+    def test_message_detail_response_cannot_inject_other_posts_or_channels(self):
+        self.run_bot_bridge(r"""
+channel.username='Oscar_4Kmovies';
+const preview={...post};delete preview.reply_markup;posts=[];
+const original=response;
+global.response=async(method,params)=>{
+ if(method==='messages.search')return {messages:[preview]};
+ if(method==='channels.getMessages')return {messages:[{...post,id:99},{...post,peer_id:{_: 'peerChannel',channel_id:999}}]};
+ return original(method,params);
+};
+const result=await run();assert.equal(result.bot.details_read,0);assert.equal(result.bot.details_failed,1);
+assert.equal(starts,0);assert.equal(result.results.length,0);
+""")
+
+    def test_message_detail_flood_wait_stops_before_bot_or_global_search(self):
+        self.run_bot_bridge(r"""
+channel.username='Oscar_4Kmovies';const preview={...post};delete preview.reply_markup;
+const original=response;
+global.response=async(method,params)=>{
+ if(method==='messages.search')return {messages:[preview]};
+ if(method==='channels.getMessages')throw {type:'FLOOD_WAIT_45'};
+ return original(method,params);
+};
+const result=await run();assert.equal(result.code,'FLOOD_WAIT');assert.equal(result.retry_after,45);
+assert.equal(starts,0);assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));
+""")
+
+    def test_resource_button_ignores_invisible_spacing_in_label(self):
+        self.run_bot_bridge(r"""
+post.reply_markup.rows[0].buttons[0].text='📥 获\u200b取 资 源';
+const result=await run();assert.equal(starts,1);assert.equal(result.bot.buttons,1);
 """)
 
     def test_archived_oscar_title_and_active_secondary_username_are_recognized(self):

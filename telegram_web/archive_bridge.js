@@ -37,9 +37,10 @@ async ({query, limit, timeout}) => {
   const results = [];
   let phase = 'archives';
   let archive = state.archives;
-  let botPeer, activeJob;
+  let botPeer, activeJob, detailRequest;
   let botChecked = false;
-  const bot = {requests: 0, links: 0, pending: 0, failed: 0, channel_posts: 0, buttons: 0, channel_archived: 0};
+  const bot = {requests: 0, links: 0, pending: 0, failed: 0, channel_posts: 0, buttons: 0, channel_archived: 0,
+    details_read: 0, details_failed: 0, button_count: 0};
   const isOscarChannel = entity => entity.input._ === 'inputPeerChannel' && (
     [entity.username, ...(entity.usernames || [])].some(name => name?.toLowerCase() === 'oscar_4kmovies')
     || /奥斯卡.*(?:4k|蓝光).*(?:影视|磁力)/i.test(String(entity.title || '').normalize('NFKC')));
@@ -57,10 +58,15 @@ async ({query, limit, timeout}) => {
           || method === 'messages.startBot' && params.start_param === activeJob.payload
             && params.bot?._ === 'inputUser' && params.bot.user_id === botPeer.user_id
             && params.bot.access_hash === botPeer.access_hash));
-    const channelRead = method === 'messages.search' && archive?.complete
+    const channelRead = archive?.complete
       && [...archive.peers.values()].some(entity => isOscarChannel(entity)
-        && entity.input._ === 'inputPeerChannel' && params.peer?._ === 'inputPeerChannel'
-        && params.peer.channel_id === entity.input.channel_id && params.peer.access_hash === entity.input.access_hash);
+        && (method === 'messages.search' && params.peer?._ === 'inputPeerChannel'
+          && params.peer.channel_id === entity.input.channel_id && params.peer.access_hash === entity.input.access_hash
+          || method === 'channels.getMessages' && detailRequest?.peerKey === `c:${entity.input.channel_id}`
+            && params.channel?._ === 'inputChannel' && params.channel.channel_id === entity.input.channel_id
+            && params.channel.access_hash === entity.input.access_hash && Array.isArray(params.id)
+            && params.id.length > 0 && params.id.length <= 20
+            && params.id.every(id => id._ === 'inputMessageID' && detailRequest.ids.has(id.id))));
     if (!archiveRead && !botRead && !channelRead) throw {type: 'BRIDGE_UNAVAILABLE'};
     const remaining = until - Date.now();
     if (remaining < 250) throw {type: 'BUDGET_EXHAUSTED'};
@@ -145,7 +151,8 @@ async ({query, limit, timeout}) => {
     }
   }
   function resourcePayload(button) {
-    if (button._ !== 'keyboardButtonUrl' || !/(获取资源|獲取資源)/.test(button.text || '')) return;
+    const label = String(button.text || '').normalize('NFKC').replace(/[\s\u200b-\u200f\ufeff]/g, '');
+    if (button._ !== 'keyboardButtonUrl' || !/(获取资源|獲取資源)/.test(label)) return;
     try {
       const url = new URL(button.url);
       if (url.username || url.password || url.port || url.hash) return;
@@ -221,12 +228,37 @@ async ({query, limit, timeout}) => {
       activeJob = null; botPeer = null;
     }
   }
+  async function messageDetails(messages, channel) {
+    const peerKey = `c:${channel.input.channel_id}`;
+    const ids = new Set(messages.filter(message => key(message.peer_id) === peerKey
+      && message._ === 'message' && Number.isInteger(message.id) && message.id > 0 && !buttons(message).length)
+      .slice(0, 20).map(message => message.id));
+    if (!ids.size) return messages;
+    detailRequest = {peerKey, ids};
+    try {
+      // Search previews can omit inline keyboards; read these exact archived posts once in a batch.
+      const response = await invoke('channels.getMessages', {
+        channel: {_: 'inputChannel', channel_id: channel.input.channel_id, access_hash: channel.input.access_hash},
+        id: [...ids].map(id => ({_: 'inputMessageID', id}))});
+      if (!Array.isArray(response.messages)) throw {type: 'BRIDGE_UNAVAILABLE'};
+      const full = new Map(response.messages.filter(message => key(message.peer_id) === peerKey
+        && message._ === 'message' && ids.has(message.id)).map(message => [message.id, message]));
+      bot.details_read += full.size;
+      bot.details_failed += ids.size - full.size;
+      return messages.map(message => full.get(message.id) || message);
+    } catch (error) {
+      if (/FLOOD|ACCOUNT_CHANGED|AUTH_KEY|SESSION_|BUDGET_EXHAUSTED/.test(String(error?.type || ''))) throw error;
+      bot.details_failed += ids.size;
+      return messages;
+    } finally { detailRequest = null; }
+  }
   function collectMessages(messages) {
     for (const message of messages) {
       search.seen++;
       const entity = archive.peers.get(key(message.peer_id));
       if (!entity || message._ !== 'message') continue;
       addShares(message, message, entity);
+      bot.button_count += buttons(message).length;
       for (const button of buttons(message)) {
         const payload = resourcePayload(button);
         if (payload && !search.botSeen.has(payload)) {
@@ -289,7 +321,8 @@ async ({query, limit, timeout}) => {
             add_offset: 0, limit: 20, max_id: 0, min_id: 0, hash: '0'});
           if (!Array.isArray(response.messages)) throw {type: 'BRIDGE_UNAVAILABLE'};
           bot.channel_posts = response.messages.length;
-          collectMessages(response.messages.filter(message => key(message.peer_id) === `c:${channel.input.channel_id}`));
+          const posts = response.messages.filter(message => key(message.peer_id) === `c:${channel.input.channel_id}`);
+          collectMessages(await messageDetails(posts, channel));
         } catch (error) {
           if (/FLOOD|ACCOUNT_CHANGED|AUTH_KEY|SESSION_|BUDGET_EXHAUSTED/.test(String(error?.type || ''))) throw error;
           bot.failed++;

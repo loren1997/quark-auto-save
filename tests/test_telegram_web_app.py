@@ -114,7 +114,7 @@ class TelegramWebClientTests(unittest.TestCase):
         self.assertEqual(returned["results"][0]["shareurl"], "https://pan.quark.cn/s/abcdef123456")
         self.assertEqual(len(returned["results"]), 1)
         self.assertTrue(returned["partial"])
-        self.assertEqual(returned["bot"], {"requests": 1, "links": 1, "pending": 0, "failed": 0, "channel_posts": 0, "buttons": 0, "channel_archived": 0})
+        self.assertEqual(returned["bot"], {"requests": 1, "links": 1, "pending": 0, "failed": 0, "channel_posts": 0, "buttons": 0, "channel_archived": 0, "details_read": 0, "details_failed": 0, "button_count": 0})
         self.assertNotIn("private-", json.dumps(returned))
         call = self.http.request.call_args
         self.assertEqual(call.args[1], "http://telegram-web:8765/search")

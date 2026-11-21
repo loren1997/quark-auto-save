@@ -77,6 +77,7 @@ class TelegramWebWorker:
         self._attempt = None
         self._expires = 0
         self._cooldown = 0
+        self._next_search = 0
         self._state = "disconnected"
         self._reason = "DISCONNECTED"
         self._archived_count = 0
@@ -413,12 +414,20 @@ class TelegramWebWorker:
                 self._state, self._reason = "disconnected", "AUTH_REQUIRED"
             return self._result(False, "AUTH_REQUIRED", results=[])
         remaining = payload["timeout"] - (self._clock() - began)
+        pause = max(0, self._next_search - self._clock())
+        if pause:
+            if remaining <= pause + 0.25:
+                return self._result(False, "TIMEOUT", results=[])
+            self._page.wait_for_timeout(pause * 1000)
+            remaining = payload["timeout"] - (self._clock() - began)
         if remaining <= 0:
             return self._result(False, "TIMEOUT", results=[])
+        self._next_search = self._clock() + 3
         result = self._page.evaluate(self._bridge, {"query": query.strip(), "limit": limit, "timeout": remaining})
         if not isinstance(result, dict):
             return self._result(False, "BRIDGE_UNAVAILABLE", results=[])
-        self._archived_count = max(0, int(result.get("archived_count", 0)))
+        count = max(0, int(result.get("archived_count", 0)))
+        self._archived_count = max(self._archived_count, count) if (result.get("progress") or {}).get("phase") == "archives" else count
         code = result.get("code")
         if code not in REASONS:
             code = "SEARCH_FAILED" if not result.get("success") else None

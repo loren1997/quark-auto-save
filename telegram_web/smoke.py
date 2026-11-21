@@ -109,7 +109,11 @@ def check_resource_button(page):
         if(method==='messages.getPinnedDialogs')return {dialogs:[],messages:[],chats:[],users:[]};
         if(method==='messages.getDialogs')return {_: 'messages.dialogs',dialogs:[{_: 'dialog',folder_id:1,peer}],messages:[],chats:[channel]};
         if(method==='messages.searchGlobal')return {_: 'messages.messages',messages:[post],chats:[channel]};
-        if(method==='messages.search')return {_: 'messages.channelMessages',messages:[post],chats:[channel]};
+        if(method==='messages.search'){const preview={...post};delete preview.reply_markup;
+          return {_: 'messages.channelMessages',messages:[preview],chats:[channel]};}
+        if(method==='channels.getMessages'){
+          if(params.channel.channel_id!==3||params.id.length!==1||params.id[0].id!==12)throw Error('Unexpected message detail request');
+          return {messages:[post],chats:[channel]};}
         if(method==='contacts.resolveUsername')return {peer:botPeer,users:[bot]};
         if(method==='messages.startBot'){
           if(params.start_param!=='get59171'||params.bot.user_id!==42)throw Error('Wrong bot request');
@@ -127,6 +131,7 @@ def check_resource_button(page):
     assert result["bot"]["requests"] == 1 and result["bot"]["links"] == 1, result
     assert result["results"][0]["source_url"] == "https://t.me/Oscar_4Kmovies/12", result
     assert result["bot"]["channel_posts"] == 1 and result["bot"]["channel_archived"] == 1, result
+    assert result["bot"]["details_read"] == 1 and result["bot"]["button_count"] >= 1, result
     assert page.evaluate("calls.filter(m=>m==='messages.startBot').length") == 1
     print("Archived Oscar resource button and reply extraction: passed (offline fixture)", flush=True)
 
