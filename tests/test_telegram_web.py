@@ -379,6 +379,20 @@ assert.equal(result.archived_count,1);assert.equal(result.results.length,1);
 assert.ok(!JSON.stringify(result).includes('BLOCKED'));
 """)
 
+    def test_search_pagination_falls_back_to_last_message_date_without_next_rate(self):
+        self.run_bridge(r"""
+let page=0;
+global.response=async(method,params)=>{
+ if(method==='messages.getPinnedDialogs')return emptyPinned();
+ if(method==='messages.getDialogs')return allDialogs();
+ if(page++===0)return {_: 'messages.messagesSlice',count:2,
+   messages:[message(peers[1],20,'作品 https://pan.quark.cn/s/abcdef111111')],users:[],chats:[chat]};
+ assert.equal(params.offset_rate,980);assert.equal(params.offset_id,20);
+ return {_: 'messages.messages',messages:[message(peers[1],19,'作品 https://pan.quark.cn/s/abcdef222222')],users:[],chats:[chat]};
+};
+const result=await run();assert.equal(result.results.length,2);assert.equal(result.partial,false);
+""")
+
     def test_small_result_limit_keeps_buffer_and_rechecks_archive(self):
         self.run_bridge(r"""
 let removed=false, searches=0;
@@ -458,6 +472,19 @@ assert.equal(window.__qasArchiveReadState.searches.size,20);
 assert.equal(window.__qasArchiveReadState.searches.has('title 0'),false);
 window.__qasArchiveReadState.searches.get('title 21').used=0;
 await run('title 21',1);assert.equal(searches,23);
+""")
+
+    def test_unfinished_archive_search_resumes_at_next_weekly_run(self):
+        self.run_bridge(r"""
+let searches=0;
+global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'
+ ? allDialogs() : (searches++,{_: 'messages.messages',messages:[
+ message(peers[0],1,'作品 https://pan.quark.cn/s/abcdef111111'),
+ message(peers[0],2,'作品 https://pan.quark.cn/s/abcdef222222')],users:[user],chats:[]});
+await run('作品',1);
+window.__qasArchiveReadState.searches.get('作品').used-=7*24*60*60*1000;
+const result=await run('作品',1);
+assert.equal(searches,1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/abcdef222222');
 """)
 
     def test_account_switch_during_call_drops_payload(self):

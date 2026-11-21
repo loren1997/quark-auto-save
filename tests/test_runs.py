@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 with contextlib.redirect_stdout(io.StringIO()):
     import run as web
-from run_manager import RunManager, redact
+from run_manager import RunManager, redact, now
 
 
 class RunFixture(unittest.TestCase):
@@ -310,7 +310,7 @@ class BackgroundRunTests(RunFixture):
         self.assertEqual(conflicts, [True])
         self.assertIn("completed", [line["text"] for line in result["logs"]])
 
-    def test_restart_marks_active_record_interrupted_and_retains_latest_twenty(self):
+    def test_restart_marks_active_record_interrupted_and_keeps_recent_history_beyond_twenty(self):
         manager = self.manager()
         _, run = manager.start({})
         record = self.finish(manager, run["id"])
@@ -319,9 +319,42 @@ class BackgroundRunTests(RunFixture):
             row["status"] = "running" if number == 21 else "succeeded"
             (manager.directory / (row["id"] + ".json")).write_text(json.dumps(row), encoding="utf-8")
         restarted = self.manager()
-        self.assertEqual(len(restarted.list()), 20)
+        self.assertEqual(len(restarted.list()), 23)
         self.assertEqual(restarted.get(f"{21:032x}")["status"], "interrupted")
-        self.assertEqual(len(list(manager.directory.glob("*.json"))), 20)
+        self.assertEqual(len(list(manager.directory.glob("*.json"))), 23)
+
+    def test_history_expiry_uses_finish_time_and_saved_days_without_deleting_active_runs(self):
+        from datetime import datetime, timedelta, timezone
+        manager = self.manager()
+        def stamp(days):
+            return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = []
+        for number, status, ended in [(1, "succeeded", stamp(8)), (2, "failed", stamp(2)),
+                                      (3, "waiting", stamp(8)), (4, "running", stamp(8)),
+                                      (5, "queued", stamp(8)), (6, "succeeded", now())]:
+            row = {"id": f"{number:032x}", "status": status, "created_at": stamp(30),
+                   "finished_at": ended, "logs": [], "cursor": 0}
+            manager.records[row["id"]] = row
+            manager._persist(row)
+            rows.append(row)
+        manager.prune()
+        self.assertEqual(set(manager.records), {row["id"] for row in rows[1:] if row is not rows[2]})
+        self.config["run_history"] = {"retention_days": 1}
+        self.config_path.write_text(json.dumps(self.config))
+        manager.prune()
+        self.assertEqual(set(manager.records), {row["id"] for row in rows[3:]})
+        self.assertEqual(len(list(manager.directory.glob("*.json"))), 3)
+
+    def test_invalid_retention_does_not_delete_history(self):
+        manager = self.manager()
+        row = {"id": "f" * 32, "status": "succeeded", "created_at": "2000-01-01",
+               "finished_at": "2000-01-01", "logs": [], "cursor": 0}
+        manager.records[row["id"]] = row
+        manager._persist(row)
+        self.config["run_history"] = {"retention_days": 0}
+        self.config_path.write_text(json.dumps(self.config))
+        manager.prune()
+        self.assertTrue((manager.directory / (row["id"] + ".json")).exists())
 
     def test_log_window_has_stable_cursor_and_truncation_indicator(self):
         self.script.write_text("for number in range(10): print('line '+str(number))\n", encoding="utf-8")
@@ -375,6 +408,19 @@ class BackgroundRunApiTests(RunFixture):
         for route, method in (("/api/runs", "get"), ("/api/runs", "post"),
                               ("/api/runs/" + "a" * 32, "get"), ("/run_script_now", "post")):
             self.assertEqual(getattr(self.client, method)(route).status_code, 401)
+
+    def test_retention_settings_validate_and_persist_without_touching_tasks(self):
+        with patch.object(web, "reload_tasks", return_value=True):
+            for value in (0, 366, True, "7", 1.5, None):
+                response = self.client.post("/update", json={"run_history": {"retention_days": value}})
+                self.assertEqual(response.status_code, 400)
+            self.assertEqual(self.client.post("/update", json={"run_history": []}).status_code, 400)
+            response = self.client.post("/update", json={"run_history": {"retention_days": 30}})
+        self.assertTrue(response.json["success"])
+        saved = web.Config.read_json(self.config_path)
+        self.assertEqual(saved["run_history"]["retention_days"], 30)
+        self.assertEqual(saved["tasklist"], self.config["tasklist"])
+        self.assertEqual(saved["cookie"], self.config["cookie"])
 
     def test_api_returns_immediately_and_schedule_uses_same_history(self):
         self.script.write_text("import time\nprint('live', flush=True)\ntime.sleep(0.4)\nprint('end')\n", encoding="utf-8")

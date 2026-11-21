@@ -19,7 +19,8 @@ async ({query, limit, timeout}) => {
   }
   const searches = state.searches;
   for (const [name, cached] of searches) {
-    if (cached.used < Date.now() - 30 * 60 * 1000 || cached.done) searches.delete(name);
+    // Unfinished pages must survive daily/weekly runs; the cache still holds at most 20 queries.
+    if (cached.used < Date.now() - 14 * 24 * 60 * 60 * 1000 || cached.done) searches.delete(name);
   }
   let search = searches.get(query);
   if (search) {
@@ -165,9 +166,10 @@ async ({query, limit, timeout}) => {
       if (response._ === 'messages.messages' || !response.messages.length) { search.exhausted = true; break; }
       const last = response.messages[response.messages.length - 1];
       const id = key(last.peer_id), entity = entities.get(id) || archive.peers.get(id);
-      const cursor = `${id}/${last.id}/${response.next_rate || 0}`;
+      const nextRate = response.next_rate ?? last.date ?? 0;
+      const cursor = `${id}/${last.id}/${nextRate}`;
       if (!entity || !last.id || cursor === search.cursor) throw {type: 'PAGINATION_FAILED'};
-      search.cursor = cursor; search.id = last.id; search.peer = entity.input; search.rate = response.next_rate || 0;
+      search.cursor = cursor; search.id = last.id; search.peer = entity.input; search.rate = nextRate;
     }
     if (!archive.peers.size) search.exhausted = true;
     search.done = search.exhausted && !search.pending.length;

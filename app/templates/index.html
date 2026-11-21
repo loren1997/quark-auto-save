@@ -96,6 +96,13 @@
               <div class="col-auto"><button type="button" class="btn btn-outline-primary" :disabled="runsLoading" @click="refreshRuns()">刷新日志</button></div>
             </div>
             <p class="text-muted">任务在后台执行，关闭页面不会中断。这里记录手动、订阅和定时运行；显示的下载阶段表示提交给下载器，实际进度请在 Aria2 查看。</p>
+            <div class="form-inline mb-3">
+              <label for="run-retention-days" class="mr-2">历史日志保留</label>
+              <input id="run-retention-days" type="number" min="1" max="365" step="1" class="form-control mr-2" style="width: 100px" v-model.number="formData.run_history.retention_days">
+              <span class="mr-3">天</span>
+              <button type="button" class="btn btn-outline-primary" @click="saveConfig().then(() => refreshRuns())">保存设置</button>
+              <small class="text-muted w-100 mt-2">按运行结束时间保留，默认 7 天，可设 1–365 天；每 5 分钟自动清理过期记录。运行中和排队任务不会删除。保存设置也会保存当前页面其他配置修改。</small>
+            </div>
             <div v-if="queuedRuns.length" class="card mb-3">
               <div class="card-body">
                 <h5>订阅队列（{{ queuedRuns.length }}）</h5>
@@ -140,7 +147,7 @@
               </div>
             </div>
             <div v-if="runDetail" class="d-flex justify-content-between mb-2">
-              <span class="text-muted small">实时更新 · 仅保留最近的运行记录和日志</span>
+              <span class="text-muted small">实时更新 · 每次运行最多保留 1000 行、512 KB 日志</span>
               <label class="small mb-0"><input type="checkbox" v-model="runFollow"> 跟随最新日志</label>
             </div>
             <pre v-if="runDetail" ref="runLogView" id="run-log-output" tabindex="0" aria-label="运行日志内容" class="border rounded p-3 bg-light" style="white-space: pre-wrap; overflow-wrap: anywhere; max-height: 65vh; overflow-y: auto;">{{ runLog || '正在等待任务输出…' }}</pre>
@@ -880,6 +887,7 @@
         formData: {
           cookie: [],
           auto_repair: true,
+          run_history: { retention_days: 7 },
           discovery: { savepath: '/cartoon' },
           push_config: {},
           media_servers: {},
@@ -1370,6 +1378,7 @@
                   enable: ""
                 };
               }
+              config_data.run_history = { retention_days: 7, ...(config_data.run_history || {}) };
               this.formData = config_data;
               setTimeout(() => {
                 this.configModified = false;

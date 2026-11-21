@@ -2,7 +2,7 @@
 
 本版在原项目基础上维护，保留上游许可证和插件。默认工作方式是：NAS 上运行订阅服务，定时将夸克分享转存到自己的夸克网盘。需要 NAS 本地文件时，可启用已有 Aria2 插件。
 
-V3.13.1 修复 Telegram Web 两步验证误报“官方网页接口已变化”。当前使用独立网页会话扫码连接，无需 API ID/API Hash，仅搜索已归档对话，不再自动加入频道。
+V3.13.2 将 Telegram 归档候选单独优先分批验证，运行日志可设置保留天数。当前使用独立网页会话扫码连接，无需 API ID/API Hash，仅搜索已归档对话，不再自动加入频道。
 
 V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再后台更新；定时换源、补集及待查找重试遵守任务运行星期，手动运行单个任务仍立即执行。
 
@@ -14,6 +14,8 @@ V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再�
 2. 在手机 Telegram 的“设置 → 设备 → 连接桌面设备”扫描管理页二维码；账号启用两步验证时在管理页输入密码。
 3. 连接成功会启用归档搜索。将需要搜索的频道、群组或私聊放入 Telegram 的 **Archived chats / 已归档聊天**。普通自定义聊天文件夹不等于归档。
 4. 以后订阅、自动换源及补集会搜索这些归档对话；移出归档后，不再作为 Telegram 搜索范围。资源仍须通过夸克文件验证。
+
+查询日志会显示归档对话数、已检查消息数、夸克候选数及当前验证阶段。Telegram 候选独立于网页结果验证，每批 6 个、每轮最多 4 批，未读完继续分批查找；满批分页不再作为来源故障。未完成关键词在存活浏览器会话中最多保留 14 天、最多 20 个关键词；重启或缓存淘汰后重新查询。发现夸克链接不代表链接有效或片名、季度、年份已经匹配。
 
 本版本取消自动加入频道，以及原公开 Telegram 名单、频道文件夹导入和账号推荐发现。旧配置即使 `auto_join=true` 也不会加入；旧账号凭据文件保留但不再用于登录或搜索。腾讯频道及其他网盘/网页搜索仍可使用。归档里的搜索机器人仅查询已有消息，不向机器人发送搜索指令。
 
@@ -27,7 +29,7 @@ V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再�
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.13.1 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.1) 中的 `quark-auto-save-nas-docker-v3.13.1.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.13.2 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.2) 中的 `quark-auto-save-nas-docker-v3.13.2.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 
 ```sh
@@ -191,7 +193,9 @@ V3.7 已在新的公开分享中匿名读到《黑暗召唤师在地下恋爱中
 
 点击运行或一键订阅后，不再自动弹出日志窗口。左侧“运行日志”可查看当前作品、正在查询的来源/关键词，以及验证、补集、转存、更名和提交下载等步骤。页面每 2 秒增量更新，刷新或重新打开后可继续查看；手动和定时任务共用一个执行锁，避免同时重复转存。
 
-运行记录保存在 `config/runs/`，保留最近 20 次，每次最多 1000 行、约 512 KiB 文本。Cookie、密钥及下载直链会脱敏。“运行结束”只表示本轮程序退出，缺集未完成等结果会单独提示；“提交下载任务”不代表 Aria2 已下载完毕。停止或升级容器会中断当前任务，重新启动后日志会标记中断。
+运行记录保存在 `config/runs/`。在“运行日志 → 历史日志保留”设置 1–365 天，默认 7 天，点击“保存设置”；也可在配置中设置 `run_history.retention_days`。按运行结束时间保留，每 5 分钟及读取历史时自动删除过期记录，不再仅保留最近 20 次；运行中和排队任务不会删除。已被旧版删除的日志无法恢复。保留天数越长，磁盘和内存占用越多；每次运行仍最多 1000 行、约 512 KiB 文本。
+
+Cookie、密钥及下载直链会脱敏。“运行结束”只表示本轮程序退出，缺集未完成等结果会单独提示；“提交下载任务”不代表 Aria2 已下载完毕。停止或升级容器会中断当前任务，重新启动后日志会标记中断。
 
 ## 6. 更新、备份与回退
 
@@ -199,16 +203,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.13.1：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
+以下从旧维护版更新至 V3.13.2：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.1/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.2/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.13.1-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.13.2-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"

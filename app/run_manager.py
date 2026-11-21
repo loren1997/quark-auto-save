@@ -18,13 +18,21 @@ import uuid
 STAGES = {"start", "signin", "task", "search", "verify", "gap", "transfer", "rename", "download", "finish"}
 ACTIVE = {"queued", "running"}
 ID_PATTERN = re.compile(r"[a-f0-9]{32}")
-MAX_RUNS, MAX_LINES, MAX_BYTES = 20, 1000, 512 * 1024
+MAX_QUEUED, MAX_LINES, MAX_BYTES = 20, 1000, 512 * 1024
 SUMMARY_FIELDS = {"id", "status", "trigger", "task", "stage", "source", "query", "discovery_id",
                   "created_at", "started_at", "finished_at", "error", "exit_code", "warning", "cursor"}
 
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def history_retention_days(settings):
+    if (not isinstance(settings, dict) or set(settings) - {"retention_days"}
+            or type(settings.get("retention_days", 7)) is not int
+            or not 1 <= settings.get("retention_days", 7) <= 365):
+        raise ValueError("运行日志保留天数必须是 1–365 的整数")
+    return settings.get("retention_days", 7)
 
 
 def validate_payload(payload):
@@ -168,11 +176,31 @@ class RunManager:
                 time.sleep(0.02)
 
     def _prune(self):
-        records = sorted(self.records.values(), key=lambda item: item["created_at"], reverse=True)
-        for record in records[MAX_RUNS:]:
-            if record["status"] not in ACTIVE:
+        try:
+            config = json.loads(Path(self.config_path).read_text(encoding="utf-8"))
+            days = history_retention_days(config.get("run_history", {}))
+        except (OSError, ValueError, AttributeError):
+            logging.warning("运行日志保留设置不可用，本次不删除历史")
+            return
+        cutoff = time.time() - days * 86400
+        for record in list(self.records.values()):
+            if record["status"] in ACTIVE or record["id"] in self.owned:
+                continue
+            try:
+                ended = datetime.fromisoformat(record.get("finished_at") or record["created_at"])
+                if ended.tzinfo is None:
+                    ended = ended.replace(tzinfo=timezone.utc)
+                if ended.timestamp() >= cutoff:
+                    continue
                 (self.directory / (record["id"] + ".json")).unlink(missing_ok=True)
                 self.records.pop(record["id"], None)
+            except (OSError, ValueError, TypeError, KeyError):
+                logging.warning("无法清理一条过期运行日志")
+
+    def prune(self):
+        with self.condition:
+            self._refresh_other_runs()
+            self._prune()
 
     @staticmethod
     def _summary(record):
@@ -200,6 +228,7 @@ class RunManager:
     def list(self):
         with self.condition:
             self._refresh_other_runs()
+            self._prune()
             return [self._summary(record) for record in sorted(self.records.values(), key=lambda item: item["created_at"], reverse=True)]
 
     def get(self, run_id, after=0):
@@ -207,6 +236,7 @@ class RunManager:
             return None
         with self.condition:
             self._refresh_other_runs()
+            self._prune()
             record = self.records.get(run_id)
             if record is None:
                 return None
@@ -273,7 +303,7 @@ class RunManager:
                               and item.get("discovery_id") == payload["discovery_id"]), None)
             if duplicate:
                 return True, self._summary(duplicate)
-            if sum(item["status"] in ACTIVE for item in self.records.values()) >= MAX_RUNS:
+            if sum(item["status"] in ACTIVE for item in self.records.values()) >= MAX_QUEUED:
                 raise ValueError("订阅队列已满，请等待当前作品处理完成后再添加")
             record = {"id": uuid.uuid4().hex, "status": "queued", "trigger": trigger,
                       "task": payload["discovery_id"], "stage": "start", "source": "", "query": "",

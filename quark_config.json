@@ -1,4 +1,7 @@
 {
+  "run_history": {
+    "retention_days": 7
+  },
   "cookie": [
     "Your pan.quark.cn Cookie1, Only this one will do save task."
   ],

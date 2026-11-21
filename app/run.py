@@ -29,7 +29,7 @@ import re
 import threading
 import uuid
 
-from run_manager import RunManager, validate_payload
+from run_manager import RunManager, validate_payload, history_retention_days
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
@@ -380,10 +380,15 @@ def update():
         return jsonify({"success": False, "message": "未登录"})
     # 使用允许列表防止批量赋值攻击
     allowed_keys = ["cookie", "crontab", "push_config", "tasklist",
-                    "magic_regex", "plugins", "source", "auto_repair", "discovery"]
+                    "magic_regex", "plugins", "source", "auto_repair", "discovery", "run_history"]
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify(success=False, message="配置必须是 JSON 对象"), 400
+    if "run_history" in payload:
+        try:
+            history_retention_days(payload["run_history"])
+        except ValueError as error:
+            return jsonify(success=False, message=str(error)), 400
     if "auto_repair" in payload and not isinstance(payload["auto_repair"], bool):
         return jsonify(success=False, message="自动换源必须是开关值"), 400
     if "discovery" in payload and (not isinstance(payload["discovery"], dict)
@@ -946,6 +951,13 @@ def run_source_monitor():
         logging.warning("渠道巡检暂未完成 (%s)", type(error).__name__)
 
 
+def prune_run_history():
+    try:
+        get_run_manager().prune()
+    except (OSError, ValueError):
+        logging.warning("运行日志自动清理未完成，下次继续重试")
+
+
 # 重新加载任务
 def reload_tasks():
     crontab = config_data.get("crontab")
@@ -975,6 +987,10 @@ def reload_tasks():
             )
     elif monitor_job:
         scheduler.remove_job(SOURCE_MONITOR_JOB)
+    if not scheduler.get_job("run-history-cleanup"):
+        scheduler.add_job(prune_run_history, "interval", minutes=5,
+                          id="run-history-cleanup", max_instances=1, coalesce=True,
+                          misfire_grace_time=300)
     # 重载转存定时不会清除巡检任务，也不会推迟已经排好的下一次巡检。
     if scheduler.state == 0 and scheduler.get_jobs():
         scheduler.start()
@@ -1015,6 +1031,7 @@ def init():
         if not config_data.get("crontab"):
             config_data["crontab"] = "0 8,18,20 * * *"
         config_data.setdefault("auto_repair", True)
+        config_data.setdefault("run_history", {"retention_days": 7})
         config_data.setdefault("discovery", {"savepath": "/cartoon"})
         source = config_data.setdefault("source", {})
         source.setdefault("pansou", {"enable": True, "server": "https://so.252035.xyz"})

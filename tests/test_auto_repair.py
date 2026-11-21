@@ -250,7 +250,8 @@ class AutoRepairTests(unittest.TestCase):
         self.task["search_aliases"] = ["官方译名"]
         attempts = []
 
-        def search(query, config, refresh=False, failed_engines=None, health_path=None):
+        def search(query, config, refresh=False, failed_engines=None, health_path=None, include_archive=True):
+            self.assertFalse(include_archive)
             attempts.append(set(failed_engines))
             if not failed_engines:
                 failed_engines.add("Google")
@@ -334,6 +335,40 @@ class AutoRepairTests(unittest.TestCase):
         wrong["data"]["share"]["title"] = "另外一部剧 第二季 (2024)"
         with self.search([]), patch.object(self.account, "get_stoken", return_value=TOKEN), patch.object(self.account, "get_detail", return_value=wrong):
             self.assertFalse(self.account.find_valid_resource(self.task, {})["success"])
+
+    def test_archive_has_dedicated_verification_budget_and_continues_past_first_batch(self):
+        # Three anonymous web hits used to consume the entire shared allowance.
+        # The valid Telegram share is the 21st archived candidate.
+        self.web_search.return_value = {"success": True, "data": [self.candidate(f"web{i}") for i in range(3)]}
+        rows = [dict(self.candidate(f"archive{i:02d}"), source_type="telegram_web") for i in range(24)]
+        batches = [{"success": True, "data": rows[start:start + 6], "partial": True}
+                   for start in range(0, 24, 6)]
+        with patch("resource_search.search_telegram_resources", side_effect=batches) as archive, \
+                self.search([]) as index, \
+                patch.object(self.account, "get_stoken", side_effect=[EXPIRED] * 20 + [TOKEN]) as token, \
+                patch.object(self.account, "get_detail", return_value=FILES):
+            result = self.account.find_valid_resource(self.task, {"source": {"telegram_web": {"enable": True}}})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["candidate"]["shareurl"], rows[20]["shareurl"])
+        self.assertEqual(archive.call_count, 4)
+        self.assertTrue(all(call.kwargs["limit"] == 6 for call in archive.call_args_list))
+        self.assertEqual(token.call_count, 21)
+        index.assert_not_called()
+        self.web_search.assert_not_called()
+
+    def test_archive_wrong_media_is_rejected_and_other_sources_still_run(self):
+        wrong = copy.deepcopy(FILES)
+        wrong["data"]["share"]["title"] = "其他作品 (2024)"
+        archive_row = dict(self.candidate("archive01"), source_type="telegram_web")
+        with patch("resource_search.search_telegram_resources", return_value={
+                "success": True, "data": [archive_row], "partial": False}), \
+                self.search([self.candidate("validindex")]) as index, \
+                patch.object(self.account, "get_stoken", return_value=TOKEN), \
+                patch.object(self.account, "get_detail", side_effect=[wrong, FILES]):
+            result = self.account.find_valid_resource(self.task, {"source": {"telegram_web": {"enable": True}}})
+        self.assertTrue(result["success"])
+        self.assertIn("validindex", result["candidate"]["shareurl"])
+        index.assert_called()
 
     def test_web_fallback_retries_arabic_season_with_chinese_numeral(self):
         self.task.update(taskname="大理寺日志 第3季", resource_type="anime")

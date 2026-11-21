@@ -89,16 +89,42 @@ def _selection(value, label):
     return list(dict.fromkeys(item.lstrip("@") for item in value))
 
 
-def search_web_resources(query, config, refresh=False, failed_engines=None, health_path=None):
+def search_telegram_resources(query, config, health_path=None, limit=20, deadline=None):
+    from app.sdk.telegram_web import TelegramWeb
+
+    if str(((config.get("source") or {}).get("telegram_web") or {}).get("enable", False)).lower() != "true":
+        return {"success": True, "data": [], "errors": [], "partial": False, "message": ""}
+    report_progress("search", source="Telegram归档", query=query)
+    print(f"Telegram归档：正在搜索 {query}", flush=True)
+    try:
+        result = TelegramWeb(health_path).search(query, limit=limit, deadline=deadline)
+    except Exception:
+        result = {"success": False, "data": {"reason": "Telegram 归档查询暂不可用"}}
+    candidates = result.get("results") or []
+    data, progress = result.get("data") or {}, result.get("progress") or {}
+    print(f"Telegram归档：{data.get('archived_count', 0)} 个归档对话，"
+          f"已检查 {progress.get('current', 0)} 条消息，返回 {len(candidates)} 条夸克候选"
+          + ("；还有结果待继续查询" if result.get("partial") else ""), flush=True)
+    errors = []
+    # A full candidate batch is pagination, not a failed source.
+    if not result.get("success") or result.get("code"):
+        reason = data.get("reason") or "Telegram 归档查询未完成"
+        errors.append({"source": "Telegram归档", "message": reason})
+        print(f"Telegram归档：{reason}", flush=True)
+    return {"success": bool(result.get("success") or candidates), "data": candidates, "errors": errors,
+            "partial": bool(result.get("partial")), "code": result.get("code"),
+            "message": "；".join(error["message"] for error in errors)}
+
+
+def search_web_resources(query, config, refresh=False, failed_engines=None, health_path=None, include_archive=True):
     """查询公开网页与用户明确启用的 Telegram 归档对话。"""
     from app.sdk.channel_search import channel_queries
     from app.sdk.source_monitor import record_web_failures
-    from app.sdk.telegram_web import TelegramWeb
 
     sources = config.get("source") or {}
     source = sources.get("websearch") or {}
     channels = sources.get("channelsearch") or {}
-    archive_enabled = str((sources.get("telegram_web") or {}).get("enable", False)).lower() == "true"
+    archive_enabled = include_archive and str((sources.get("telegram_web") or {}).get("enable", False)).lower() == "true"
     if not _enabled(source) and not _enabled(channels) and not archive_enabled:
         return {"success": True, "data": [], "errors": [], "message": ""}
     if not isinstance(query, str) or not query.strip() or len(query) > 200:
@@ -116,7 +142,8 @@ def search_web_resources(query, config, refresh=False, failed_engines=None, heal
                                       include_engines=_enabled(source), **options)
             archive = None
             if archive_enabled and (failed_engines is None or "Telegram归档" not in failed_engines):
-                archive = executor.submit(TelegramWeb(health_path).search, query.strip(), limit=20, deadline=deadline)
+                archive = executor.submit(search_telegram_resources, query.strip(), config,
+                                          health_path=health_path, limit=20, deadline=deadline)
             if web is not None:
                 try:
                     entries.extend(web.result())
@@ -130,14 +157,15 @@ def search_web_resources(query, config, refresh=False, failed_engines=None, heal
                 try:
                     result = archive.result()
                 except Exception:
-                    result = {"success": False, "data": {"reason": "Telegram 归档查询暂不可用"}}
-                candidates = result.get("results") or []
-                entries.extend(candidates)
+                    result = {"success": False, "data": [], "errors": [
+                        {"source": "Telegram归档", "message": "Telegram 归档查询暂不可用"}]}
+                candidates = result.get("data") or []
+                # Manual search also keeps archive hits ahead of anonymous web results.
+                entries[0:0] = candidates
                 successful = successful or bool(result.get("success")) or bool(candidates)
-                if not result.get("success") or result.get("partial"):
-                    reason = (result.get("data") or {}).get("reason") or "归档查询未完成，将在下次运行继续"
-                    errors.append({"source": "Telegram归档", "message": reason})
-                    if not result.get("success") and failed_engines is not None:
+                if result.get("errors"):
+                    errors.extend(result["errors"])
+                    if failed_engines is not None:
                         failed_engines.add("Telegram归档")
     except (SearchError, ValueError) as error:
         errors.extend(_web_errors([error]))

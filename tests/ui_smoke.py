@@ -236,6 +236,14 @@ def main():
                 page.get_by_label("运行日志内容").filter(has_text="Aria2 已接收").wait_for()
                 saved = web.Config.read_json(web.CONFIG_PATH)
                 assert len(saved["tasklist"]) == 2 and "NEVER_SAVE" not in json.dumps(saved)
+                assert page.locator("#run-retention-days").input_value() == "7"
+                page.locator("#run-retention-days").fill("30")
+                with page.expect_response(lambda response: urlsplit(response.url).path == "/update") as retention:
+                    page.get_by_role("button", name="保存设置", exact=True).click()
+                assert retention.value.json()["success"]
+                page.wait_for_function("!app.configModified")
+                assert web.Config.read_json(web.CONFIG_PATH)["run_history"]["retention_days"] == 30
+                assert len(web.Config.read_json(web.CONFIG_PATH)["tasklist"]) == 2
                 page.screenshot(path=str(output / "runs-desktop.png"), full_page=True)
                 page.get_by_role("link", name="热门追更").click()
                 page.get_by_role("button", name="动漫", exact=True).click()

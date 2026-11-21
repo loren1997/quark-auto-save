@@ -1479,7 +1479,7 @@ class Quark:
         )
 
     def find_valid_resource(self, task, config, required_episodes=None, exclude_candidates=None):
-        from resource_search import search_resources, search_web_resources, search_error_reason
+        from resource_search import search_resources, search_web_resources, search_telegram_resources, search_error_reason
 
         title = task.get("taskname", "").strip()
         if not title:
@@ -1519,7 +1519,7 @@ class Quark:
         attempted, source_errors = [], []
         failed_sources = set()
         failed_web_engines = set()
-        index_deadline = time.monotonic() + 60
+        index_deadline = 0
         interrupted = False
 
         def record_error(source, message):
@@ -1541,7 +1541,7 @@ class Quark:
                 try:
                     # Reuse index caches; share validity is checked live below.
                     result = search_web_resources(query, config, refresh=False, failed_engines=failed_web_engines,
-                                                  health_path=self.search_health_path) if web else search_resources(
+                                                  health_path=self.search_health_path, include_archive=False) if web else search_resources(
                         query, config, refresh=False, include_web=False, failed_sources=failed_sources,
                         health_path=self.search_health_path
                     )
@@ -1599,6 +1599,44 @@ class Quark:
             # 网页通常收录整季帖子，先用片名找到合集，再在真实文件中筛选缺集。
             web_queries = list(dict.fromkeys(web_queries + focused))
         failures = [history_result] if history_result else []
+        if str(((config.get("source") or {}).get("telegram_web") or {}).get("enable", False)).lower() == "true":
+            archive_deadline = time.monotonic() + 75
+
+            def archive_candidates():
+                nonlocal interrupted
+                active_queries = list(web_queries)
+                # Each fetched batch fits the dedicated verification allowance;
+                # anonymous web candidates cannot consume the archive's slots.
+                for page in range(4):
+                    if not active_queries or time.monotonic() >= archive_deadline:
+                        interrupted = bool(active_queries)
+                        return
+                    query = active_queries.pop(0)
+                    attempted.append(("telegram", query))
+                    response = search_telegram_resources(query, config, health_path=self.search_health_path,
+                                                         limit=6, deadline=archive_deadline)
+                    for error in response.get("errors", []):
+                        record_error(error.get("source"), error.get("message"))
+                    yield from response.get("data", [])
+                    if response.get("partial") and response.get("success") and not response.get("code"):
+                        active_queries.append(query)
+                    if response.get("code") or not response.get("success"):
+                        break
+                if active_queries:
+                    interrupted = True
+                    print("Telegram归档：本轮分批验证已达上限，未读取的候选将在下次运行继续查询")
+
+            archive_result = self._find_verified_resource(
+                task, archive_candidates(), seen, aliases, visited=visited, max_checked=24,
+                verify_index_title=False, required_episodes=required_episodes, repair_context=repair_context)
+            if archive_result["success"]:
+                print("已从 Telegram归档 验证到可用分享")
+                return archive_result
+            failures.append(archive_result)
+            print("Telegram归档：本轮候选未通过夸克文件验证，继续查询其他来源")
+        else:
+            print("Telegram归档：未启用，跳过归档搜索")
+        index_deadline = time.monotonic() + 60
         for web, words in ((False, queries), (True, web_queries)):
             try:
                 result = self._find_verified_resource(task, search_candidates(words, web), seen, aliases,
@@ -1682,15 +1720,22 @@ class Quark:
                 continue
             visited.add(attempt_key)
             checked += 1
-            report_progress("verify", task=title, source="夸克分享", query=f"候选 {checked}")
+            candidate_source = "Telegram归档" if candidate.get("source_type") == "telegram_web" else "夸克分享"
+            report_progress("verify", task=title, source=candidate_source, query=f"候选 {checked}")
+            if candidate_source == "Telegram归档":
+                print(f"Telegram归档：验证候选 {checked} 的有效性、视频、片名、季度和年份")
             try:
                 token = self.get_stoken(pwd_id, passcode)
                 stoken = (token.get("data") or {}).get("stoken")
                 if token.get("status") != 200 or not stoken:
+                    if candidate_source == "Telegram归档":
+                        print("Telegram归档：跳过候选，分享失效、提取码不符或夸克暂不可访问")
                     continue
                 detail = self.get_detail(pwd_id, stoken, pdir_fid, _fetch_share=1, max_pages=3)
                 files = (detail.get("data") or {}).get("list", [])
                 if detail.get("code") != 0 or not listing_is_complete(detail) or not files:
+                    if candidate_source == "Telegram归档":
+                        print("Telegram归档：跳过候选，分享文件为空或文件列表读取未完成")
                     continue
                 directory_evidence = list(verified_path)
                 share = detail["data"].get("share")
@@ -1773,6 +1818,8 @@ class Quark:
                     continue
                 video_files = [item for item in files if is_video_file(item)]
                 if not video_files:
+                    if candidate_source == "Telegram归档":
+                        print("Telegram归档：跳过候选，未找到视频文件")
                     continue
                 evidence = directory_evidence + [item.get("file_name", "") for item in files
                                                   if item.get("dir") or is_video_file(item)]
@@ -1852,6 +1899,8 @@ class Quark:
                         repair_context["primary_verified"] = primary["success"]
                     supplement_without_year = repair_context["primary_verified"]
                 if not exact and not combined and not supplement_without_year and not post_identity:
+                    if candidate_source == "Telegram归档":
+                        print("Telegram归档：跳过候选，实际文件中的片名、季度或年份信息不足以确认匹配")
                     continue
                 # 历史保留验证入口，复查时才能重新取得祖先年份与作品目录；任务仍限定所选子目录。
                 Config.remember_resources(self.resource_history_path, [{"taskname": title, "shareurl": shareurl,

@@ -83,6 +83,19 @@ class TelegramArchiveSearchIntegrationTests(unittest.TestCase):
         self.assertNotIn("private-chat-name", str(result))
         self.assertNotIn("secret-session", str(result))
 
+    def test_full_archive_batch_is_not_reported_as_a_failed_source(self):
+        self.browser.search.return_value = {"success": True, "results": [self.candidate], "partial": True,
+                                           "data": {"archived_count": 28}, "progress": {"current": 154, "total": 784}}
+        failed = set()
+        result = search_web_resources("测试动画", self.config, failed_engines=failed)
+        self.assertEqual(result["errors"], [])
+        self.assertNotIn("Telegram归档", failed)
+        self.assertEqual(result["data"], [self.candidate])
+
+    def test_web_only_phase_does_not_search_archive_again(self):
+        search_web_resources("测试动画", self.config, include_archive=False)
+        self.browser.search.assert_not_called()
+
     def test_unavailable_browser_is_not_retried_for_every_alias_in_same_run(self):
         self.browser.search.return_value = {"success": False, "results": [],
                                            "data": {"reason": "需要连接 Telegram Web"}}

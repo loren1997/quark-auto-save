@@ -194,10 +194,14 @@ class SourceMonitorAppTests(unittest.TestCase):
         web.config_data["source"]["monitor"] = {"enable": False}
         web.reload_tasks()
         self.assertIsNone(scheduler.get_job(web.SOURCE_MONITOR_JOB))
+        cleanup = scheduler.get_job("run-history-cleanup")
+        self.assertEqual(cleanup.func, web.prune_run_history)
+        self.assertEqual(cleanup.trigger.interval.total_seconds(), 300)
         web.config_data["source"]["monitor"]["enable"] = True
         web.config_data["crontab"] = ""
         self.assertFalse(web.reload_tasks())
         self.assertIsNotNone(scheduler.get_job(web.SOURCE_MONITOR_JOB))
+        self.assertIs(scheduler.get_job("run-history-cleanup"), cleanup)
         self.maintain.assert_not_called()
 
     def test_update_saves_both_switches_and_keeps_custom_channels(self):
