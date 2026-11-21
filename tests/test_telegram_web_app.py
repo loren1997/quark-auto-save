@@ -108,13 +108,15 @@ class TelegramWebClientTests(unittest.TestCase):
              "source_type": "telegram_web", "peer_id": "private-id"},
             {"title": "无关链接", "url": "https://example.com", "source_type": "telegram_web"},
         ], partial=True, progress={"phase": "search", "current": 10, "total": 15, "cursor": "private-cursor"},
-            bot={"requests": 1, "links": 1, "pending": 0, "failed": 0, "payload": "private-start"}))
+            bot={"requests": 1, "links": 1, "pending": 0, "failed": 0, "payload": "private-start",
+                 "button_rejections": {"other_target": 5, "invalid_url": "private-url", "private-button": 1}}))
         returned = self.client.search("作品", limit=20, deadline=time.monotonic() + 10)
         self.assertEqual(returned["results"][0]["taskname"], "作品 第二集")
         self.assertEqual(returned["results"][0]["shareurl"], "https://pan.quark.cn/s/abcdef123456")
         self.assertEqual(len(returned["results"]), 1)
         self.assertTrue(returned["partial"])
-        self.assertEqual(returned["bot"], {"requests": 1, "links": 1, "pending": 0, "failed": 0, "channel_posts": 0, "buttons": 0, "channel_archived": 0, "details_read": 0, "details_failed": 0, "button_count": 0})
+        self.assertEqual(returned["bot"], {"requests": 1, "links": 1, "pending": 0, "failed": 0, "channel_posts": 0, "buttons": 0, "channel_archived": 0, "details_read": 0, "details_failed": 0, "button_count": 0,
+                                         "button_rejections": {"other_target": 5}})
         self.assertNotIn("private-", json.dumps(returned))
         call = self.http.request.call_args
         self.assertEqual(call.args[1], "http://telegram-web:8765/search")

@@ -102,7 +102,7 @@ def check_resource_button(page):
       const bot={_: 'user',id:42,access_hash:'fixture-bot',username:'Oscar4KBot',pFlags:{bot:true}};
       const botPeer={_: 'peerUser',user_id:42};
       const post={_: 'message',id:12,peer_id:peer,date:1,message:'一念永恒 第4季',reply_markup:{rows:[{buttons:[
-        {_: 'keyboardButtonUrl',text:'获取资源',url:'tg://resolve?domain=Oscar4KBot&start=get59171'}]}]}};
+        {_: 'keyboardButtonUrl',text:'📥 获取資源',url:'https://telegram.me/Oscar4KBot/?start=get59171&utm_source=channel#resource'}]}]}};
       window.calls=[];
       window.rootScope={myId:777,managers:{apiManager:{invokeApi:async(method,params)=>{
         window.calls.push(method);

@@ -574,6 +574,54 @@ replyOverride=()=>++polls===1?[reply(102,'正在获取')]:[reply(102,'#作品',{
 const result=await run();assert.equal(polls,2);assert.equal(starts,1);assert.equal(result.results.length,1);
 """)
 
+    def test_equivalent_telegram_links_do_not_depend_on_button_wording(self):
+        self.run_bot_bridge(r"""
+const urls=[
+ 'tg://resolve?domain=Oscar4KBot&start=get59171',
+ 'tg:resolve?domain=Oscar4KBot&start=get59171',
+ 'tg://resolve/?domain=Oscar4KBot&start=get59171',
+ 'https://t.me/Oscar4KBot/?start=get59171',
+ 'https://telegram.me/Oscar4KBot?start=get59171',
+ 'http://telegram.dog/Oscar4KBot?start=get59171',
+ 't.me/Oscar4KBot?start=get59171',
+ 'https://Oscar4KBot.t.me/?start=get59171',
+ 'https://t.me/%4fscar4KBot?utm_source=channel&start=get59171#resource'];
+for(const url of urls){
+ delete window.__qasArchiveReadState;
+ post.reply_markup.rows[0].buttons[0]={_: 'keyboardButtonUrl',text:'📥 获取資源',url};
+ const before=starts,result=await run();
+ assert.equal(starts,before+1,url);assert.equal(result.results.length,1,url);
+ assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
+}
+""")
+
+    def test_channel_buttons_are_resolved_top_to_bottom_before_stale_global_links(self):
+        self.run_bot_bridge(r"""
+channel.title='奥斯卡4K蓝光(精品)影视磁力站';
+const payloads=['get59171','get59172','get59173'];
+posts=payloads.map((payload,i)=>({...post,id:12-i,reply_markup:{rows:[{buttons:[{
+ _: 'keyboardButtonUrl',text:'获取资源',url:'https://t.me/Oscar4KBot/?start='+payload}]}]}}));
+const original=response,validate=validateBotCall;let current;
+global.validateBotCall=(method,params)=>{
+ if(method==='messages.startBot')assert.equal(params.start_param,payloads[starts]);
+ else validate(method,params);
+};
+global.response=async(method,params)=>{
+ if(method==='messages.search')return {_: 'messages.channelMessages',messages:posts,chats:[channel]};
+ if(method==='messages.searchGlobal')return {_: 'messages.messages',messages:[message(peers[2],1,'作品 https://pan.quark.cn/s/STALE0111111')],chats:[channel]};
+ if(method==='messages.startBot')current=params.start_param.slice(3);
+ return original(method,params);
+};
+replyOverride=()=>[reply(102,'#作品 https://pan.quark.cn/s/NEW000'+current)];
+for(let i=0;i<3;i++){
+ const result=await run('作品',6);
+ assert.equal(starts,i+1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000'+payloads[i].slice(3));
+ assert.equal(result.results[0].source_url,'https://t.me/publicchannel/'+(12-i));
+ if(i<2){assert.equal(result.results.length,1);assert.equal(result.partial,true);
+  assert.ok(!calls.some(c=>c.method==='messages.searchGlobal'));}
+}
+""")
+
     def test_oscar_ignores_old_unrelated_and_forged_replies(self):
         self.run_bot_bridge(r"""
 replyOverride=()=>[
@@ -591,13 +639,22 @@ const urls=[
  'tg://resolve?domain=OtherBot&start=get59171','tg://resolve?domain=Oscar4KBot&start=pay59171',
  'tg://resolve?domain=Oscar4KBot&start=get59171&start=other',
  'tg://resolve?domain=Oscar4KBot&start=get59171&admin=1',
+ 'tg://resolve?domain=Oscar4KBot&domain=OtherBot&start=get59171',
  'https://t.me@evil.example/Oscar4KBot?start=get59171',
- 'https://t.me/Oscar4KBot?start=get59171#extra'];
+ 'https://t.me/Oscar4KBot?start=get59171&startapp=other',
+ 'https://t.me/Oscar4KBot?start=get59171&startgroup=get59171',
+ 'https://t.me/Oscar4KBot?start=get59171%0A',
+ 'https://t.me/Oscar4KBot/extra?start=get59171',
+ 'https://t.me.evil.example/Oscar4KBot?start=get59171',
+ 'https://Oscar4KBot.t.me.evil.example/?start=get59171',
+ 'https://t.me:8443/Oscar4KBot?start=get59171',
+ 'not-a-url'];
 posts=urls.map((url,i)=>({...post,id:i+1,reply_markup:{rows:[{buttons:[{_: 'keyboardButtonUrl',text:'获取资源',url}]}]}}));
 posts.push({...post,peer_id:{_: 'peerChannel',channel_id:99}});
 posts.push({...post,id:88,reply_markup:{rows:[{buttons:[{_: 'keyboardButtonCallback',text:'获取资源',data:'NO'}]}]}});
 const result=await run();assert.equal(starts,0);assert.equal(result.results.length,0);
 assert.ok(!calls.some(c=>c.method==='contacts.resolveUsername'));
+assert.deepEqual(result.bot.button_rejections,{other_target:5,invalid_payload:2,other_action:4,invalid_url:3,not_url:1});
 """)
 
     def test_non_bot_resolution_preserves_direct_candidates_and_reports_failure(self):

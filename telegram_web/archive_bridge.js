@@ -40,7 +40,7 @@ async ({query, limit, timeout}) => {
   let botPeer, activeJob, detailRequest;
   let botChecked = false;
   const bot = {requests: 0, links: 0, pending: 0, failed: 0, channel_posts: 0, buttons: 0, channel_archived: 0,
-    details_read: 0, details_failed: 0, button_count: 0};
+    details_read: 0, details_failed: 0, button_count: 0, button_rejections: {}};
   const isOscarChannel = entity => entity.input._ === 'inputPeerChannel' && (
     [entity.username, ...(entity.usernames || [])].some(name => name?.toLowerCase() === 'oscar_4kmovies')
     || /奥斯卡.*(?:4k|蓝光).*(?:影视|磁力)/i.test(String(entity.title || '').normalize('NFKC')));
@@ -145,26 +145,34 @@ async ({query, limit, timeout}) => {
       if (entity.publicMessages && /^[a-zA-Z][a-zA-Z0-9_]{4,31}$/.test(entity.username || '') && Number.isInteger(post.id) && post.id > 0) {
         candidate.source_url = `https://t.me/${entity.username}/${post.id}`;
       }
-      const item = {peerKey: key(post.peer_id), candidate};
+      const item = {peerKey: key(post.peer_id), candidate, priority};
       if (priority) { search.pending.unshift(item); bot.links++; }
       else search.pending.push(item);
     }
   }
   function resourcePayload(button) {
-    const label = String(button.text || '').normalize('NFKC').replace(/[\s\u200b-\u200f\ufeff]/g, '');
-    if (button._ !== 'keyboardButtonUrl' || !/(获取资源|獲取資源)/.test(label)) return;
+    const reject = reason => { bot.button_rejections[reason] = (bot.button_rejections[reason] || 0) + 1; };
+    if (button._ !== 'keyboardButtonUrl' || typeof button.url !== 'string') return reject('not_url');
     try {
-      const url = new URL(button.url);
-      if (url.username || url.password || url.port || url.hash) return;
-      const tg = url.protocol === 'tg:' && url.hostname === 'resolve' && !url.pathname
-        && url.searchParams.get('domain')?.toLowerCase() === 'oscar4kbot';
-      const web = url.protocol === 'https:' && url.hostname === 't.me' && url.pathname.toLowerCase() === '/oscar4kbot';
-      if (!tg && !web) return;
-      const keys = [...url.searchParams.keys()];
-      if (new Set(keys).size !== keys.length || keys.some(k => k !== 'start' && !(tg && k === 'domain'))) return;
+      // Telegram accepts equivalent deep links; the bot and resource ID authorize the action, not its label.
+      let raw = button.url.trim().replace(/^tg:(?:\/\/)?resolve\/?\?/i, 'tg://resolve?');
+      if (/^(?:t\.me|telegram\.me|telegram\.dog|oscar4kbot\.t\.me)\//i.test(raw)) raw = 'https://' + raw;
+      const url = new URL(raw);
+      if (url.username || url.password || url.port) return reject('invalid_url');
+      const path = decodeURIComponent(url.pathname).toLowerCase();
+      const tg = url.protocol === 'tg:' && url.hostname === 'resolve' && !path
+        && url.searchParams.getAll('domain').length === 1 && url.searchParams.get('domain').toLowerCase() === 'oscar4kbot';
+      const web = ['http:', 'https:'].includes(url.protocol) && (
+        ['t.me', 'telegram.me', 'telegram.dog'].includes(url.hostname) && /^\/oscar4kbot\/?$/.test(path)
+        || url.hostname === 'oscar4kbot.t.me' && path === '/');
+      if (!tg && !web) return reject('other_target');
+      if (url.searchParams.getAll('start').length !== 1 || !tg && url.searchParams.has('domain')
+        || ['startgroup', 'startchannel', 'startapp', 'game', 'appname', 'attach', 'choose', 'admin', 'text', 'profile']
+          .some(key => url.searchParams.has(key))) return reject('other_action');
       const payload = url.searchParams.get('start');
-      if (/^get[0-9]{1,20}$/.test(payload || '')) return payload;
-    } catch (_) { /* An unsupported button is not an executable action. */ }
+      if (/^get[0-9]{1,20}$/.exec(payload)?.[0] === payload) return payload;
+      return reject('invalid_payload');
+    } catch (_) { return reject('invalid_url'); }
   }
   async function resolveResourceButton() {
     if (botChecked || !search.botPending.length || until - Date.now() < 1000) return;
@@ -306,6 +314,8 @@ async ({query, limit, timeout}) => {
     }
     const drain = () => {
       while (search.pending.length && results.length < limit) {
+        // Finish resource buttons in search order before stale direct links consume the verification budget.
+        if (search.botPending.length && !search.pending[0].priority) break;
         const item = search.pending.shift();
         if (archive.peers.has(item.peerKey)) results.push(item.candidate);
       }
@@ -332,7 +342,7 @@ async ({query, limit, timeout}) => {
     }
     await resolveResourceButton();
     drain();
-    while (!search.exhausted && results.length < limit && archive.peers.size) {
+    while (!search.exhausted && !search.botPending.length && results.length < limit && archive.peers.size) {
       const response = await invoke('messages.searchGlobal', {folder_id: 1, q: query,
         filter: {_: 'inputMessagesFilterEmpty'}, min_date: 0, max_date: 0,
         offset_rate: search.rate, offset_peer: search.peer, offset_id: search.id, limit: 100});

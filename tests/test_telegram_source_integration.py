@@ -119,13 +119,15 @@ class TelegramArchiveSearchIntegrationTests(unittest.TestCase):
 
     def test_message_details_failure_is_reported_without_exposing_channel_text(self):
         self.browser.search.return_value.update(bot={"channel_archived": 1, "channel_posts": 9,
-                                                   "details_read": 8, "details_failed": 1, "button_count": 3, "buttons": 1})
+                                                   "details_read": 8, "details_failed": 1, "button_count": 3, "buttons": 1,
+                                                   "button_rejections": {"other_target": 1, "invalid_payload": 1}})
         with patch("resource_search.print") as log:
             result = search_telegram_resources("测试动画", self.config)
         text = "\n".join(call.args[0] for call in log.call_args_list)
         self.assertIn("奥斯卡资源频道在归档中", text)
         self.assertIn("补读 8 条详情", text)
         self.assertIn("读取 3 个按钮", text)
+        self.assertIn("其他目标 1，资源编号不支持 1", text)
         self.assertIn("详情未读完整", text)
         self.assertEqual(result["errors"][0]["source"], "Telegram归档消息详情")
 

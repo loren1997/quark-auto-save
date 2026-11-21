@@ -123,6 +123,12 @@ def search_telegram_resources(query, config, health_path=None, limit=20, deadlin
         print(f"Telegram归档资源按钮：{channel_state}；本批定向查询 {bot.get('channel_posts', 0)} 条帖子，补读 {bot.get('details_read', 0)} 条详情，读取 {bot.get('button_count', 0)} 个按钮，识别 {bot.get('buttons', 0)} 个资源按钮；Oscar4KBot 请求 {bot.get('requests', 0)} 次，"
               f"新增 {bot.get('links', 0)} 条夸克候选，待获取 {bot.get('pending', 0)} 项，"
               f"未取得可关联资源回复 {bot.get('failed', 0)} 项", flush=True)
+        rejected = bot.get("button_rejections") or {}
+        reasons = [("not_url", "非链接按钮"), ("invalid_url", "链接格式不支持"), ("other_target", "其他目标"),
+                   ("other_action", "非资源获取操作"), ("invalid_payload", "资源编号不支持")]
+        summary = "，".join(f"{label} {rejected[key]}" for key, label in reasons if rejected.get(key))
+        if summary:
+            print(f"Telegram归档按钮筛选：{summary}", flush=True)
         if bot.get("failed"):
             errors.append({"source": "Telegram归档资源按钮", "message": "Oscar4KBot 暂不可用或未返回可关联的夸克资源，稍后自动重试"})
         if bot.get("details_failed"):

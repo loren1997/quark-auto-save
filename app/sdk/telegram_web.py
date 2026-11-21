@@ -116,6 +116,10 @@ def _safe_result(result, action):
         bot = result.get("bot")
         if isinstance(bot, dict):
             clean["bot"] = {key: _number(bot.get(key)) for key in ("requests", "links", "pending", "failed", "channel_posts", "buttons", "channel_archived", "details_read", "details_failed", "button_count")}
+            rejected = bot.get("button_rejections")
+            if isinstance(rejected, dict):
+                clean["bot"]["button_rejections"] = {key: _number(rejected.get(key)) for key in
+                    ("not_url", "invalid_url", "other_target", "other_action", "invalid_payload") if _number(rejected.get(key))}
         progress = result.get("progress")
         if isinstance(progress, dict) and progress.get("phase") in ("archives", "search", "complete"):
             clean["progress"] = {"phase": progress["phase"], "current": _number(progress.get("current")),
