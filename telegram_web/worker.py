@@ -7,6 +7,7 @@ the six actions below, never arbitrary browser URLs, selectors or JavaScript.
 import base64
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 import importlib.util
+import json
 import os
 import queue
 import re
@@ -34,6 +35,8 @@ REASONS = {
     "STALE_ATTEMPT": "登录页面已更新，请使用当前二维码",
     "INVALID_INPUT": "请求参数不正确",
     "PASSWORD_FAILED": "两步验证未完成，请检查密码后重试",
+    "PASSWORD_PENDING": "Telegram 正在验证两步验证密码，请稍候",
+    "LOGIN_FORM_UNAVAILABLE": "Telegram 登录密码框暂不可用，请稍后重试",
     "AUTH_REQUIRED": "Telegram Web 登录已失效，请重新扫码",
     "BRIDGE_UNAVAILABLE": "Telegram 官方网页接口已变化，已停止读取",
     "PAGINATION_FAILED": "归档列表分页未完成，将保留进度继续查询",
@@ -44,15 +47,17 @@ REASONS = {
     "ERROR": "Telegram Web 暂时不可用，请稍后重试",
 }
 QR_SELECTOR = '[class*="pageSignQR"] canvas, .page-signQR canvas, .page-signQR .qr-container canvas'
-PASSWORD_SELECTOR = '[class*="pagePassword"] input[type="password"], .page-password input[type="password"]'
+PASSWORD_SELECTOR = (':is([class*="pagePassword"], .page-password) '
+                     'input:is([type="password"], [name="notsearch_password"])'
+                     ':not(.stealthy):not([aria-hidden="true"])')
 AUTH_STATE = """() => {
   if (location.origin !== 'https://web.telegram.org' || location.pathname !== '/k/') return 'unavailable';
   if (window.rootScope?.myId && window.rootScope?.managers?.apiManager?.invokeApi) return 'authorized';
   const visible = e => !!(e && e.getClientRects().length);
-  if ([...document.querySelectorAll('[class*="pagePassword"] input[type="password"], .page-password input[type="password"]')].some(visible)) return 'waiting_password';
+  if ([...document.querySelectorAll(__PASSWORD_SELECTOR__)].some(visible)) return 'waiting_password';
   if ([...document.querySelectorAll('[class*="pageSignQR"] canvas, .page-signQR canvas')].some(visible)) return 'waiting_qr';
   return 'starting';
-}"""
+}""".replace("__PASSWORD_SELECTOR__", json.dumps(PASSWORD_SELECTOR))
 
 
 class TelegramWebWorker:
@@ -316,25 +321,36 @@ class TelegramWebWorker:
             return self._result(False, "STALE_ATTEMPT")
         field = self._page.locator(PASSWORD_SELECTOR).filter(visible=True)
         if field.count() != 1:
-            return self._result(False, "BRIDGE_UNAVAILABLE")
+            return self._result(False, "LOGIN_FORM_UNAVAILABLE")
+        if not field.is_enabled():
+            return self._result(True, "PASSWORD_PENDING", attempt_id=self._attempt)
+        input_handle = field.element_handle(timeout=3000)
         try:
             field.fill(password, timeout=3000)
             # Only the official password input receives this keystroke, never the
             # desktop keyboard or a chat composer.
             field.press("Enter", timeout=3000)
             try:
-                self._page.wait_for_function("""() => !!window.rootScope?.myId ||
-                  !!document.querySelector('[class*="pagePassword"] input.error, .page-password input.error')""", timeout=5000)
+                self._page.wait_for_function("""selector => !!window.rootScope?.myId ||
+                  [...document.querySelectorAll(selector)].some(input => input.classList.contains('error'))""",
+                                             arg=PASSWORD_SELECTOR, timeout=5000)
             except Exception:
                 pass
             self._refresh_state()
             if self._state == "waiting_password" and "error" in (field.get_attribute("class") or "").split():
                 return self._result(False, "PASSWORD_FAILED")
+            if self._state == "waiting_password":
+                return self._result(True, "PASSWORD_PENDING", attempt_id=self._attempt)
             return self._result(attempt_id=self._attempt)
         finally:
             password = None
-            if field.count() and field.is_visible():
-                field.fill("", timeout=1500)
+            # WebK disables/hides the input during submission; clear that exact
+            # element without another keystroke, even after its card is detached.
+            if input_handle:
+                try:
+                    input_handle.evaluate("input => { input.value = ''; }")
+                finally:
+                    input_handle.dispose()
 
     def _logout(self, payload):
         self._attempt = None

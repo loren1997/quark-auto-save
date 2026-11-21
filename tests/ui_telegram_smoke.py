@@ -59,6 +59,9 @@ def main():
         def poll(self, id):
             calls.append(("poll", {"id": id}))
             assert id == attempt
+            if control["phase"] == "authorized":
+                state.update(state="authorized", authorized=True, reason="")
+                return response()
             if control["phase"] == "password":
                 state.update(state="waiting_password", reason="请输入两步验证密码（模拟）")
                 return response(attempt_id=attempt)
@@ -72,8 +75,8 @@ def main():
             if password != secret:
                 state.update(reason="两步验证密码错误（模拟）")
                 return response(success=False, attempt_id=attempt)
-            state.update(state="authorized", authorized=True, reason="")
-            return response()
+            state.update(reason="Telegram 正在验证两步验证密码，请稍候")
+            return response(code="PASSWORD_PENDING", attempt_id=attempt)
 
         def logout(self):
             calls.append(("logout", {}))
@@ -157,8 +160,18 @@ def main():
                 assert page.locator("#telegram-password").input_value() == ""
                 assert page.get_by_role("alert").filter(has_text="两步验证密码错误").is_visible()
                 assert page.evaluate("app.telegramAttemptId") == attempt
+                with page.expect_response(lambda reply: urlsplit(reply.url).path == "/api/telegram/web/poll"):
+                    page.wait_for_timeout(2300)
+                page.wait_for_function("!app.telegramBusy")
+                assert page.get_by_role("alert").filter(has_text="两步验证密码错误").is_visible()
                 page.locator("#telegram-password").fill(secret)
-                authorized = action("#telegram-submit-password", "/api/telegram/web/password")
+                pending = action("#telegram-submit-password", "/api/telegram/web/password")
+                assert pending["success"] and pending["data"]["state"] == "waiting_password"
+                assert page.locator("#telegram-password").input_value() == ""
+                with page.expect_response(lambda reply: urlsplit(reply.url).path == "/api/telegram/web/poll") as verified:
+                    control["phase"] = "authorized"
+                authorized = verified.value.json()
+                page.wait_for_function("app.telegramStatus.authorized && !app.telegramBusy")
                 assert authorized["data"]["authorized"]
                 assert page.locator("#telegram-account-enabled").is_checked()
                 assert page.evaluate("app.telegramAttemptId") is None
@@ -209,7 +222,7 @@ def main():
                 assert not errors, errors
                 browser.close()
             print("Telegram Web UI smoke passed: status never starts browser; QR refresh; no polling away; "
-                  "2FA failure/success and cleared password; archive-only toggle; logout; revision conflict "
+                  "2FA error survives polling, delayed success and cleared password; archive-only toggle; logout; revision conflict "
                   "preserves worker task and edits; legacy session untouched; no secrets in config/console; mobile; no JS errors")
         finally:
             server.shutdown()

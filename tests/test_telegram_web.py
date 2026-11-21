@@ -23,6 +23,18 @@ class FakeLocator:
     def is_visible(self):
         return True
 
+    def is_enabled(self):
+        return not getattr(self.page, "password_disabled", False)
+
+    def element_handle(self, **kwargs):
+        return self
+
+    def evaluate(self, source):
+        self.page.fills.append("")
+
+    def dispose(self):
+        pass
+
     def screenshot(self, **kwargs):
         return b"\x89PNG\r\n\x1a\nfixture"
 
@@ -142,6 +154,16 @@ class TelegramWebWorkerTests(unittest.TestCase):
         self.assertEqual(self.page.presses, ["Enter"])
         self.assertEqual(self.page.fills, ["fixture secret", ""])
         self.assertNotIn("fixture secret", json.dumps(result))
+
+    def test_password_still_being_verified_is_not_submitted_twice(self):
+        attempt = self.start()["attempt_id"]
+        self.page.state = "waiting_password"
+        self.page.password_disabled = True
+        result = self.worker.submit("password", {"id": attempt, "password": "fixture secret"})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["code"], "PASSWORD_PENDING")
+        self.assertEqual(self.page.fills, [])
+        self.assertEqual(self.page.presses, [])
 
     def test_login_expires_and_old_attempt_cannot_revive(self):
         attempt = self.start()["attempt_id"]

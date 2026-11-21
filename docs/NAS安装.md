@@ -2,7 +2,7 @@
 
 本版在原项目基础上维护，保留上游许可证和插件。默认工作方式是：NAS 上运行订阅服务，定时将夸克分享转存到自己的夸克网盘。需要 NAS 本地文件时，可启用已有 Aria2 插件。
 
-V3.12 将 Telegram 连接简化为扫码，并新增账号自动发现频道及可选自动订阅。首次配置 API ID/API Hash 后可以复用，无需每次填手机号和验证码；开启 Telegram 两步验证时仍需密码。
+V3.13.1 修复 Telegram Web 两步验证误报“官方网页接口已变化”。当前使用独立网页会话扫码连接，无需 API ID/API Hash，仅搜索已归档对话，不再自动加入频道。
 
 V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再后台更新；定时换源、补集及待查找重试遵守任务运行星期，手动运行单个任务仍立即执行。
 
@@ -27,7 +27,7 @@ V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再�
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.12 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13) 中的 `quark-auto-save-nas-docker-v3.13.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.13.1 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.1) 中的 `quark-auto-save-nas-docker-v3.13.1.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 
 ```sh
@@ -199,16 +199,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.13：先下载并检查新配置、拉取镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅和端口，不影响原作者版本。
+以下从旧维护版更新至 V3.13.1：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.1/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.13-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.13.1-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"

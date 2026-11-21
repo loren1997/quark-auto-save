@@ -1021,7 +1021,7 @@
           if (!document.hidden) {
             this.refreshRuns();
             if (this.activeTab === 'discovery' && this.calendar.refreshing) this.loadDiscovery();
-            if (this.activeTab === 'config' && this.telegramAttemptId && ['starting', 'waiting_qr'].includes(this.telegramStatus?.state) && Date.now() >= this.telegramQrNextPoll) this.pollTelegramQr();
+            if (this.activeTab === 'config' && this.telegramAttemptId && ['starting', 'waiting_qr', 'waiting_password'].includes(this.telegramStatus?.state) && Date.now() >= this.telegramQrNextPoll) this.pollTelegramQr();
           }
         }, 2000);
         this.checkNewVersion();
@@ -1045,11 +1045,12 @@
         async telegramRequest(method, url, data, syncEnabled = false) {
           if (this.telegramBusy) return;
           this.telegramBusy = true;
-          this.telegramError = '';
+          if (url !== '/api/telegram/web/poll') this.telegramError = '';
           try {
             const response = await axios({ method, url, data });
             const result = response.data;
             if (result.data) this.telegramStatus = result.data;
+            if (result.data?.authorized) this.telegramError = '';
             if (result.attempt_id) this.telegramAttemptId = result.attempt_id;
             if (result.qr && result.data?.state === 'waiting_qr') this.telegramQr = result.qr;
             if (result.data && result.data.state !== 'waiting_qr') this.telegramQr = null;
