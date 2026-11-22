@@ -128,7 +128,7 @@ class IndexCatalog:
                 break
             started = time.time()
             try:
-                results = client.search('庆余年', plugins=[row['name']], refresh=True, timeout=(3, 10))
+                results = client.search('庆余年', plugins=[row['name']], refresh=True, timeout=(3, 10), wait_for_index=False)
                 self.record(row['name'], hits=len(results), started=started)
             except SearchError as error:
                 from resource_search import search_error_reason

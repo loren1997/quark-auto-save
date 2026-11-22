@@ -172,15 +172,19 @@ class IndexCatalogTests(unittest.TestCase):
             self.assertEqual(probe_index_search.main(), 2)
         self.client.search.assert_not_called()
 
-    def test_readonly_probe_waits_once_for_cold_index_without_refresh_loop(self):
+    def test_readonly_probe_verifies_with_the_same_description_policy(self):
         from scripts import probe_index_search
-        self.client.search.side_effect = [[], [{'channel': 'plugin:pansearch'}]]
+        output = io.StringIO()
+        def verify(*args, **kwargs):
+            self.assertIs(kwargs['description_only'], True)
+            print('夸克拒绝访问 private-secret')
+            return {'success': False, 'candidate': {'stoken': 'private-secret'}}
         with patch.object(probe_index_search, 'PanSou', return_value=self.client), \
-                patch.object(probe_index_search.time, 'sleep') as wait, \
-                patch('sys.argv', ['probe_index_search.py', '作品']), contextlib.redirect_stdout(io.StringIO()):
+                patch('quark_auto_save.Quark._find_verified_resource', side_effect=verify), \
+                patch('sys.argv', ['probe_index_search.py', '作品', '--verify']), contextlib.redirect_stdout(output):
             self.assertEqual(probe_index_search.main(), 0)
-        wait.assert_called_once_with(12)
-        self.assertEqual([call.kwargs['refresh'] for call in self.client.search.call_args_list], [True, False])
+        self.assertNotIn('private-secret', output.getvalue())
+        self.assertEqual(json.loads(output.getvalue().splitlines()[-1])['rejections'], {'夸克拒绝访问': 1})
 
 
 if __name__ == '__main__':

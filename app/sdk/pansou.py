@@ -1,5 +1,6 @@
 import json
 import re
+import time
 
 import requests
 
@@ -36,7 +37,15 @@ class PanSou:
         except (requests.RequestException, ValueError) as error:
             raise SearchError(f'插件目录读取失败 ({type(error).__name__})') from error
 
-    def search(self, keyword: str, refresh: bool = False, channels=None, plugins=None, timeout=(5, 25)) -> list:
+    def search(self, keyword: str, refresh: bool = False, channels=None, plugins=None, timeout=(5, 25), wait_for_index=True) -> list:
+        rows = self._search_once(keyword, refresh, channels, plugins, timeout)
+        # A cold PanSou search can return empty while its adapters populate the cache.
+        if not rows and wait_for_index:
+            time.sleep(12)
+            rows = self._search_once(keyword, False, channels, plugins, (3, min(timeout[1], 10)))
+        return rows
+
+    def _search_once(self, keyword, refresh, channels, plugins, timeout):
         """搜索资源
 
         Args:

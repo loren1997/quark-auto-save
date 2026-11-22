@@ -24,6 +24,11 @@ def entry(url=URL, title="测试作品", date=""):
 
 
 class SearchAdapterTests(unittest.TestCase):
+    def setUp(self):
+        wait = patch('app.sdk.pansou.time.sleep')
+        self.wait = wait.start()
+        self.addCleanup(wait.stop)
+
     def pansou(self, payload):
         client = PanSou("https://search.example/")
         client.session = Mock()
@@ -45,8 +50,31 @@ class SearchAdapterTests(unittest.TestCase):
                 self.assertEqual(call.kwargs["timeout"], (5, 25))
 
     def test_empty_results_are_successful(self):
-        self.assertEqual(self.pansou({"merged_by_type": {}}).search("不存在"), [])
-        self.assertEqual(self.pansou({"total": 0}).search("不存在"), [])
+        for payload in ({"merged_by_type": {}}, {"total": 0}):
+            client = self.pansou(payload)
+            self.assertEqual(client.search("不存在"), [])
+            self.assertEqual(client.session.post.call_count, 2)
+
+    def test_cold_index_is_read_once_more_without_restarting_refresh(self):
+        client = self.pansou({})
+        client.session.post.return_value.json.side_effect = [
+            {'total': 0}, {'merged_by_type': {'quark': [{'url': URL, 'note': '作品'}]}}]
+        self.assertEqual(client.search('作品', refresh=True, plugins=['pansearch'])[0]['shareurl'], URL)
+        self.wait.assert_called_once_with(12)
+        calls = client.session.post.call_args_list
+        self.assertEqual([call.kwargs['json']['refresh'] for call in calls], [True, False])
+        self.assertTrue(all(call.kwargs['json']['plugins'] == ['pansearch'] for call in calls))
+        self.assertEqual(calls[1].kwargs['timeout'], (3, 10))
+
+    def test_index_monitor_skips_wait_and_errors_never_enter_empty_retry(self):
+        client = self.pansou({'total': 0})
+        self.assertEqual(client.search('作品', wait_for_index=False), [])
+        client.session.post.assert_called_once()
+        self.wait.assert_not_called()
+        client.session.post.side_effect = requests.ReadTimeout()
+        with self.assertRaises(SearchError):
+            client.search('作品')
+        self.wait.assert_not_called()
 
     def test_all_channels_and_raw_text_are_requested_and_parsed(self):
         payload = {"results": [{"title": "作品", "content": f"{URL} 提取码: ab12\nhttps://pan.quark.cn/s/def456 密码: cd34", "channel": "tg:anime"}]}

@@ -39,21 +39,24 @@ def main():
         if not names:
             raise SearchError('PanSou 没有已启用且可查询的插件')
         rows = client.search(args.query, plugins=names, refresh=True)
-        if not rows:
-            print(json.dumps({'initial_candidates': 0, 'notice': '等待后台索引后读取一次缓存'}, ensure_ascii=False), flush=True)
-            time.sleep(12)
-            rows = client.search(args.query, plugins=names, refresh=False)
         counts = Counter(row.get('channel') if re.fullmatch(r'plugin:[a-z0-9_-]{1,64}', str(row.get('channel') or ''))
                          else 'unknown' for row in rows)
         print(json.dumps({'query': args.query, 'candidates': len(rows),
                           'by_plugin': dict(counts),
                           'seconds': round(time.monotonic() - started, 1)}, ensure_ascii=False), flush=True)
         if args.verify:
-            with contextlib.redirect_stdout(io.StringIO()):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
                 from quark_auto_save import Quark
                 result = Quark('')._find_verified_resource(
-                    {'taskname': args.query}, rows, set(), [], max_checked=3, verify_index_title=False)
+                    {'taskname': args.query}, rows, set(), [], max_checked=3, description_only=True)
+            reasons = ('分享已明确取消、过期或不存在', '提取码缺失或不正确', '夸克登录或认证失败',
+                       '夸克限流或访问验证', '夸克拒绝访问', '夸克网络请求失败', '夸克服务暂不可用',
+                       '分享内未找到视频文件', '目录读取未完成或达到扫描上限')
             print(json.dumps({'video_share_verified': bool(result['success']),
+                              'validation_limited': bool(result.get('validation_limited')),
+                              'rejections': {reason: captured.getvalue().count(reason) for reason in reasons
+                                             if reason in captured.getvalue()},
                               'notice': '仅验证前三个候选；未转存或下载'}, ensure_ascii=False), flush=True)
         return 0
     except SearchError as error:
