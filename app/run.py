@@ -621,7 +621,7 @@ def subscribe_discovery_payload(payload):
     if not valid_discovery_path(base):
         return jsonify(success=False, message="热门订阅保存路径必须是以 / 开头的夸克网盘目录"), 400
     base = base.rstrip("/") or "/"
-    auto_download = settings.get("auto_download", False)
+    auto_download = settings.get("auto_download", True)
     if auto_download and not aria2_download_configured(current):
         return jsonify(success=False, message="请先启用并配置 Aria2 插件的地址、密钥和下载目录"), 400
     cookies = current.get("cookie") or []
@@ -639,8 +639,9 @@ def subscribe_discovery_payload(payload):
     })
     apply_media_rename_defaults(task)
     task["addition"].setdefault("aria2", {})["save_path"] = base.strip("/")
+    task["addition"]["aria2"]["auto_download"] = auto_download
     if auto_download:
-        task["addition"].setdefault("aria2", {}).update(auto_download=True, download_subdir=True)
+        task["addition"]["aria2"]["download_subdir"] = True
     account = Quark(cookie)
     account.resource_history_path = Config.resource_history_path(CONFIG_PATH)
     account.search_health_path = Config.search_health_path(CONFIG_PATH)
@@ -918,7 +919,8 @@ def add_task():
                 400,
             )
     if not request_data.get("addition"):
-        request_data["addition"] = task_plugins_config_default
+        request_data["addition"] = deepcopy(task_plugins_config_default)
+    request_data["addition"].setdefault("aria2", {}).setdefault("auto_download", True)
     # 添加任务
     with Config.locked(CONFIG_PATH):
         config_data = Config.read_json(CONFIG_PATH)

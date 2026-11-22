@@ -36,7 +36,8 @@
   "tasklist": [],
   "auto_repair": true,
   "discovery": {
-    "savepath": "/cartoon"
+    "savepath": "/cartoon",
+    "auto_download": true
   },
   "source": {
     "monitor": {

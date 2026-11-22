@@ -483,6 +483,8 @@ class BackgroundRunApiTests(RunFixture):
 class DiscoveryWorkerTests(RunFixture):
     def setUp(self):
         super().setUp()
+        self.config["discovery"] = {"savepath": "/cartoon", "auto_download": False}
+        self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         from scripts import subscribe_and_run
         self.worker = subscribe_and_run
         self.calendar = {"days": [{"anime": [{"id": "bangumi:42", "title": "测试作品", "search_title": "测试作品", "year": 2026}]}]}

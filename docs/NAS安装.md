@@ -2,7 +2,7 @@
 
 本版在原项目基础上维护，保留上游许可证和插件。默认工作方式是：NAS 上运行订阅服务，定时将夸克分享转存到自己的夸克网盘。需要 NAS 本地文件时，可启用已有 Aria2 插件。
 
-V3.13.11 修复多作品 Telegram 合集候选污染、机器人资源时间丢失、搜索框刷新及跨来源时间排序；升级必须同时更新主程序和 Telegram Web 两个镜像。
+V3.13.12 将所有任务的 `auto_download` 默认设为开启，升级首次启动时一次性开启已有任务及待查找订阅；此后手动关闭的任务会保留关闭设置。本次升级不启用历史补下载，已转存的视频不会因此重新入队；原有失败重试和用户明确设置的补下载继续生效。Aria2 仍需配置并保持可用。升级包同时更新主程序和 Telegram Web 两个镜像，并包含 V3.13.11 的资源搜索修复。
 
 手动运行会先重新搜索最新有效链接，无论原链接是否失效，也不受自动换源开关限制。搜索跳过历史资源的优先复用，重新查询索引及网页，Telegram 从最新帖子开始查找；本轮候选按来源提供的发布时间由新到旧验证，未标注时间的候选排在后面。找到后更新链接并运行，未找到或查询失败则保留原链接继续处理；原链接也失效时跳过转存。保持命名、保存路径和下载设置；同一链接被重新找到时保留文件起始边界。开启删除子目录重存的任务继续禁止自动替换链接，避免删除风险。
 
@@ -35,7 +35,7 @@ V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再�
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.13.11 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.11) 中的 `quark-auto-save-nas-docker-v3.13.11.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.13.12 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.12) 中的 `quark-auto-save-nas-docker-v3.13.12.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 
 ```sh
@@ -187,8 +187,8 @@ V3.7 已在新的公开分享中匿名读到《黑暗召唤师在地下恋爱中
 
 1. 系统配置 → 插件 → aria2，填写 `host_port`（如 `http://NAS局域网IP:6800`）、`secret` 和 `dir`。
 2. `dir` 是 **Aria2 进程看到的下载根目录**，默认填写 `/downloads`。热门任务的 `save_path` 为 `cartoon`，所以文件直接下载到 `/downloads/cartoon`，不再追加剧名或来源子目录。NAS 上的实际位置由 Aria2 容器的目录挂载决定。
-3. 开启“热门订阅通过 Aria2 下载到 NAS”并保存。仅填写 RPC 连接参数不会启用下载。
-4. 保存后，新旧热门订阅都会启用下载；刚启用的旧任务会在下一次运行时补交符合条件的视频。默认不下载字幕，需要时将该任务 `addition.aria2.download_subtitles` 设为 `true`。到“任务列表”运行原任务即可，无需删除文件或重新订阅。
+3. 从 V3.13.12 起，新建任务和“热门订阅通过 Aria2 下载到 NAS”默认开启下载；已有任务及待查找订阅首次升级时也会一次性开启。之后可按需关闭单个任务，其他任务及后续新任务不受影响。
+4. 本次升级只改变自动下载开关，不补交历史视频。后续新转存的视频会提交 Aria2。默认不下载字幕，需要时将该任务 `addition.aria2.download_subtitles` 设为 `true`。若之后主动将热门订阅总开关从关闭改为开启，仍保留既有的旧任务补交行为；已手动下载历史文件的用户不需要反复切换该开关。
 5. 日志出现 `Aria2已提交` 和 `GID` 表示下载器已受理；实际进度、完成情况和磁盘路径在 Aria2 查看。RPC 未连接、任务未开启、请求被拒绝会分别提示。
 
 无法提交的文件及未扫描成功的子目录会保留到下次运行重试，即使没有新转存也会重试；不保存临时下载直链或 Cookie。普通手动任务仍使用自己的 `addition.aria2` 设置：开启 `auto_download`，需扫描旧子目录时开启 `download_subdir`，下载仍平铺到目标目录；要补交历史文件，可将 `download_existing` 设为 `true`，完成扫描后自动关闭。共享目录补交只选择能按当前任务标准命名规则确认归属的文件；不认领其他剧集或纯集号文件。重命名失败的文件保留待办，成功更名后才提交下载。显式再次补交会重新提交目录中的允许文件，适用于此前尚未下载的任务。
@@ -209,13 +209,13 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.13.11：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
+以下从旧维护版更新至 V3.13.12：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.11/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.12/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
 backup="backup-v3.13.11-$(date +%Y%m%d-%H%M%S)"

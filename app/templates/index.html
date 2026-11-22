@@ -1318,6 +1318,7 @@
               config_data = response.data.data
               if (config_data.auto_repair === undefined) config_data.auto_repair = true;
               if (!config_data.discovery) config_data.discovery = { savepath: '/cartoon' };
+              if (config_data.discovery.auto_download === undefined) config_data.discovery.auto_download = true;
               // cookie兼容
               if (typeof config_data.cookie === 'string')
                 config_data.cookie = [config_data.cookie];
@@ -1444,7 +1445,7 @@
             this.$delete(this.formData.push_config, key);
         },
         addTask() {
-          newTask = { ...this.newTask }
+          const newTask = JSON.parse(JSON.stringify(this.newTask));
           newTask.taskname = this.taskNameFilter;
           if (this.formData.tasklist.length > 0) {
             lastTask = this.formData.tasklist[this.formData.tasklist.length - 1];

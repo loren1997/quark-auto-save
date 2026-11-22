@@ -23,7 +23,7 @@ class AppIntegrationTests(unittest.TestCase):
         self.config = {
             "webui": {"username": "test", "password": "test-only"},
             "cookie": ["fake-cookie"], "tasklist": [], "crontab": "0 8 * * *",
-            "discovery": {"savepath": "/cartoon"}, "auto_repair": True,
+            "discovery": {"savepath": "/cartoon", "auto_download": False}, "auto_repair": True,
         }
         self.entry = {"id": "bangumi:42", "title": "测试动漫 第二季",
                       "search_title": "测试动漫 第二季", "year": 2024}
@@ -139,8 +139,12 @@ class AppIntegrationTests(unittest.TestCase):
                 self.assertEqual(saved["plugins"]["aria2"]["dir"], "/downloads" if local_path == "/Downloads" else local_path)
                 self.assertEqual(saved["tasklist"][0]["savepath"], "/cartoon")
                 self.assertEqual(saved["tasklist"][0]["addition"]["aria2"]["save_path"], "cartoon")
+                self.assertNotIn("download_existing", saved["tasklist"][0]["addition"]["aria2"])
                 self.assertEqual(saved["tasklist"][0]["replace"], "{TASKNAME} S02E{EXX}.{EXT}")
-                self.assertEqual(saved["tasklist"][1:], [manual, custom])
+                self.assertEqual(saved["tasklist"][1:], [
+                    {**manual, "addition": {"aria2": {"auto_download": True}}},
+                    {**custom, "addition": {"aria2": {"save_path": "自定义下载", "auto_download": True}}},
+                ])
 
     def test_new_routes_and_search_require_login(self):
         with self.client.session_transaction() as session:
@@ -346,7 +350,7 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(task["taskname"], "测试动漫 第二季 (2024)")
         self.assertEqual(task["savepath"], "/cartoon")
         self.assertEqual(task["runweek"], list(range(1, 8)))
-        self.assertEqual(task["addition"], {"testplugin": {"enabled": False}, "aria2": {"save_path": "cartoon"}})
+        self.assertEqual(task["addition"], {"testplugin": {"enabled": False}, "aria2": {"save_path": "cartoon", "auto_download": False}})
         self.assertNotIn("auto_repair", task)
         for key in ("stoken", "passcode", "pwd_id", "pdir_fid", "cookie"):
             self.assertNotIn(key, task)
@@ -702,6 +706,42 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(web.task_plugins_config_default["aria2"], {"auto_download": False, "download_subdir": False})
         self.assertNotIn("fake-rpc-secret", response.get_data(as_text=True))
         self.assertEqual(self.saved_config()["tasklist"][0], response.json["data"])
+
+    def test_new_subscription_defaults_on_and_explicit_off_overrides_plugin_default(self):
+        self.config["discovery"].pop("auto_download")
+        self.config["plugins"] = {"aria2": {"host_port": "localhost:6800", "secret": "fixture", "dir": "/downloads"}}
+        web.task_plugins_config_default["aria2"] = {"auto_download": True}
+        self.write_config()
+        self.assertTrue(self.subscribe().json["data"]["addition"]["aria2"]["auto_download"])
+        self.config["discovery"]["auto_download"] = False
+        self.write_config()
+        self.assertFalse(self.subscribe().json["data"]["addition"]["aria2"]["auto_download"])
+
+    def test_api_task_defaults_on_without_overriding_explicit_off(self):
+        defaults = copy.deepcopy(web.task_plugins_config_default)
+        for addition in (None, {"aria2": {"save_path": "cartoon"}}, {"aria2": {"auto_download": False}}):
+            task = {"taskname": "测试", "shareurl": "https://pan.quark.cn/s/fixture123", "savepath": "/cartoon"}
+            if addition is not None:
+                task["addition"] = addition
+            response = self.client.post("/api/add_task", json=task)
+            self.assertTrue(response.json["success"])
+            expected = addition is None or addition.get("aria2", {}).get("auto_download", True)
+            self.assertEqual(response.json["data"]["addition"]["aria2"]["auto_download"], expected)
+        self.assertEqual(web.task_plugins_config_default, defaults)
+
+    def test_startup_persists_upgrade_and_later_disabled_tasks_stay_disabled(self):
+        self.config["tasklist"] = [{"taskname": "测试", "addition": {"aria2": {"auto_download": False}}}]
+        self.write_config()
+        with patch.object(web.Config, "load_plugins", return_value=({}, {}, {})):
+            web.init()
+            current = self.saved_config()
+            self.assertTrue(current["tasklist"][0]["addition"]["aria2"]["auto_download"])
+            self.assertNotIn("download_existing", current["tasklist"][0]["addition"]["aria2"])
+            self.assertTrue(current["discovery"]["auto_download"])
+            current["tasklist"][0]["addition"]["aria2"]["auto_download"] = False
+            web.Config.write_json(self.config_path, current)
+            web.init()
+            self.assertFalse(self.saved_config()["tasklist"][0]["addition"]["aria2"]["auto_download"])
 
     def test_update_enables_existing_popular_tasks_and_preserves_other_settings(self):
         for previous_global in (False, True):

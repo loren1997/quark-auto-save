@@ -14,7 +14,7 @@ class Aria2:
         "dir": "/downloads",  # 下载目录，需要Aria2有权限访问
     }
     default_task_config = {
-        "auto_download": False,  # 是否自动添加下载任务
+        "auto_download": True,  # 默认自动添加下载任务，可逐任务关闭
         "download_existing": False,  # 下次运行时补交保存目录内的文件，完成扫描后自动关闭
         "download_subdir": False,  # 是否递归下载子目录和文件
         "download_subtitles": False,  # 默认只下载视频；开启后同时下载字幕
@@ -100,7 +100,7 @@ class Aria2:
                 pending.pop(fid)
         if not pending:
             task.pop("aria2_pending", None)
-        if not task_config.get("auto_download"):
+        if not task_config.get("auto_download", self.default_task_config["auto_download"]):
             if kwargs.get("tree"):
                 print("Aria2下载: 此任务未开启 auto_download；仅转存到网盘")
             return

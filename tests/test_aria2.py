@@ -49,6 +49,23 @@ class Aria2Tests(unittest.TestCase):
         self.assertIn("GID: accepted-gid", self.output.getvalue())
         self.assertNotIn("PRIVATE_COOKIE", self.output.getvalue())
 
+    def test_missing_auto_download_defaults_on_including_partial_options(self):
+        self.assertTrue(Aria2.default_task_config["auto_download"])
+        for options in ({}, {"save_path": "cartoon"}):
+            self.task["addition"]["aria2"] = options
+            self.plugin.add_uri.reset_mock()
+            self.plugin.run(self.task, account=self.account, tree=self.tree)
+            self.plugin.add_uri.assert_called_once()
+
+    def test_enabling_default_does_not_scan_or_submit_old_files_without_new_transfer(self):
+        self.task["addition"]["aria2"]["auto_download"] = False
+        qas.Config.breaking_change_update({"tasklist": [self.task]})
+        self.assertTrue(self.task["addition"]["aria2"]["auto_download"])
+        self.plugin.run(self.task, account=self.account, tree=False)
+        self.account.ls_dir.assert_not_called()
+        self.account.download.assert_not_called()
+        self.plugin.add_uri.assert_not_called()
+
     def test_new_tree_only_submits_videos_by_default(self):
         for index, name in enumerate(("02.MP4", "02.zh.SRT", "poster.jpg", "广告.html",
                                       "电影.nfo", "资源.zip", "video.mp4.exe")):
@@ -327,6 +344,27 @@ class Aria2Tests(unittest.TestCase):
         self.assertNotIn("PRIVATE_RPC", self.output.getvalue())
         self.assertNotIn("PRIVATE_COOKIE", self.output.getvalue())
         self.assertIn("saved-01", self.task["aria2_pending"])
+
+
+class DownloadDefaultsMigrationTests(unittest.TestCase):
+    def test_upgrade_enables_all_existing_and_pending_tasks_once(self):
+        configured = {"auto_download": False, "save_path": "cartoon", "pause": True, "download_subtitles": False}
+        data = {"discovery": {"savepath": "/cartoon", "auto_download": False},
+                "tasklist": [{"addition": {"aria2": copy.deepcopy(configured)}}, {},
+                             {"addition": {"aria2": {"auto_download": True}}}],
+                "pending_subscriptions": [{"task": {"addition": {"aria2": {"auto_download": False}}}}]}
+        qas.Config.breaking_change_update(data)
+        self.assertTrue(data["discovery"]["auto_download"])
+        self.assertEqual(data["tasklist"][0]["addition"]["aria2"],
+                         {**configured, "auto_download": True})
+        self.assertNotIn("download_existing", data["tasklist"][1]["addition"]["aria2"])
+        self.assertNotIn("download_existing", data["tasklist"][2]["addition"]["aria2"])
+        self.assertEqual(data["pending_subscriptions"][0]["task"]["addition"]["aria2"], {"auto_download": True})
+        data["tasklist"][0]["addition"]["aria2"]["auto_download"] = False
+        data["discovery"]["auto_download"] = False
+        after = copy.deepcopy(data)
+        qas.Config.breaking_change_update(data)
+        self.assertEqual(data, after)
 
 
 if __name__ == "__main__":

@@ -708,6 +708,14 @@ class Config:
             if "$TASKNAME" in task.get("replace", ""):
                 task["replace"] = task["replace"].replace("$TASKNAME", "{TASKNAME}")
             apply_media_rename_defaults(task)
+        # One-time opt-in, without requesting backfill; later explicit opt-outs survive restarts.
+        if config_data.get("download_defaults_version", 0) < 1:
+            if isinstance(discovery, dict):
+                discovery["auto_download"] = True
+            pending = [item["task"] for item in config_data.get("pending_subscriptions", [])]
+            for task in config_data.get("tasklist", []) + pending:
+                task.setdefault("addition", {}).setdefault("aria2", {})["auto_download"] = True
+            config_data["download_defaults_version"] = 1
 
 
 class MagicRename:
@@ -2852,9 +2860,13 @@ def main():
             return
     else:
         print(f"⚙️ 正从 {config_path} 文件中读取配置")
-        CONFIG_DATA = Config.read_json(config_path)
-        original_config = deepcopy(CONFIG_DATA)
-        Config.breaking_change_update(CONFIG_DATA)
+        with Config.locked(config_path):
+            CONFIG_DATA = Config.read_json(config_path)
+            original_config = deepcopy(CONFIG_DATA)
+            Config.breaking_change_update(CONFIG_DATA)
+            if original_config.get("download_defaults_version") != CONFIG_DATA.get("download_defaults_version"):
+                Config.write_json(config_path, CONFIG_DATA)
+                original_config = deepcopy(CONFIG_DATA)
         cookie_val = CONFIG_DATA.get("cookie")
         cookie_form_file = True
     # 获取cookie

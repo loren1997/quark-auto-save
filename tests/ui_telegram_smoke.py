@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT))
 import run as web
+from plugins.aria2 import Aria2
 
 
 def png(color):
@@ -94,7 +95,7 @@ def main():
         config.setdefault("source", {}).update(telegram_web={"enable": False}, telegram={"enable": True, "auto_join": False})
         web.Config.write_json(web.CONFIG_PATH, config)
         web.config_data = copy.deepcopy(config)
-        web.task_plugins_config_default = {}
+        web.task_plugins_config_default = {"aria2": copy.deepcopy(Aria2.default_task_config)}
         health = Path(web.Config.search_health_path(web.CONFIG_PATH))
         legacy = health.with_name("." + health.name + ".telegram.json")
         legacy.write_text("private-legacy-session", encoding="utf-8")
@@ -127,6 +128,12 @@ def main():
                 page.wait_for_function("typeof app !== 'undefined' && app.formData.config_revision && app.telegramStatus && !app.telegramBusy")
                 page.locator("a.nav-link").filter(has_text="系统配置").click()
                 assert calls == [("status", {})], "mount must not start the NAS browser"
+                page.evaluate("app.addTask()")
+                assert page.evaluate("app.formData.tasklist[0].addition.aria2.auto_download") is True
+                page.evaluate("app.formData.tasklist[0].addition.aria2.auto_download=false; app.addTask()")
+                assert page.evaluate("app.formData.tasklist[1].addition.aria2.auto_download") is True
+                assert page.evaluate("app.newTask.addition.aria2.auto_download") is True
+                page.evaluate("app.formData.tasklist=[]")
                 for old in ("telegram-api-id", "telegram-api-hash", "telegram-phone", "telegram-mode-code", "telegram-auto-join"):
                     assert page.locator("#" + old).count() == 0
 
@@ -224,6 +231,7 @@ def main():
             print("Telegram Web UI smoke passed: status never starts browser; QR refresh; no polling away; "
                   "2FA error survives polling, delayed success and cleared password; archive-only toggle; logout; revision conflict "
                   "preserves worker task and edits; legacy session untouched; no secrets in config/console; mobile; no JS errors")
+            print("Task download defaults: new tasks enabled; disabling one task does not affect later tasks")
         finally:
             server.shutdown()
             worker.join(timeout=5)
