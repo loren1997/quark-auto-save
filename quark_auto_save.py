@@ -22,6 +22,7 @@ import html
 import unicodedata
 import tempfile
 import threading
+from itertools import islice
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
@@ -1543,13 +1544,13 @@ class Quark:
             max_checked=1, verify_index_title=False,
         )
 
-    def find_valid_resource(self, task, config, required_episodes=None, exclude_candidates=None):
-        from resource_search import search_resources, search_web_resources, search_telegram_resources, search_error_reason
+    def find_valid_resource(self, task, config, required_episodes=None, exclude_candidates=None, latest=False):
+        from resource_search import search_resources, search_web_resources, search_telegram_resources, search_error_reason, candidate_timestamp
 
         title = task.get("taskname", "").strip()
         if not title:
             return {"success": False, "candidate": None, "code": "no_results", "error": "缺少资源名称"}
-        report_progress("search", task=title, source="历史资源记录", query=title)
+        report_progress("search", task=title, source="最新资源查询" if latest else "历史资源记录", query=title)
         aliases = task.get("search_aliases", [])
         aliases = list(dict.fromkeys(alias.strip() for alias in aliases
                                     if isinstance(alias, str) and alias.strip() and len(alias) <= 200))[:8] if isinstance(aliases, list) else []
@@ -1559,6 +1560,8 @@ class Quark:
             entry.get("from_id") for entry in task.get("repair_history", [])
             if isinstance(entry, dict)
         }
+        if latest:
+            seen = set()  # A freshly indexed current/previous share may still be the newest valid result.
         visited = set(exclude_candidates or ())
         repair_context = {}
         history = [item for item in Config.resource_history(self.resource_history_path)
@@ -1574,13 +1577,14 @@ class Quark:
             aliases = list(dict.fromkeys(aliases))[:8]
             task = dict(task, search_aliases=aliases)
             queries = _resource_search_queries(title, aliases)
-            history_result = self._find_verified_resource(
-                task, history, seen, aliases, visited=visited, required_episodes=required_episodes,
-                repair_context=repair_context, description_only=True,
-            )
-            if history_result["success"]:
-                print("已从本地资源记录重新验证到可用分享")
-                return history_result
+            if not latest:
+                history_result = self._find_verified_resource(
+                    task, history, seen, aliases, visited=visited, required_episodes=required_episodes,
+                    repair_context=repair_context, description_only=True,
+                )
+                if history_result["success"]:
+                    print("已从本地资源记录重新验证到可用分享")
+                    return history_result
         attempted, source_errors = [], []
         failed_sources = set()
         failed_web_engines = set()
@@ -1604,10 +1608,9 @@ class Quark:
                 attempted.append(("web" if web else "index", query))
                 report_progress("search", task=title, source="网页搜索" if web else "网盘索引", query=query)
                 try:
-                    # Reuse index caches; share validity is checked live below.
-                    result = search_web_resources(query, config, refresh=False, failed_engines=failed_web_engines,
+                    result = search_web_resources(query, config, refresh=latest, failed_engines=failed_web_engines,
                                                   health_path=self.search_health_path, include_archive=False) if web else search_resources(
-                        query, config, refresh=False, include_web=False, failed_sources=failed_sources,
+                        query, config, refresh=latest, include_web=False, failed_sources=failed_sources,
                         health_path=self.search_health_path
                     )
                 except (requests.RequestException, ValueError, TypeError) as exc:
@@ -1664,12 +1667,14 @@ class Quark:
             # 网页通常收录整季帖子，先用片名找到合集，再在真实文件中筛选缺集。
             web_queries = list(dict.fromkeys(web_queries + focused))
         failures = [history_result] if history_result else []
+        latest_candidates = []
         if str(((config.get("source") or {}).get("telegram_web") or {}).get("enable", False)).lower() == "true":
             archive_deadline = time.monotonic() + 75
 
             def archive_candidates():
                 nonlocal interrupted
                 active_queries = list(web_queries)
+                refreshed_queries = set()
                 checked_start = len(visited)
                 # Filtered introductions do not consume the 24-share verification allowance.
                 for page in range(40):
@@ -1684,14 +1689,19 @@ class Quark:
                     query = active_queries.pop(0)
                     attempted.append(("telegram", query))
                     response = search_telegram_resources(query, config, health_path=self.search_health_path,
-                                                         limit=min(6, allowance), deadline=archive_deadline)
+                                                         limit=min(6, allowance), deadline=archive_deadline,
+                                                         **({"refresh": True} if latest and query not in refreshed_queries else {}))
+                    refreshed_queries.add(query)
                     for error in response.get("errors", []):
                         record_error(error.get("source"), error.get("message"))
                     rows = response.get("data", [])
                     matched = sum(isinstance(row, dict) and resource_description_matches(task, row, aliases) for row in rows)
                     checked_before = len(visited)
                     yield from rows
-                    print(f"Telegram归档：本批介绍匹配 {matched}/{len(rows)} 条，新增校验 {len(visited) - checked_before} 条分享；重复或已排除的候选不重复校验")
+                    if latest:
+                        print(f"Telegram归档：本批介绍匹配 {matched}/{len(rows)} 条，汇总后按发布时间由新到旧验证")
+                    else:
+                        print(f"Telegram归档：本批介绍匹配 {matched}/{len(rows)} 条，新增校验 {len(visited) - checked_before} 条分享；重复或已排除的候选不重复校验")
                     if response.get("partial") and response.get("success") and not response.get("code"):
                         active_queries.append(query)
                     if response.get("code") or not response.get("success"):
@@ -1700,20 +1710,26 @@ class Quark:
                     interrupted = True
                     print("Telegram归档：本轮候选筛选达到 40 批，未读取的候选将在下次运行继续查询")
 
-            archive_result = self._find_verified_resource(
-                task, archive_candidates(), seen, aliases, visited=visited, max_checked=24,
-                verify_index_title=False, required_episodes=required_episodes, repair_context=repair_context,
-                description_only=True)
-            if archive_result["success"]:
-                print("已从 Telegram归档 验证到可用分享")
-                return archive_result
-            failures.append(archive_result)
-            print("Telegram归档：本轮候选未通过夸克文件验证，继续查询其他来源")
+            if latest:
+                latest_candidates.extend(islice(archive_candidates(), 60))
+            else:
+                archive_result = self._find_verified_resource(
+                    task, archive_candidates(), seen, aliases, visited=visited, max_checked=24,
+                    verify_index_title=False, required_episodes=required_episodes, repair_context=repair_context,
+                    description_only=True)
+                if archive_result["success"]:
+                    print("已从 Telegram归档 验证到可用分享")
+                    return archive_result
+                failures.append(archive_result)
+                print("Telegram归档：本轮候选未通过夸克文件验证，继续查询其他来源")
         else:
             print("Telegram归档：未启用，跳过归档搜索")
         index_deadline = time.monotonic() + 60
         for web, words in ((False, queries), (True, web_queries)):
             try:
+                if latest:
+                    latest_candidates.extend(search_candidates(words, web))
+                    continue
                 result = self._find_verified_resource(task, search_candidates(words, web), seen, aliases,
                                                       visited=visited, max_checked=(8 if web else 12) if required_episodes else (3 if web else 5),
                                                       verify_index_title=not web, required_episodes=required_episodes,
@@ -1727,6 +1743,15 @@ class Quark:
             failures.append(result)
             if not web:
                 print("索引未找到可验证资源，继续查询网页来源")
+        if latest:
+            latest_candidates.sort(key=candidate_timestamp, reverse=True)
+            print(f"手动运行：已获取 {len(latest_candidates)} 条候选，按来源发布时间由新到旧验证；未标注时间的候选排在后面")
+            result = self._find_verified_resource(
+                task, latest_candidates, seen, aliases, visited=visited, max_checked=32,
+                required_episodes=required_episodes, repair_context=repair_context, description_only=True)
+            if result["success"]:
+                return result
+            failures.append(result)
         result = next((result for result in failures if result["code"] == "no_match"),
                       next((result for result in failures if result["code"] == "unavailable"), failures[0]))
         result["queries"] = list(dict.fromkeys(query for _, query in attempted))
@@ -2113,8 +2138,8 @@ class Quark:
                 "未找到经夸克视频文件验证的同名、同季、同年份资源，请尝试其他译名或手动选择链接" if found_results
                 else "已查询的来源未返回该名称的夸克资源，请尝试其他译名或手动搜索"}
 
-    def repair_share(self, task, reason="分享已失效"):
-        if not task.get("auto_repair", CONFIG_DATA.get("auto_repair", True)):
+    def repair_share(self, task, reason="分享已失效", latest=False):
+        if not latest and not task.get("auto_repair", CONFIG_DATA.get("auto_repair", True)):
             return None
         if not task_is_due(task):
             print(f"《{task['taskname']}》待换源：未到任务运行日或已过截止日期，保留原链接和任务设置")
@@ -2123,11 +2148,21 @@ class Quark:
             print("自动换源已跳过：此任务开启了删除子目录后重存，请手工检查新资源")
             return None
         print(f"🔎《{task['taskname']}》{reason}，查找同名同季资源")
-        result = self.find_valid_resource(task, CONFIG_DATA)
+        try:
+            result = self.find_valid_resource(task, CONFIG_DATA, **({"latest": True} if latest else {}))
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            if not latest:
+                raise
+            print(f"手动运行：最新资源查询暂不可用，保留原链接（{type(exc).__name__}）")
+            return None
         if not result["success"]:
-            print(f"自动换源未完成：{result['error']}")
+            print(f"手动运行：未找到最新有效链接，保留原链接；{result['error']}" if latest else f"自动换源未完成：{result['error']}")
             return None
         candidate = result["candidate"]
+        if latest and self.extract_url(task["shareurl"])[:3] == self.extract_url(candidate["shareurl"])[:3]:
+            task.pop("shareurl_ban", None)
+            print("手动运行：最新搜索结果仍为原分享，已重新验证有效，继续运行")
+            return candidate
         old_id = self.extract_url(task["shareurl"])[0]
         task["shareurl"] = candidate["shareurl"]
         task.pop("shareurl_ban", None)
@@ -2276,17 +2311,18 @@ class Quark:
         except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
             print(f"补集暂未完成（{type(exc).__name__}）；保留原订阅和已有文件")
 
-    def do_save_task(self, task):
+    def do_save_task(self, task, latest=False):
         if not task_is_due(task):
             print("任务不在运行周期内，跳过；失效分享将在任务运行日复查并自动换源")
             return
-        report_progress("verify", task=task.get("taskname", ""), source="当前分享")
         apply_media_rename_defaults(task)
+        replacement = self.repair_share(task, reason="手动运行，查找最新有效资源", latest=True) if latest else None
+        report_progress("verify", task=task.get("taskname", ""), source="搜索结果" if replacement else "当前分享")
         # Recheck historical bans: older versions also banned temporary login errors.
-        repaired = False
+        repaired = latest
         pwd_id, passcode, pdir_fid, _ = self.extract_url(task["shareurl"])
         try:
-            token = self.get_stoken(pwd_id, passcode)
+            token = {"status": 200, "data": {"stoken": replacement["stoken"]}} if replacement else self.get_stoken(pwd_id, passcode)
         except (requests.RequestException, ValueError) as exc:
             print(f"跳过任务：分享验证暂不可用（{type(exc).__name__}）")
             return
@@ -2297,7 +2333,7 @@ class Quark:
                 if task.get("shareurl_ban") != message:
                     add_notify(f"❌《{task['taskname']}》：{message}\n")
                 task["shareurl_ban"] = message
-                replacement = self.repair_share(task)
+                replacement = None if latest else self.repair_share(task)
                 if not replacement:
                     return
                 pwd_id, pdir_fid, stoken = (
@@ -2672,7 +2708,7 @@ def retry_pending_subscriptions(account, config_path):
     return promoted
 
 
-def do_save(account, tasklist=[]):
+def do_save(account, tasklist=[], latest=False):
     print(f"🧩 载入插件")
     plugins, CONFIG_DATA["plugins"], task_plugins_config = Config.load_plugins(
         CONFIG_DATA.get("plugins", {})
@@ -2714,7 +2750,7 @@ def do_save(account, tasklist=[]):
         if not task_is_due(task):
             print("任务不在运行周期内，跳过" + ("；已失效分享待换源，等待任务运行日" if task.get("shareurl_ban") else ""))
         else:
-            is_new_tree = account.do_save_task(task)
+            is_new_tree = account.do_save_task(task, **({"latest": True} if latest else {}))
 
             # 补充任务的插件配置
             def merge_dicts(a, b):
@@ -2849,7 +2885,7 @@ def main():
         # 任务列表
         if tasklist_from_env:
             originals = deepcopy(tasklist_from_env)
-            do_save(accounts[0], tasklist_from_env)
+            do_save(accounts[0], tasklist_from_env, **({"latest": True} if os.environ.get("QAS_MANUAL_RUN") == "1" else {}))
             for original, updated in zip(originals, tasklist_from_env):
                 Config.merge_task_state(CONFIG_DATA, original, updated)
         else:
@@ -2861,7 +2897,7 @@ def main():
             latest_cookies = Config.get_cookies(CONFIG_DATA.get("cookie")) or []
             if (latest_cookies and isinstance(latest_cookies[0], str)
                     and latest_cookies[0].strip() == cookies[0].strip()):
-                do_save(accounts[0], CONFIG_DATA.get("tasklist", []))
+                do_save(accounts[0], CONFIG_DATA.get("tasklist", []), **({"latest": True} if os.environ.get("QAS_MANUAL_RUN") == "1" else {}))
             else:
                 print("运行期间 Cookie 已修改，本轮停止转存，下次运行将重新验证账号")
         print()

@@ -110,6 +110,7 @@ def _safe_result(result, action):
                 "taskname": row["title"][:200], "shareurl": shareurl, "source": "Telegram Web 归档",
                 "content": row.get("content", "")[:8000] if isinstance(row.get("content", ""), str) else "",
                 "source_type": "telegram_web",
+                "datetime": row.get("datetime") if type(row.get("datetime")) is int and 0 < row["datetime"] < 253402300800 else 0,
                 "source_url": row.get("source_url", "")[:2048] if isinstance(row.get("source_url", ""), str) else "",
             })
         clean["partial"] = result.get("partial") is True
@@ -183,11 +184,12 @@ class TelegramWeb:
     def logout(self):
         return self._request("logout", {})
 
-    def search(self, query, limit=20, deadline=None):
+    def search(self, query, limit=20, deadline=None, refresh=False):
         if (not isinstance(query, str) or not query.strip() or len(query) > 512
                 or type(limit) is not int or not 1 <= limit <= 40):
             return {**_failure("搜索参数不正确", "WEB_INVALID_INPUT"), "results": []}
         budget = min(25, deadline - time.monotonic()) if deadline is not None else 25
         if budget <= 0:
             return {**_failure("本轮搜索时间已用完", "WEB_TIMEOUT"), "results": [], "partial": True}
-        return self._request("search", {"query": query.strip(), "limit": limit, "timeout": budget}, timeout=budget + 2)
+        return self._request("search", {"query": query.strip(), "limit": limit, "timeout": budget,
+                                      **({"refresh": True} if refresh is True else {})}, timeout=budget + 2)

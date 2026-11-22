@@ -423,7 +423,8 @@ class TelegramWebWorker:
         if remaining <= 0:
             return self._result(False, "TIMEOUT", results=[])
         self._next_search = self._clock() + 3
-        result = self._page.evaluate(self._bridge, {"query": query.strip(), "limit": limit, "timeout": remaining})
+        result = self._page.evaluate(self._bridge, {"query": query.strip(), "limit": limit, "timeout": remaining,
+                                                  **({"refresh": True} if payload.get("refresh") is True else {})})
         if not isinstance(result, dict):
             return self._result(False, "BRIDGE_UNAVAILABLE", results=[])
         count = max(0, int(result.get("archived_count", 0)))

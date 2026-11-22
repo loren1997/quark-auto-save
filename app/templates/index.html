@@ -591,7 +591,7 @@
                   <div class="col-auto">
                     <button type="button" class="btn btn-outline-primary btn-sm" @click="copyTaskToClipboard(index)" title="复制任务参数到粘贴板"><i class=" bi bi-clipboard-check-fill"></i></button>
                     <button class="btn btn-warning btn-sm" v-if="task.shareurl_ban" :title="task.shareurl_ban" disabled><i class="bi bi-exclamation-triangle-fill"></i></button>
-                    <button type="button" class="btn btn-outline-primary btn-sm" @click="runScriptNow(index)" title="运行此任务（失效时重试与自动换源）"><i class="bi bi-play-fill"></i></button>
+                    <button type="button" class="btn btn-outline-primary btn-sm" @click="runScriptNow(index)" title="查找最新有效链接后运行；未找到则保留原链接"><i class="bi bi-play-fill"></i></button>
                     <button type="button" class="btn btn-outline-danger btn-sm" @click="removeTask(index)" title="删除此任务"><i class="bi bi-trash3-fill"></i></button>
                   </div>
                 </div>
@@ -740,7 +740,7 @@
 
           <div class="bottom-buttons" v-if="activeTab !== 'runs'">
             <button class="btn btn-success" data-toggle="tooltip" data-placement="top" title="保存 CTRL+S"><i class="bi bi-floppy2-fill"></i></button>
-            <button type="button" class="btn btn-primary" data-toggle="tooltip" data-placement="top" title="后台运行 CTRL+R" :disabled="runRequestPending || !!backgroundRun" @click="runScriptNow()"><i class="bi bi-play-fill"></i></button>
+            <button type="button" class="btn btn-primary" data-toggle="tooltip" data-placement="top" title="后台运行：先查最新有效链接，未找到则保留原链接 CTRL+R" :disabled="runRequestPending || !!backgroundRun" @click="runScriptNow()"><i class="bi bi-play-fill"></i></button>
             <button type="button" class="btn btn-info" data-toggle="tooltip" data-placement="top" title="单击回顶，双击到底" @click="scrollToX(0)" @dblclick="scrollToX()"><i class="bi bi-chevron-bar-up"></i></button>
           </div>
         </form>

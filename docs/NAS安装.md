@@ -2,7 +2,9 @@
 
 本版在原项目基础上维护，保留上游许可证和插件。默认工作方式是：NAS 上运行订阅服务，定时将夸克分享转存到自己的夸克网盘。需要 NAS 本地文件时，可启用已有 Aria2 插件。
 
-V3.13.9 搜索全部已归档对话，其他频道的直链无需等待奥斯卡机器人；普通正文、富文本代码块、表格、链接和复制按钮均可提取。机器人回复按批读取并遵守限流，日志显示全归档范围与回复解析计数；继续按资源介绍匹配并定位最内层视频目录，不自动加入频道。
+V3.13.10 手动运行会先重新搜索最新有效链接，无论原链接是否失效，也不受自动换源开关限制。搜索跳过历史资源的优先复用，重新查询索引及网页，Telegram 从最新帖子开始查找；本轮候选按来源提供的发布时间由新到旧验证，未标注时间的候选排在后面。找到后更新链接并运行，未找到或查询失败则保留原链接继续处理；原链接也失效时跳过转存。保持命名、保存路径和下载设置；同一链接被重新找到时保留文件起始边界。开启删除子目录重存的任务继续禁止自动替换链接，避免删除风险。
+
+“最新”指当前来源在本轮搜索范围内返回的候选；无法证明未被索引或缺少发布时间的资源是否更新。定时任务仍按运行星期执行，只在原链接失效等现有条件下换源。归档直链及机器人富文本取链继续可用，限流等待不会被手动刷新绕过。
 
 V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再后台更新；定时换源、补集及待查找重试遵守任务运行星期，手动运行单个任务仍立即执行。
 
@@ -31,7 +33,7 @@ V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再�
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.13.9 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.9) 中的 `quark-auto-save-nas-docker-v3.13.9.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.13.10 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.10) 中的 `quark-auto-save-nas-docker-v3.13.10.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 
 ```sh
@@ -205,16 +207,16 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.13.9：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
+以下从旧维护版更新至 V3.13.10：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.9/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.10/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
-backup="backup-v3.13.9-$(date +%Y%m%d-%H%M%S)"
+backup="backup-v3.13.10-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 docker compose -p qas-maintained stop quark-auto-save
 cp -a compose.yaml .env config "$backup/"

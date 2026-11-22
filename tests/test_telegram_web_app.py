@@ -105,14 +105,15 @@ class TelegramWebClientTests(unittest.TestCase):
     def test_search_normalizes_only_archived_share_results_and_does_not_expose_cursor(self):
         self.respond(result("authorized", results=[
             {"title": "作品 第二集", "url": "https://pan.quark.cn/s/abcdef123456", "content": "已归档的消息",
-             "source_type": "telegram_web", "peer_id": "private-id"},
+             "source_type": "telegram_web", "peer_id": "private-id", "datetime": 1795305600},
             {"title": "无关链接", "url": "https://example.com", "source_type": "telegram_web"},
         ], partial=True, progress={"phase": "search", "current": 10, "total": 15, "cursor": "private-cursor",
                                    "global_pages": 1, "global_dialogs": 4, "direct_links": 6},
             bot={"requests": 1, "links": 1, "pending": 0, "failed": 0, "payload": "private-start",
                  "button_rejections": {"other_target": 5, "invalid_url": "private-url", "private-button": 1}}))
-        returned = self.client.search("作品", limit=20, deadline=time.monotonic() + 10)
+        returned = self.client.search("作品", limit=20, deadline=time.monotonic() + 10, refresh=True)
         self.assertEqual(returned["results"][0]["taskname"], "作品 第二集")
+        self.assertEqual(returned["results"][0]["datetime"], 1795305600)
         self.assertEqual(returned["results"][0]["shareurl"], "https://pan.quark.cn/s/abcdef123456")
         self.assertEqual(len(returned["results"]), 1)
         self.assertTrue(returned["partial"])
@@ -125,6 +126,7 @@ class TelegramWebClientTests(unittest.TestCase):
         self.assertEqual(call.args[1], "http://telegram-web:8765/search")
         self.assertLessEqual(call.kwargs["json"]["timeout"], 10)
         self.assertEqual(call.kwargs["json"]["limit"], 20)
+        self.assertTrue(call.kwargs["json"]["refresh"])
         self.http.request.reset_mock()
         self.assertFalse(self.client.search("作品", deadline=time.monotonic() - 1)["success"])
         self.http.request.assert_not_called()

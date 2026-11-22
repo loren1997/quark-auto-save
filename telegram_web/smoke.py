@@ -148,6 +148,12 @@ def check_resource_button(page):
     assert result["results"][0]["source_url"] == "https://t.me/Oscar_4Kmovies/12", result
     assert page.evaluate("calls.filter(m=>m==='messages.startBot').length") == 1
     print("Archived Oscar resource button and reply extraction: passed (offline fixture)", flush=True)
+    result = page.evaluate(bridge, {"query": "一念永恒", "limit": 6, "timeout": 5, "refresh": True})
+    assert {item["url"] for item in result["results"]} == {
+        "https://pan.quark.cn/s/direct123456", "https://pan.quark.cn/s/fixture123456"}, result
+    assert page.evaluate("calls.filter(m=>m==='messages.searchGlobal').length") == 2
+    assert page.evaluate("calls.filter(m=>m==='messages.startBot').length") == 1
+    print("Manual refreshed archive search preserves bot request: passed (offline fixture)", flush=True)
 
 
 def main():

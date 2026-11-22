@@ -1,6 +1,7 @@
 """Web 搜索和失效订阅修复共用的资源搜索入口。"""
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import os
 import re
 import time
@@ -97,7 +98,21 @@ def _selection(value, label):
     return list(dict.fromkeys(item.lstrip("@") for item in value))
 
 
-def search_telegram_resources(query, config, health_path=None, limit=20, deadline=None):
+def candidate_timestamp(candidate):
+    """Unknown publication times sort last without inventing a freshness guarantee."""
+    value = candidate.get("datetime") if isinstance(candidate, dict) else None
+    try:
+        if type(value) in (int, float) or (isinstance(value, str) and value.isdigit()):
+            value = float(value)
+            value = value / 1000 if value > 1e12 else value
+            return value if 0 < value < 253402300800 else 0
+        stamp = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        return (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return 0
+
+
+def search_telegram_resources(query, config, health_path=None, limit=20, deadline=None, refresh=False):
     from app.sdk.telegram_web import TelegramWeb
 
     if str(((config.get("source") or {}).get("telegram_web") or {}).get("enable", False)).lower() != "true":
@@ -105,7 +120,8 @@ def search_telegram_resources(query, config, health_path=None, limit=20, deadlin
     report_progress("search", source="Telegram归档", query=query)
     print(f"Telegram归档：正在搜索 {query}", flush=True)
     try:
-        result = TelegramWeb(health_path).search(query, limit=limit, deadline=deadline)
+        result = TelegramWeb(health_path).search(query, limit=limit, deadline=deadline,
+                                               **({"refresh": True} if refresh else {}))
     except Exception:
         result = {"success": False, "data": {"reason": "Telegram 归档查询暂不可用"}}
     candidates = result.get("results") or []

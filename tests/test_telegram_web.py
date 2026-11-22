@@ -204,6 +204,17 @@ class TelegramWebWorkerTests(unittest.TestCase):
         self.assertEqual(result["code"], "FLOOD_WAIT")
         self.assertEqual(len(self.page.threads), calls)
 
+    def test_manual_refresh_is_forwarded_to_browser_without_disabling_rate_limits(self):
+        self.authorize()
+        self.worker.submit("search", {"query": "作品", "refresh": True})
+        self.assertTrue(self.page.last_search["refresh"])
+        self.page.search_result = {"success": False, "code": "FLOOD_WAIT", "retry_after": 60}
+        self.worker.submit("search", {"query": "作品", "refresh": True})
+        calls = len(self.page.threads)
+        result = self.worker.submit("search", {"query": "作品", "refresh": True})
+        self.assertEqual(result["code"], "FLOOD_WAIT")
+        self.assertEqual(len(self.page.threads), calls)
+
     def test_search_batches_are_paced_and_wait_counts_against_timeout(self):
         self.authorize()
         self.worker.submit("search", {"query": "作品"})
@@ -995,6 +1006,22 @@ await run('作品',1);
 window.__qasArchiveReadState.searches.get('作品').used-=7*24*60*60*1000;
 const result=await run('作品',1);
 assert.equal(searches,1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/abcdef222222');
+""")
+
+    def test_manual_refresh_restarts_from_latest_posts_and_preserves_bot_jobs(self):
+        self.run_bridge(r"""
+let searches=0;
+global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'
+ ? allDialogs() : (searches++,{_: 'messages.messages',messages: searches===1 ? [
+ message(peers[0],1,'作品 https://pan.quark.cn/s/abcdef111111'),
+ message(peers[0],2,'作品 https://pan.quark.cn/s/abcdef222222')]:[
+ {...message(peers[0],3,'作品 https://pan.quark.cn/s/newest333333'),date:1795305600}],users:[user],chats:[]});
+await run('作品',1);
+window.__qasArchiveReadState.botJobs.set('get59171',{created:Date.now(),started:true});
+const result=await bridge({query:'作品',limit:1,timeout:2,refresh:true});
+assert.equal(searches,2);assert.equal(result.results[0].url,'https://pan.quark.cn/s/newest333333');
+assert.equal(result.results[0].datetime,1795305600);
+assert.equal(window.__qasArchiveReadState.botJobs.get('get59171').started,true);
 """)
 
     def test_account_switch_during_call_drops_payload(self):

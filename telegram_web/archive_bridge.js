@@ -1,5 +1,5 @@
 // Executed only in the already authenticated official WebK page. No credentials leave it.
-async ({query, limit, timeout}) => {
+async ({query, limit, timeout, refresh = false}) => {
   if (location.origin !== 'https://web.telegram.org' || location.pathname !== '/k/') {
     return {success: false, code: 'BRIDGE_UNAVAILABLE'};
   }
@@ -31,6 +31,8 @@ async ({query, limit, timeout}) => {
     if (job.created < Date.now() - 15 * 60 * 1000) botJobs.delete(payload);
   }
   const searches = state.searches;
+  // Restart manual searches at newest posts, retaining bot jobs to avoid duplicate requests.
+  if (refresh === true) searches.delete(query);
   for (const [name, cached] of searches) {
     // Unfinished pages must survive daily/weekly runs; the cache still holds at most 20 queries.
     if (cached.used < Date.now() - 14 * 24 * 60 * 60 * 1000 || cached.done) searches.delete(name);
@@ -182,7 +184,8 @@ async ({query, limit, timeout}) => {
       if (search.urls.has(url)) continue;
       search.urls.add(url);
       const title = text.split('\n').map(s => s.trim()).find(s => s && !/^https?:\/\//.test(s)) || entity.title || '';
-      const candidate = {title: title.slice(0,240), url, content: text.slice(0,1600), source_type: 'telegram_web'};
+      const candidate = {title: title.slice(0,240), url, content: text.slice(0,1600), source_type: 'telegram_web',
+        datetime: Number.isInteger(post.date) && post.date > 0 ? post.date : 0};
       if (entity.publicMessages && /^[a-zA-Z][a-zA-Z0-9_]{4,31}$/.test(entity.username || '') && Number.isInteger(post.id) && post.id > 0) {
         candidate.source_url = `https://t.me/${entity.username}/${post.id}`;
       }

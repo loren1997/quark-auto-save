@@ -404,7 +404,7 @@ class RunManager:
         timed_out = threading.Event()
         try:
             environment = os.environ.copy()
-            for key in ("TASKLIST", "QUARK_TEST", "COOKIE", "PUSH_CONFIG", "QAS_RUN_PAYLOAD"):
+            for key in ("TASKLIST", "QUARK_TEST", "COOKIE", "PUSH_CONFIG", "QAS_RUN_PAYLOAD", "QAS_MANUAL_RUN"):
                 environment.pop(key, None)
             environment.update(PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1", QAS_RUN_PROGRESS="1")
             script = self.script_path
@@ -416,6 +416,8 @@ class RunManager:
                                    PUSH_CONFIG=json.dumps(payload.get("push_config", {})))
             elif payload.get("tasklist"):
                 environment["TASKLIST"] = json.dumps(payload["tasklist"], ensure_ascii=False)
+            if record["trigger"] == "manual" and not payload.get("quark_test") and "discovery_id" not in payload:
+                environment["QAS_MANUAL_RUN"] = "1"
             with self.condition:
                 record.update(status="running", started_at=now())
                 self._persist(record)

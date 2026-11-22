@@ -59,6 +59,19 @@ class RunFixture(unittest.TestCase):
 
 
 class BackgroundRunTests(RunFixture):
+    def test_manual_refresh_marker_does_not_leak_into_scheduled_or_subscription_runs(self):
+        self.script.write_text("import os\nprint('manual-refresh='+os.environ.get('QAS_MANUAL_RUN','0'))\n", encoding="utf-8")
+        manager = self.manager()
+        with patch.dict(os.environ, {"QAS_MANUAL_RUN": "1"}), self.subscription_worker():
+            for trigger, payload, marker in [("manual", {}, "1"), ("scheduled", {}, "0"),
+                                             ("discovery", {"discovery_id": "anime:123"}, "0"),
+                                             ("manual", {"quark_test": True}, "0")]:
+                with self.subTest(trigger=trigger, payload=payload):
+                    started, record = manager.start(payload, trigger=trigger)
+                    self.assertTrue(started)
+                    result = self.finish(manager, record["id"])
+                    self.assertIn("manual-refresh=" + marker, str(result["logs"]))
+
     @contextlib.contextmanager
     def subscription_worker(self):
         original = subprocess.Popen

@@ -973,11 +973,12 @@ class AutoRepairTests(unittest.TestCase):
     def test_manual_task_execution_persists_replacement_to_config(self):
         config = {"cookie": "fake-cookie", "tasklist": [copy.deepcopy(self.task)]}
 
-        def repair(account, tasks):
+        def repair(account, tasks, latest=False):
+            self.assertTrue(latest)
             tasks[0]["shareurl"] = self.candidate()["shareurl"]
             tasks[0]["repair_history"] = [{"from_id": "oldshare"}]
 
-        with patch.dict(os.environ, {"TASKLIST": json.dumps([self.task])}, clear=True), patch.object(qas.sys, "argv", ["quark_auto_save.py", "fake-config.json"]), patch.object(qas.os.path, "exists", return_value=True), patch.object(qas.Config, "read_json", return_value=config), patch.object(qas.Config, "write_json") as write, patch.object(qas.Config, "locked", side_effect=lambda _: contextlib.nullcontext()), patch.object(qas, "verify_account", side_effect=lambda account: setattr(account, "is_active", True)), patch.object(qas, "do_save", side_effect=repair), patch.object(qas, "NOTIFYS", []):
+        with patch.dict(os.environ, {"TASKLIST": json.dumps([self.task]), "QAS_MANUAL_RUN": "1"}, clear=True), patch.object(qas.sys, "argv", ["quark_auto_save.py", "fake-config.json"]), patch.object(qas.os.path, "exists", return_value=True), patch.object(qas.Config, "read_json", return_value=config), patch.object(qas.Config, "write_json") as write, patch.object(qas.Config, "locked", side_effect=lambda _: contextlib.nullcontext()), patch.object(qas, "verify_account", side_effect=lambda account: setattr(account, "is_active", True)), patch.object(qas, "do_save", side_effect=repair), patch.object(qas, "NOTIFYS", []):
             qas.main()
         saved = write.call_args.args[1]
         self.assertEqual(saved["tasklist"][0]["shareurl"], self.candidate()["shareurl"])
