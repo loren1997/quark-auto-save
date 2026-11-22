@@ -62,7 +62,8 @@
     },
     "pansou": {
       "enable": true,
-      "server": "https://so.252035.xyz",
+      "server": "http://pansou:8888",
+      "auto_discover": true,
       "fallback_servers": [],
       "channels": [],
       "plugins": [],

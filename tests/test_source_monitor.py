@@ -106,8 +106,8 @@ class SourceMonitorTests(unittest.TestCase):
             self.assertEqual(maintain_sources(config, self.path)['checked'], 0)
         fetch.assert_not_called()
 
-    def test_blank_pansou_server_uses_same_default_as_search_not_environment(self):
-        self.expire(DEFAULT_PANSOU_SERVER)
+    def test_blank_pansou_server_uses_same_deployment_address_as_search(self):
+        self.expire('https://environment.example')
         config = {'source': {'pansou': {'server': '', 'token': 'main-token'}}}
         with patch.dict(os.environ, {'PANSOU_SERVER': 'https://environment.example',
                                     'PANSOU_FALLBACK_SERVERS': ''}), \
@@ -118,7 +118,7 @@ class SourceMonitorTests(unittest.TestCase):
             result = maintain_sources(config, self.path)
             search_resources('电视剧', config, include_web=False)
         self.assertEqual(result['checked'], 1)
-        monitor_client.assert_called_once_with(DEFAULT_PANSOU_SERVER, token='main-token')
+        monitor_client.assert_called_once_with('https://environment.example', token='main-token')
         self.assertEqual(monitor_client.call_args_list, search_client.call_args_list)
 
     def test_pansou_duplicates_are_removed_before_three_server_limit_like_search(self):

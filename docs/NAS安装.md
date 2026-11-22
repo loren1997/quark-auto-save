@@ -2,6 +2,20 @@
 
 本版在原项目基础上维护，保留上游许可证和插件。默认工作方式是：NAS 上运行订阅服务，定时将夸克分享转存到自己的夸克网盘。需要 NAS 本地文件时，可启用已有 Aria2 插件。
 
+V3.13.13 修复默认搜索入口和网站索引发现。请更新 `pansou`、`quark-auto-save`、`telegram-web` 三个服务。旧工厂公共地址 `https://so.252035.xyz`（未配置认证时）会迁移到本地 `http://pansou:8888`；自定义地址和认证设置保留，不向备用源转发主源令牌。
+
+Compose 默认申请启用 32 个网站索引插件；实际安装数量以“系统配置 → 资源搜索 → 查看渠道状态”为准，旧 PanSou 镜像可能不包含全部插件。`PANSOU_PLUGINS` 可覆盖名单，不设置时使用本版默认值。默认移除失效公共备用源，继续使用本地服务及其他搜索来源。
+
+“自动发现并接入 PanSou 已安装的网站索引”默认开启，每小时读取本地服务目录；每 5 分钟最多对两个到期插件发起只读查询。插件列表留空时，新发现的插件自动加入搜索；手工填写时仅查询指定插件。目录在线只标记“已接入”，实际返回夸克候选才记录命中；空结果不等于失效。请求失败会冷却，限流遵守服务端等待时间，复查成功后恢复。状态页展示插件名、命中数、上次查询及复查时间。自动发现不下载或执行外部代码，不会凭任意网站地址生成适配器；服务新增插件可自动接入，服务镜像本身仍需按正常方式更新。
+
+CloudSaver 是[需要独立部署的服务](https://github.com/jiangrui1994/CloudSaver)，不是开箱即用的公共接口；未部署时保持关闭，不影响其他搜索。已启用但缺少服务器或登录信息时会明确跳过。网页站点返回人机验证时自动切换其他来源并冷却复查，无需手动处理；本项目不能取消外站防护，也不能保证每部作品都有有效分享。Telegram 仅搜索已归档对话，旧公开频道自动发现不再作为正在运行的功能展示。
+
+只读检查真实索引查询（不读取应用账号配置，不转存下载）：
+
+```bash
+docker compose -p qas-maintained exec -T quark-auto-save python scripts/probe_index_search.py "庆余年" --verify
+```
+
 V3.13.12 将所有任务的 `auto_download` 默认设为开启，升级首次启动时一次性开启已有任务及待查找订阅；此后手动关闭的任务会保留关闭设置。本次升级不启用历史补下载，已转存的视频不会因此重新入队；原有失败重试和用户明确设置的补下载继续生效。Aria2 仍需配置并保持可用。升级包同时更新主程序和 Telegram Web 两个镜像，并包含 V3.13.11 的资源搜索修复。
 
 手动运行会先重新搜索最新有效链接，无论原链接是否失效，也不受自动换源开关限制。搜索跳过历史资源的优先复用，重新查询索引及网页，Telegram 从最新帖子开始查找；本轮候选按来源提供的发布时间由新到旧验证，未标注时间的候选排在后面。找到后更新链接并运行，未找到或查询失败则保留原链接继续处理；原链接也失效时跳过转存。保持命名、保存路径和下载设置；同一链接被重新找到时保留文件起始边界。开启删除子目录重存的任务继续禁止自动替换链接，避免删除风险。
@@ -35,7 +49,7 @@ V3.11 支持 Telegram 账号和频道文件夹，热门周历先显示快照再�
 
 ### 与原作者版本并行安装（推荐）
 
-使用 [维护版 V3.13.12 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.12) 中的 `quark-auto-save-nas-docker-v3.13.12.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
+使用 [维护版 V3.13.13 发布包](https://github.com/loren1997/quark-auto-save/releases/tag/maintenance-v3.13.13) 中的 `quark-auto-save-nas-docker-v3.13.13.zip`。将其中三个文件放到独立目录，例如 `/root/quark-save-gpt`；复制 `.env.example` 为 `.env` 并设置管理密码，然后运行：
 
 
 ```sh
@@ -209,13 +223,13 @@ V3.3 会迁移工厂默认设置：热门任务原 `/追更/片名` 改为 `/car
 
 ### 已安装并行发布包（`/root/quark-save-gpt`）
 
-以下从旧维护版更新至 V3.13.12：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
+以下从旧维护版更新至 V3.13.13：先下载并检查新配置、拉取应用及浏览器镜像，再停止维护版并备份，最后自动导入旧配置中的资源线索并启动；保留原 `.env`、Cookie、订阅、端口和浏览器会话卷，不影响原作者版本。
 
 ```sh
 (
 set -e
 cd /root/quark-save-gpt
-curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.12/compose.yaml -o compose.yaml.next
+curl -fL --retry 2 https://github.com/loren1997/quark-auto-save/releases/download/maintenance-v3.13.13/compose.yaml -o compose.yaml.next
 docker compose -p qas-maintained -f compose.yaml.next config --quiet
 docker compose -p qas-maintained -f compose.yaml.next pull
 backup="backup-v3.13.11-$(date +%Y%m%d-%H%M%S)"

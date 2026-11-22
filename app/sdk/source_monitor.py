@@ -70,7 +70,8 @@ def record_telegram_failures(errors, health_path, known_channels=(), unavailable
 
 
 def maintain_sources(config, health_path):
-    from resource_search import DEFAULT_PANSOU_SERVER, MAX_PANSOU_SERVERS, _server_url, search_error_reason
+    from resource_search import MAX_PANSOU_SERVERS, _server_url, _selection, pansou_server, search_error_reason
+    from .index_catalog import IndexCatalog
     from .channel_registry import ChannelRegistry
     from .channel_search import channel_queries, channel_results
     from .pansou import PanSou
@@ -98,7 +99,7 @@ def maintain_sources(config, health_path):
         if not isinstance(extra, list):
             logging.warning("PanSou 巡检聚合地址列表无效，保留配置并跳过")
             extra = []
-        servers = [pansou.get("server") or DEFAULT_PANSOU_SERVER] + extra + os.getenv("PANSOU_FALLBACK_SERVERS", "").splitlines()
+        servers = [pansou_server(pansou)] + extra + os.getenv("PANSOU_FALLBACK_SERVERS", "").splitlines()
         seen = set()
         for index, value in enumerate(servers):
             if not value:
@@ -114,6 +115,17 @@ def maintain_sources(config, health_path):
                 probes.setdefault(urlsplit(url).hostname, ("pansou", "PanSou", url, token))
             except (SearchError, ValueError):
                 logging.warning("PanSou 巡检地址无效，保留配置并跳过")
+        if _enabled(pansou.get('auto_discover', False)):
+            client = PanSou(pansou_server(pansou), token=pansou.get('token', ''))
+            try:
+                health.check(pansou_server(pansou))
+                catalog = IndexCatalog(health_path, pansou_server(pansou))
+                catalog.discover(client)
+                catalog.probe(client, _selection(pansou.get('plugins'), '插件'))
+            except (SearchError, ValueError):
+                logging.warning('索引插件巡检未完成，下轮继续')
+            finally:
+                client.session.close()
     result = {"checked": 0, "recovered": []}
     due = [row for row in health.status() if row["status"] == "awaiting_probe" and row["host"] in probes][:2]
     for row in due:

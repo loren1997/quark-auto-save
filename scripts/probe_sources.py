@@ -164,7 +164,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     servers = args.pansou if args.pansou is not None else [
         os.getenv("PANSOU_SERVER") or "http://pansou:8888",
-        *(os.getenv("PANSOU_FALLBACK_SERVERS") or "https://so.252035.xyz").splitlines(),
+        *os.getenv("PANSOU_FALLBACK_SERVERS", "").splitlines(),
     ]
     try:
         servers = list(dict.fromkeys(health_url(value) for value in servers if value.strip()))

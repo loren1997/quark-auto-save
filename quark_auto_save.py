@@ -688,6 +688,10 @@ class Config:
         from app.sdk.channel_search import DEFAULT_TELEGRAM_CHANNELS
 
         source = config_data.get("source")
+        if isinstance(source, dict) and isinstance(source.get('pansou'), dict):
+            from resource_search import pansou_server
+            source['pansou']['server'] = pansou_server(source['pansou'])
+            source['pansou'].setdefault('auto_discover', True)
         channelsearch = source.get("channelsearch") if isinstance(source, dict) else None
         if isinstance(channelsearch, dict):
             channels = channelsearch.get("telegram_channels")

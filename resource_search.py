@@ -15,8 +15,16 @@ from app.sdk.websearch import WebSearch
 from run_progress import report_progress
 
 
-DEFAULT_PANSOU_SERVER = "https://so.252035.xyz"
+DEFAULT_PANSOU_SERVER = "http://pansou:8888"
+LEGACY_PANSOU_SERVER = "https://so.252035.xyz"
 MAX_PANSOU_SERVERS = 3
+
+
+def pansou_server(settings):
+    server = settings.get('server') or ''
+    if not server or (isinstance(server, str) and server.rstrip('/') == LEGACY_PANSOU_SERVER and not settings.get('token')):
+        return os.getenv('PANSOU_SERVER') or DEFAULT_PANSOU_SERVER
+    return server
 
 
 def search_error_reason(message):
@@ -38,6 +46,9 @@ def search_error_reason(message):
         (r"归档消息详情读取失败", "归档消息详情读取失败，稍后自动重试"),
         (r"Oscar4KBot 暂不可用或未返回可关联的夸克资源", "Oscar4KBot 暂不可用或未返回可关联的夸克资源，稍后自动重试"),
         (r"没有启用的搜索源|未启用其他索引来源", "未启用其他索引来源"),
+        (r"搜索插件未在 PanSou", "所选搜索插件未在 PanSou 服务启用"),
+        (r"PanSou 没有已启用", "PanSou 暂无可查询插件，等待后台巡检"),
+        (r"CloudSaver 未配置", "CloudSaver 未配置服务器或登录信息，已跳过"),
         (r"本次查找已跳过此前失败的来源", "本次查找已跳过此前失败的来源"),
         (r"非公网", "地址解析为非公网 IP，已拒绝访问"),
         (r"域名解析|\bdns\b|NameResolution|gaierror", "DNS 域名解析失败"),
@@ -256,7 +267,7 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
         if not isinstance(fallback, list):
             errors.append({"source": "PanSou", "message": "聚合服务器必须是地址列表或换行分隔地址"})
             fallback = []
-        servers = [ps.get("server") or DEFAULT_PANSOU_SERVER] + fallback + os.getenv("PANSOU_FALLBACK_SERVERS", "").splitlines()
+        servers = [pansou_server(ps)] + fallback + os.getenv("PANSOU_FALLBACK_SERVERS", "").splitlines()
         seen = set()
         try:
             selection = {key: _selection(ps.get(key), label) for key, label in (("channels", "频道"), ("plugins", "插件"))}
@@ -279,7 +290,9 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
             except (SearchError, ValueError) as error:
                 errors.append({"source": label, "message": str(error)})
     cs = sources.get("cloudsaver") or {}
-    if _enabled(cs) and cs.get("server"):
+    if _enabled(cs) and cs.get('enable') and (not cs.get('server') or not (cs.get('token') or (cs.get('username') and cs.get('password')))):
+        errors.append({'source': 'CloudSaver', 'message': 'CloudSaver 未配置服务器或登录信息，已跳过'})
+    elif _enabled(cs) and cs.get("server"):
         try:
             jobs.append(("CloudSaver", _server_url(cs["server"]), ""))
         except (SearchError, ValueError) as error:
@@ -306,7 +319,15 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
                     raise SearchError(response.get("message", "搜索失败"))
                 entries = client.clean_search_results(response.get("data", []))
             else:
-                entries = client.search(query, refresh=refresh, **selection)
+                from app.sdk.index_catalog import IndexCatalog
+                catalog = IndexCatalog(health_path, server)
+                selected = dict(selection)
+                if str(ps.get('auto_discover', True)).lower() == 'true':
+                    selected['plugins'] = catalog.select(selected['plugins'])
+                entries = client.search(query, refresh=refresh, **selected)
+                catalog.record_results(entries, checked_after)
+                scope = f"{len(selected['plugins'])} 个网站索引" if selected['plugins'] else '服务默认网站索引'
+                print(f'{label}：查询{scope}，返回 {len(entries)} 条夸克候选；分享有效性另行验证', flush=True)
             health.clear(server, checked_after=checked_after)
             return entries, [], True
         except SearchError as error:

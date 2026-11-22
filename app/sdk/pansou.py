@@ -1,3 +1,4 @@
+import json
 import re
 
 import requests
@@ -16,7 +17,26 @@ class PanSou:
         if token:
             self.session.headers["Authorization"] = f"Bearer {token}"
 
-    def search(self, keyword: str, refresh: bool = False, channels=None, plugins=None) -> list:
+    def plugins(self):
+        server = self.server.rstrip('/').removesuffix('/api/search')
+        try:
+            with self.session.get(server + '/api/health', timeout=(3, 5), stream=True, allow_redirects=False) as response:
+                response.raise_for_status()
+                body = bytearray()
+                for chunk in response.iter_content(8192):
+                    body.extend(chunk)
+                    if len(body) > 512 * 1024:
+                        raise SearchError('插件目录超过读取限制')
+                result = json.loads(body)
+            names = result.get('plugins') if isinstance(result, dict) else None
+            if (not isinstance(names, list) or len(names) > 128 or result.get('status') != 'ok'
+                    or any(not isinstance(name, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name) for name in names)):
+                raise SearchError('插件目录响应格式错误')
+            return list(dict.fromkeys(names))
+        except (requests.RequestException, ValueError) as error:
+            raise SearchError(f'插件目录读取失败 ({type(error).__name__})') from error
+
+    def search(self, keyword: str, refresh: bool = False, channels=None, plugins=None, timeout=(5, 25)) -> list:
         """搜索资源
 
         Args:
@@ -31,7 +51,7 @@ class PanSou:
             params = {"kw": keyword, "cloud_types": ["quark"], "res": "all", "src": "plugin", "refresh": refresh}
             if plugins:
                 params["plugins"] = plugins
-            response = self.session.post(url, json=params, timeout=(5, 25), stream=True)
+            response = self.session.post(url, json=params, timeout=timeout, stream=True)
             try:
                 if response.status_code == 400:
                     prefix = next(response.iter_content(chunk_size=2048), b"")

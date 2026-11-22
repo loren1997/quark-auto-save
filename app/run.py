@@ -35,7 +35,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
 from quark_auto_save import Quark, Config, MagicRename, resource_titles_match, apply_media_rename_defaults
 from media_files import MEDIA_PATTERN, is_media_file, is_video_file
-from resource_search import search_resources
+from resource_search import search_resources, pansou_server
 from app.sdk.source_monitor import maintain_sources
 from app.sdk.channel_registry import ChannelRegistry
 from app.sdk.source_health import SourceHealth
@@ -158,6 +158,10 @@ def source_status():
             "registry": {key: registry.get(key) for key in ("last_discovery", "next_discovery", "discovery_reason")},
             "sources": [{key: row.get(key) for key in source_fields} for row in SourceHealth(health_path).status()],
         }
+        from app.sdk.index_catalog import IndexCatalog
+        ps = (current.get('source') or {}).get('pansou') or {}
+        data['index_discovery_enabled'] = source_option_enabled(current, 'pansou', 'auto_discover') and source_option_enabled(current, 'pansou')
+        data['indexes'] = IndexCatalog(health_path, pansou_server(ps)).status()
         data["registry"]["channels"] = [{key: row.get(key) for key in channel_fields}
                                          for row in registry.get("channels", [])]
         origins = registry.get("origins", [])
@@ -1036,10 +1040,11 @@ def init():
         config_data.setdefault("run_history", {"retention_days": 7})
         config_data.setdefault("discovery", {"savepath": "/cartoon"})
         source = config_data.setdefault("source", {})
-        source.setdefault("pansou", {"enable": True, "server": "https://so.252035.xyz"})
+        source.setdefault("pansou", {"enable": True, "server": pansou_server({})})
         source.setdefault("cloudsaver", {"enable": False, "server": "", "username": "", "password": ""})
         source.setdefault("websearch", {"enable": True})
         source.setdefault("monitor", {"enable": True})
+        source['pansou'].setdefault('auto_discover', True)
         source.setdefault("telegram", {}).setdefault("enable", False)
         source["telegram"]["auto_join"] = False
         source.setdefault("telegram_web", {}).setdefault("enable", False)

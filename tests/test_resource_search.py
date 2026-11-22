@@ -209,7 +209,7 @@ class SharedSearchTests(unittest.TestCase):
     @patch("resource_search.PanSou")
     def test_empty_primary_also_uses_configured_fallback(self, pansou):
         pansou.return_value.search.side_effect = [[], [entry()]]
-        result = search_resources("作品", {"source": {"pansou": {"fallback_servers": ["http://pansou:8888"]}}})
+        result = search_resources("作品", {"source": {"pansou": {"fallback_servers": ["https://backup.example"]}}})
         self.assertTrue(result["data"])
 
     @patch("resource_search.PanSou")

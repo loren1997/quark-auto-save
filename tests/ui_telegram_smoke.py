@@ -128,6 +128,11 @@ def main():
                 page.wait_for_function("typeof app !== 'undefined' && app.formData.config_revision && app.telegramStatus && !app.telegramBusy")
                 page.locator("a.nav-link").filter(has_text="系统配置").click()
                 assert calls == [("status", {})], "mount must not start the NAS browser"
+                page.locator('#source-status-refresh').click()
+                page.get_by_role('table', name='自动发现的网站索引').wait_for()
+                assert page.locator('#index-auto-discover').is_checked()
+                assert page.get_by_text('尚未发现已启用插件；后台巡检将读取本地 PanSou 的目录', exact=True).count() == 1
+                assert page.get_by_text('CloudSaver（可选独立服务）', exact=False).count() >= 1
                 page.evaluate("app.addTask()")
                 assert page.evaluate("app.formData.tasklist[0].addition.aria2.auto_download") is True
                 page.evaluate("app.formData.tasklist[0].addition.aria2.auto_download=false; app.addTask()")

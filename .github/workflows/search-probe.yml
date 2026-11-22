@@ -3,6 +3,11 @@ name: Read-only public search probe
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 检查网页搜索或随安装包部署的 PanSou 索引
+        type: choice
+        options: [web, index]
+        default: web
       query:
         description: 搜索词
         required: true
@@ -29,9 +34,28 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install -r requirements.txt
+      - name: Start the installed website indexes
+        if: inputs.mode == 'index'
+        run: |
+          plugins=$(python -c 'import re; print(re.search(r"ENABLED_PLUGINS: \$\{PANSOU_PLUGINS:-([^}]+)}", open("compose.yaml").read())[1])')
+          docker run -d --name qas-search-probe --cpus=1 --memory=512m \
+            --publish 127.0.0.1:8888:8888 --env ENABLED_PLUGINS="$plugins" \
+            --env ASYNC_MAX_BACKGROUND_WORKERS=4 --env ASYNC_MAX_BACKGROUND_TASKS=32 \
+            --env OUTBOUND_MAX_CONCURRENCY=4 ghcr.io/fish2018/pansou:latest
+          curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-delay 2 \
+            http://127.0.0.1:8888/api/health > /dev/null
+      - name: Query actual website indexes and verify video candidates
+        if: inputs.mode == 'index'
+        env:
+          SEARCH_QUERY: ${{ inputs.query }}
+        run: python scripts/probe_index_search.py "$SEARCH_QUERY" --server http://127.0.0.1:8888 --verify
       - name: Search and verify public shares without an account
+        if: inputs.mode != 'index'
         env:
           SEARCH_QUERY: ${{ inputs.query }}
           VERIFY_TITLE: ${{ inputs.title }}
           VERIFY_ALIAS: ${{ inputs.alias }}
         run: python scripts/probe_web_search.py "$SEARCH_QUERY" --title "$VERIFY_TITLE" --alias "$VERIFY_ALIAS"
+      - name: Stop the isolated probe service
+        if: always() && inputs.mode == 'index'
+        run: docker rm -f qas-search-probe
