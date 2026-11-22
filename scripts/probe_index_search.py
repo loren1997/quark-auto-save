@@ -39,6 +39,10 @@ def main():
         if not names:
             raise SearchError('PanSou 没有已启用且可查询的插件')
         rows = client.search(args.query, plugins=names, refresh=True)
+        if not rows:
+            print(json.dumps({'initial_candidates': 0, 'notice': '等待后台索引后读取一次缓存'}, ensure_ascii=False), flush=True)
+            time.sleep(12)
+            rows = client.search(args.query, plugins=names, refresh=False)
         counts = Counter(row.get('channel') if re.fullmatch(r'plugin:[a-z0-9_-]{1,64}', str(row.get('channel') or ''))
                          else 'unknown' for row in rows)
         print(json.dumps({'query': args.query, 'candidates': len(rows),

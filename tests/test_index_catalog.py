@@ -172,6 +172,16 @@ class IndexCatalogTests(unittest.TestCase):
             self.assertEqual(probe_index_search.main(), 2)
         self.client.search.assert_not_called()
 
+    def test_readonly_probe_waits_once_for_cold_index_without_refresh_loop(self):
+        from scripts import probe_index_search
+        self.client.search.side_effect = [[], [{'channel': 'plugin:pansearch'}]]
+        with patch.object(probe_index_search, 'PanSou', return_value=self.client), \
+                patch.object(probe_index_search.time, 'sleep') as wait, \
+                patch('sys.argv', ['probe_index_search.py', '作品']), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(probe_index_search.main(), 0)
+        wait.assert_called_once_with(12)
+        self.assertEqual([call.kwargs['refresh'] for call in self.client.search.call_args_list], [True, False])
+
 
 if __name__ == '__main__':
     unittest.main()
