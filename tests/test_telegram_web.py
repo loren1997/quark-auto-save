@@ -516,7 +516,7 @@ global.response=async(method,params)=>method==='messages.search'
 const result=await run('作品',1);
 assert.equal(starts,0);assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
 assert.equal(result.bot.channel_posts,1);assert.equal(result.bot.buttons,1);
-assert.equal(window.__qasArchiveReadState.buttonSchema,3);
+assert.equal(window.__qasArchiveReadState.buttonSchema,4);
 assert.equal(window.__qasArchiveReadState.searches.get('作品').id,0);
 assert.equal(calls.filter(c=>c.method==='messages.searchGlobal').length,1);
 """)
@@ -527,6 +527,7 @@ posts.unshift(message(peers[2],15,'作品 https://pan.quark.cn/s/STALE0111111'))
 const result=await run('作品',1);
 assert.equal(starts,1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/NEW000111111');
 assert.equal(result.results[0].title,'作品 第4季');assert.equal(result.results[0].source_url,'https://t.me/publicchannel/12');
+assert.equal(result.results[0].datetime,post.date);
 assert.equal(result.bot.requests,1);assert.equal(result.bot.links,1);assert.equal(result.partial,true);
 assert.ok(!JSON.stringify(result).includes('BOT_PRIVATE_HASH'));assert.ok(!JSON.stringify(result).includes('get59171'));
 const second=await run('作品',1);assert.equal(starts,1);assert.equal(second.results[0].url,'https://pan.quark.cn/s/STALE0111111');
@@ -971,8 +972,44 @@ assert.equal(result.results[1].url,'https://pan.quark.cn/s/abcdef222222?pwd=X9Y8
     def test_multi_share_message_never_assigns_first_access_code_to_every_share(self):
         self.run_bridge(r"""
 global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'?allDialogs()
- :{_: 'messages.messages',messages:[message(peers[0],1,'A https://pan.quark.cn/s/abcdef111111 提取码AAAA\nB https://pan.quark.cn/s/abcdef222222 提取码BBBB')],users:[user],chats:[]};
+ :{_: 'messages.messages',messages:[message(peers[0],1,'作品 A https://pan.quark.cn/s/abcdef111111 提取码AAAA\n作品 B https://pan.quark.cn/s/abcdef222222 提取码BBBB')],users:[user],chats:[]};
 const result=await run();assert.equal(result.results.length,2);assert.ok(result.results.every(r=>!r.url.includes('pwd=')));
+""")
+
+    def test_large_multi_work_index_keeps_only_own_introduction_before_truncation(self):
+        self.run_bridge(r"""
+const body=Array.from({length:852},(_,i)=>`${i===810?'大王饶命':'其他作品'+i} https://pan.quark.cn/s/INDEX${String(i).padStart(7,'0')}`).join('\n');
+global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'?allDialogs()
+ :{_: 'messages.messages',messages:[message(peers[0],1,body)],users:[user],chats:[]};
+const result=await run('大王饶命',6);
+assert.equal(result.results.length,1);assert.equal(result.results[0].url,'https://pan.quark.cn/s/INDEX0000810');
+assert.equal(result.results[0].title,'大王饶命');assert.equal(result.results[0].content,'大王饶命');
+assert.equal(result.progress.direct_links,1);assert.equal(result.partial,false);
+""")
+
+    def test_multi_work_hidden_links_are_associated_using_entity_offsets(self):
+        self.run_bridge(r"""
+const post=message(peers[0],1,'其他作品\n大王饶命');
+post.entities=[{_: 'messageEntityTextUrl',offset:0,length:4,url:'https://pan.quark.cn/s/OTHER0000001'},
+ {_: 'messageEntityTextUrl',offset:5,length:4,url:'https://pan.quark.cn/s/RIGHT0000001'}];
+global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'?allDialogs()
+ :{_: 'messages.messages',messages:[post],users:[user],chats:[]};
+const result=await run('大王饶命');assert.equal(result.results.length,1);
+assert.equal(result.results[0].title,'大王饶命');assert.equal(result.results[0].url,'https://pan.quark.cn/s/RIGHT0000001');
+""")
+
+    def test_rich_index_does_not_assign_a_previous_works_description_to_next_link(self):
+        self.run_bridge(r"""
+const plain=text=>({_: 'textPlain',text});
+const post=message(peers[0],1,'');
+post.rich_message={_: 'richMessage',blocks:[
+ {_: 'pageBlockParagraph',text:{_: 'textUrl',text:plain('大王饶命'),url:'https://pan.quark.cn/s/RIGHT0000001'}},
+ {_: 'pageBlockParagraph',text:plain('大王饶命介绍：其他说明')},
+ {_: 'pageBlockParagraph',text:{_: 'textUrl',text:plain('其他作品'),url:'https://pan.quark.cn/s/OTHER0000001'}}]};
+global.response=async method=>method==='messages.getPinnedDialogs'?emptyPinned():method==='messages.getDialogs'?allDialogs()
+ :{_: 'messages.messages',messages:[post],users:[user],chats:[]};
+const result=await run('大王饶命');assert.equal(result.results.length,1);
+assert.equal(result.results[0].url,'https://pan.quark.cn/s/RIGHT0000001');assert.equal(result.results[0].title,'大王饶命');
 """)
 
     def test_restricted_kicked_and_deleted_archived_peers_are_excluded(self):

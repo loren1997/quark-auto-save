@@ -57,6 +57,12 @@ class TelegramArchiveSearchIntegrationTests(unittest.TestCase):
         self.assertEqual(len(result["data"]), 1)
         self.browser.search.assert_called_once()
 
+    def test_search_refresh_reaches_archive_without_changing_normal_pagination(self):
+        search_web_resources("测试动画", self.config, refresh=True)
+        self.assertTrue(self.browser.search.call_args.kwargs["refresh"])
+        search_web_resources("测试动画", self.config)
+        self.assertNotIn("refresh", self.browser.search.call_args.kwargs)
+
     def test_web_and_archive_run_concurrently_and_partial_links_survive(self):
         started = threading.Event()
         def archive(*_, **__):

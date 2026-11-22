@@ -1,7 +1,7 @@
 """Web 搜索和失效订阅修复共用的资源搜索入口。"""
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 import re
 import time
@@ -107,7 +107,8 @@ def candidate_timestamp(candidate):
             value = value / 1000 if value > 1e12 else value
             return value if 0 < value < 253402300800 else 0
         stamp = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-        return (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)).timestamp()
+        # PanSou and CloudSaver expose their display timestamps in China Standard Time.
+        return (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone(timedelta(hours=8)))).timestamp()
     except (ValueError, TypeError, OverflowError, OSError):
         return 0
 
@@ -197,7 +198,8 @@ def search_web_resources(query, config, refresh=False, failed_engines=None, heal
             archive = None
             if archive_enabled and (failed_engines is None or "Telegram归档" not in failed_engines):
                 archive = executor.submit(search_telegram_resources, query.strip(), config,
-                                          health_path=health_path, limit=20, deadline=deadline)
+                                          health_path=health_path, limit=20, deadline=deadline,
+                                          **({"refresh": True} if refresh else {}))
             if web is not None:
                 try:
                     entries.extend(web.result())
@@ -334,7 +336,7 @@ def search_resources(query, config, refresh=False, include_web=True, failed_sour
         errors.append({"source": "搜索源" if jobs else "搜索配置", "message":
                        "本次查找已跳过此前失败的来源" if jobs else
                        "没有启用的搜索源，请启用 PanSou、网页搜索或配置 CloudSaver"})
-    results.sort(key=lambda item: item.get("datetime", ""), reverse=True)
+    results.sort(key=candidate_timestamp, reverse=True)
     unique = {}
     for item in results:
         # 同一分享的多个频道可能只有一个提供提取码，优先保留带码链接。

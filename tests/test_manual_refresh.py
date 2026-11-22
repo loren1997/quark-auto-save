@@ -127,10 +127,25 @@ class ManualRefreshTests(unittest.TestCase):
         self.assertNotIn("refresh", archive.call_args_list[1].kwargs)
 
     def test_recency_handles_timezones_unix_milliseconds_and_unknown_dates(self):
-        same = ["2026-11-22T08:00:00+08:00", "2026-11-22T00:00:00Z", "2026-11-22", 1795305600, 1795305600000]
+        same = ["2026-11-22T08:00:00+08:00", "2026-11-22T00:00:00Z", "2026-11-22 08:00:00", 1795305600, 1795305600000]
         self.assertEqual(len({candidate_timestamp({"datetime": value}) for value in same}), 1)
         for value in (None, "unknown", {}, True, float("nan"), float("inf")):
             self.assertEqual(candidate_timestamp({"datetime": value}), 0)
+        self.assertEqual(candidate_timestamp({"datetime": "2026-11-22"}),
+                         candidate_timestamp({"datetime": "2026-11-21T16:00:00Z"}))
+
+    def test_irrelevant_bulk_links_do_not_hide_a_newer_later_batch(self):
+        junk = [{**self.row(f"other{i:08d}", "2026-11-20"), "taskname": "其他短剧"} for i in range(80)]
+        _, _, archive = self.search_setup([], archive=[
+            {"success": True, "data": [self.row("original1234", "2026-11-19"), *junk[:39]], "partial": True},
+            {"success": True, "data": junk[39:], "partial": True},
+            {"success": True, "data": [self.row("newarchive12", 1795305600)], "partial": False},
+        ])
+        with patch.object(self.account, "get_stoken", return_value=self.token) as token:
+            result = self.account.find_valid_resource(self.task, {"source": {"telegram_web": {"enable": True}}}, latest=True)
+        self.assertEqual(result["candidate"]["pwd_id"], "newarchive12")
+        token.assert_called_once_with("newarchive12", "")
+        self.assertEqual(archive.call_count, 3)
 
 
 if __name__ == "__main__":

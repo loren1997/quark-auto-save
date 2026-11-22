@@ -340,6 +340,19 @@ class SharedSearchTests(unittest.TestCase):
 
 
 class WebAggregationTests(unittest.TestCase):
+    @patch("resource_search.search_web_resources")
+    @patch("resource_search.PanSou")
+    def test_mixed_telegram_and_index_timestamps_are_sorted_without_type_error(self, pansou, web):
+        pansou.return_value.search.return_value = [entry()]
+        web.return_value = {"success": True, "errors": [], "data": [
+            {**entry("https://pan.quark.cn/s/tgnew1234567"), "datetime": 1795305600},
+            {**entry("https://pan.quark.cn/s/tgunknown123"), "datetime": 0},
+        ]}
+        result = aggregate_search_resources("作品", {})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"][0]["shareurl"], "https://pan.quark.cn/s/tgnew1234567")
+        self.assertEqual(result["data"][-1]["datetime"], 0)
+
     @patch("resource_search.report_progress")
     @patch("resource_search.PanSou")
     def test_source_progress_contains_label_and_query_without_credentials(self, pansou, progress):

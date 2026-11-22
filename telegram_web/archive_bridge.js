@@ -19,9 +19,9 @@ async ({query, limit, timeout, refresh = false}) => {
     state.botJobs = new Map();
   }
   // Re-read posts skipped by the old button parser, retaining already-started bot requests.
-  if (state.buttonSchema !== 3) {
+  if (state.buttonSchema !== 4) {
     state.searches = new Map();
-    state.buttonSchema = 3;
+    state.buttonSchema = 4;
     for (const job of state.botJobs?.values() || []) {
       if (job.started && !job.replies) { job.failed = false; job.polls = 0; job.waitUntil = Date.now() + 45000; }
     }
@@ -140,7 +140,10 @@ async ({query, limit, timeout, refresh = false}) => {
       if (typeof node === 'string') return node.slice(0, 16000);
       if (Array.isArray(node)) return node.slice(0, 2000).map(item => visit(item, depth + 1)).join('\n');
       if (!node || typeof node !== 'object') return '';
-      if (node._ === 'textUrl' && typeof node.url === 'string') result.links.push(node.url);
+      if (node._ === 'textUrl' && typeof node.url === 'string') {
+        result.links.push(node.url);
+        return visit(node.text, depth + 1) + ' ' + node.url;
+      }
       if (node._ === 'pageButton') result.buttons.push(node);
       if (node._ === 'textConcat' && Array.isArray(node.texts)) {
         return node.texts.slice(0, 2000).map(item => visit(item, depth + 1)).join('');
@@ -179,12 +182,37 @@ async ({query, limit, timeout, refresh = false}) => {
     });
   }
   function addShares(message, post, entity, priority = false) {
-    const text = messageText(post);
-    for (const url of shares(message)) {
+    const text = messageText(post), urls = shares(message);
+    // A multi-work index must associate each link with its own introduction before truncation.
+    const contexts = new Map();
+    if (!priority && new Set(urls.map(url => new URL(url).pathname)).size > 1) {
+      let body = text;
+      for (const e of [...(message.entities || [])].sort((a, b) => b.offset - a.offset)) {
+        if (e._ === 'messageEntityTextUrl' && Number.isInteger(e.offset) && Number.isInteger(e.length)
+          && e.offset >= 0 && e.length > 0 && e.offset + e.length <= String(message.message || '').length) {
+          const end = e.offset + e.length;
+          body = body.slice(0, end) + ' ' + e.url + body.slice(end);
+        }
+      }
+      const links = [...body.matchAll(/https?:\/\/pan\.quark\.cn\/s\/[A-Za-z0-9]{6,32}(?![A-Za-z0-9])(?:[?#][^\s<>"'，。；、）】]*)?/g)];
+      let end = 0;
+      for (const link of links) {
+        const label = body.slice(Math.max(end, body.lastIndexOf('\n', link.index - 1) + 1), link.index).trim();
+        const intro = label && !/^(?:夸克|链接|連結|地址|下载|下载地址|链接地址|夸克网盘|资源链接)\s*[:：]?$/u.test(label)
+          ? label : body.slice(end, link.index).split(/\n\s*\n/).pop().trim();
+        const path = new URL(link[0]).pathname;
+        if (!contexts.has(path)) contexts.set(path, intro);
+        end = link.index + link[0].length;
+      }
+    }
+    const normalized = value => String(value).normalize('NFKC').replace(/[\s\p{P}\p{S}]+/gu, '').toLowerCase();
+    for (const url of urls) {
       if (search.urls.has(url)) continue;
+      const intro = contexts.size ? contexts.get(new URL(url).pathname) || '' : text;
+      if (contexts.size && !normalized(intro).includes(normalized(query))) continue;
       search.urls.add(url);
-      const title = text.split('\n').map(s => s.trim()).find(s => s && !/^https?:\/\//.test(s)) || entity.title || '';
-      const candidate = {title: title.slice(0,240), url, content: text.slice(0,1600), source_type: 'telegram_web',
+      const title = intro.split('\n').map(s => s.trim()).find(s => s && !/^https?:\/\//.test(s)) || entity.title || '';
+      const candidate = {title: title.slice(0,240), url, content: intro.slice(0,1600), source_type: 'telegram_web',
         datetime: Number.isInteger(post.date) && post.date > 0 ? post.date : 0};
       if (entity.publicMessages && /^[a-zA-Z][a-zA-Z0-9_]{4,31}$/.test(entity.username || '') && Number.isInteger(post.id) && post.id > 0) {
         candidate.source_url = `https://t.me/${entity.username}/${post.id}`;
@@ -323,7 +351,7 @@ async ({query, limit, timeout, refresh = false}) => {
         const payload = resourcePayload(button);
         if (payload && !search.botSeen.has(payload)) {
           search.botSeen.add(payload); bot.buttons++;
-          search.botPending.push({payload, post: {id: message.id, peer_id: message.peer_id,
+          search.botPending.push({payload, post: {id: message.id, peer_id: message.peer_id, date: message.date,
             message: messageText(message)}, peerKey: key(message.peer_id)});
         }
       }

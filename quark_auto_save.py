@@ -22,7 +22,6 @@ import html
 import unicodedata
 import tempfile
 import threading
-from itertools import islice
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
@@ -1689,7 +1688,7 @@ class Quark:
                     query = active_queries.pop(0)
                     attempted.append(("telegram", query))
                     response = search_telegram_resources(query, config, health_path=self.search_health_path,
-                                                         limit=min(6, allowance), deadline=archive_deadline,
+                                                         limit=40 if latest else min(6, allowance), deadline=archive_deadline,
                                                          **({"refresh": True} if latest and query not in refreshed_queries else {}))
                     refreshed_queries.add(query)
                     for error in response.get("errors", []):
@@ -1711,7 +1710,8 @@ class Quark:
                     print("Telegram归档：本轮候选筛选达到 40 批，未读取的候选将在下次运行继续查询")
 
             if latest:
-                latest_candidates.extend(islice(archive_candidates(), 60))
+                latest_candidates.extend(row for row in archive_candidates()
+                                         if isinstance(row, dict) and resource_description_matches(task, row, aliases))
             else:
                 archive_result = self._find_verified_resource(
                     task, archive_candidates(), seen, aliases, visited=visited, max_checked=24,
